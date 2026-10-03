@@ -156,7 +156,7 @@ struct Engine<'a> {
     mode: &'a str,
     principal: Value,
     sql_method: String,
-    sql: sql::Allowance,
+    sql: Box<sql::Allowance>,
     /// No caller: maintenance, the authorization hook, deployments. Access
     /// policies apply only to invocations with one, even an anonymous one.
     system: bool,
@@ -381,7 +381,7 @@ fn run_with_limit_and_schema(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned(),
-        sql: sql::Allowance::default(),
+        sql: Box::new(sql::Allowance::default()),
         system: invocation.get("$principal").is_none(),
         access: HashMap::new(),
         definer: 0,
@@ -1190,21 +1190,7 @@ impl Engine<'_> {
                 self.marker_read(crate::consensus::HISTORY_MARKER);
                 Ok(self.base.get("$flower.retention").map_or(Value::Null, |state|json!({"database":state["database"],"incarnation":state["incarnation"]})).into())
             }
-            "codeVersion" => {
-                self.record_read("bundle");
-                self.record_read("schema");
-                let generation = self
-                    .staged
-                    .get("bundle")
-                    .and_then(|bundle| bundle.get("hash"))
-                    .and_then(Value::as_str)
-                    .map(|hash| {
-                        let binding =
-                            json!([hash, self.staged.get("schema").unwrap_or(&Value::Null)]);
-                        crate::evaluator::hash(canonical_json(&binding).as_bytes())
-                    });
-                Ok(generation.map_or(Value::Null, Value::String).into())
-            }
+            "codeVersion" => self.code_version(),
             "managedKey" => self.managed_key(argument(0)).map(Reply::Value),
             "now" => {
                 self.query_cacheable = false;
@@ -1292,30 +1278,7 @@ impl Engine<'_> {
                 }
             }
             "scan" => {
-                if self.sql.callback.is_some() {
-                    let limit = arguments
-                        .get(1)
-                        .and_then(|options| options.get("limit"))
-                        .and_then(Value::as_u64);
-                    if limit.is_none_or(|limit| {
-                        limit == 0 || limit > crate::evaluator::sql::BATCH_ROWS as u64
-                    }) {
-                        return self.abort(
-                            "SQL_SOURCE_BUDGET",
-                            "SQL callback scans require a bounded native index range",
-                        );
-                    }
-                    if arguments
-                        .get(1)
-                        .and_then(|options| options.get("index"))
-                        .is_none()
-                    {
-                        return self.abort(
-                            "SQL_SOURCE_BUDGET",
-                            "SQL callback scans require a declared index",
-                        );
-                    }
-                }
+                self.sql_admit_scan(arguments.get(1))?;
                 if let Some(options) = arguments.get(1) {
                     let query = ranges::RangeQuery::parse_scan(argument(0), options)?;
                     let rows = self.range_rows(&query, true)?.rows;
@@ -1340,53 +1303,14 @@ impl Engine<'_> {
                 self.rows_for_host(rows)
             }
             "range" => {
-                if self.sql.callback.is_some()
-                    && argument(0)
-                        .get("options")
-                        .and_then(|options| options.get("limit"))
-                        .and_then(Value::as_u64)
-                        .is_none_or(|limit| {
-                            limit == 0 || limit > crate::evaluator::sql::BATCH_ROWS as u64
-                        })
-                {
-                    return self.abort("SQL_SOURCE_BUDGET", "SQL callback ranges must be bounded");
-                }
+                self.sql_admit_range(argument(0))?;
                 let query = ranges::RangeQuery::parse(argument(0))?;
                 Ok(self.range_rows(&query, true)?.rows)
             }
             "query" => {
                 let query = Query::parse(argument(0))?;
                 if self.sql.callback.is_some() {
-                    if !self.has_index(&query) {
-                        return self.abort(
-                            "SQL_SOURCE_BUDGET",
-                            "SQL callback queries require a declared index",
-                        );
-                    }
-                    let prefix = if query.fields.len() == 1 {
-                        vec![query.expected.clone()]
-                    } else {
-                        query.expected.as_array().cloned().ok_or_else(|| {
-                            EngineError::new(
-                                "SQL_SOURCE_BUDGET",
-                                "SQL callback query requires scalar index components",
-                            )
-                        })?
-                    };
-                    let range = ranges::RangeQuery::parse(
-                        &json!({"kind":"range","collection":query.collection,"fields":query.fields,"options":{"prefix":prefix,"limit":crate::evaluator::sql::BATCH_ROWS + 1}}),
-                    )?;
-                    let result = self.range_rows(&range, true)?.rows.into_value();
-                    let rows = result["rows"].as_array().expect("native page");
-                    if rows.len() > crate::evaluator::sql::BATCH_ROWS {
-                        return self.abort(
-                            "SQL_SOURCE_BUDGET",
-                            "SQL callback query exceeds bounded batch",
-                        );
-                    }
-                    return Ok(Reply::Value(Value::Array(
-                        rows.iter().map(|row| row["value"].clone()).collect(),
-                    )));
+                    return self.sql_callback_query(&query);
                 }
                 self.query_rows(&query, false)
             }

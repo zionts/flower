@@ -142,6 +142,8 @@ fn cells_bytes(rows: &VecDeque<Vec<SqlCell>>) -> usize {
         )
     })
 }
+type CandidatePage = (Vec<(String, Arc<Value>)>, Option<String>, bool);
+
 struct Cursor {
     table: usize,
     constraints: Vec<Equality>,
@@ -180,7 +182,7 @@ impl Providers<'_, '_> {
             let selected = rows.get(offset..end).ok_or_else(|| {
                 EngineError::new("SQL_PROVIDER_INVALID", "Invalid metadata continuation")
             })?;
-            let bytes = selected.len() * std::mem::size_of::<Vec<SqlCell>>()
+            let bytes = std::mem::size_of_val(selected)
                 + selected
                     .iter()
                     .map(|row| {
@@ -460,7 +462,7 @@ impl Engine<'_> {
         source: &catalog::Source,
         constraints: &[Equality],
         after: Option<&str>,
-    ) -> EngineResult<(Vec<(String, Arc<Value>)>, Option<String>, bool)> {
+    ) -> EngineResult<CandidatePage> {
         self.marker_read(collection_id(&source.name));
         // Source-key equality is an exact point read, independently of SQL order.
         if let Some(key) = constraints.iter().find_map(|constraint| {
