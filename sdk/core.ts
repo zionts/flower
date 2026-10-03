@@ -1,6 +1,7 @@
 import { canonicalJson, type Json } from "./json.ts";
 import { schema as adopt, ValidationError, type Infer, type Schema, type SchemaLike } from "./schema.ts";
-import type { SqlCatalog, SqlContext } from "./sql.ts";
+import type { SqlContext } from "./sql.ts";
+import type { SqlTerminalMetadata } from "./sql-method.ts";
 import type { ManagedKey } from "./keys.ts";
 import { compileAccess, compileDerivedAccess, type AccessManifest, type CollectionAccess, type DerivedAccess } from "./access.ts";
 
@@ -440,6 +441,7 @@ export interface QueryMethod<A = Json, V = Json> {
   readonly consistency?: "replica-local";
   readonly cache?: false;
   readonly watch?: false;
+  readonly terminal?: SqlTerminalMetadata;
 }
 export interface MutationMethod<A = Json, V = Json> {
   readonly kind: "mutationMethod";
@@ -456,7 +458,7 @@ export interface TransactionMethod<A = Json, V = Json> {
   readonly compute: (ctx: Context, args: A) => TransactionPlan<V>;
 }
 export interface SqlCallback {
-  readonly kind: "sqlAuthority" | "sqlProvider";
+  readonly kind: "sqlAuthority" | "sqlProvider" | "sqlFinalizer";
   readonly name: string;
   readonly compute: (ctx: any, args: any) => any;
 }
@@ -538,7 +540,7 @@ export function transaction(name: string, specOrPlan: unknown, maybePlan?: unkno
 
 /** A committed transaction: each call's result, and the plan's value when it has one. */
 export interface TransactionResult<V = Json> { results: Json[]; value?: V }
-export interface ManifestMethod { readonly name: string; readonly kind: "query" | "mutation" | "transaction"; readonly consistency?: "replica-local"; readonly receipt?: false; readonly cache?: false; readonly watch?: false }
+export interface ManifestMethod { readonly name: string; readonly kind: "query" | "mutation" | "transaction"; readonly consistency?: "replica-local"; readonly receipt?: false; readonly cache?: false; readonly watch?: false; readonly terminal?: SqlTerminalMetadata }
 /**
  * A reference as the server enforces it: the target's name, where the row holds its key, and whether the
  * target's keys are JSON (`collection.key(schema)`), which the parts then make as one value or a tuple.

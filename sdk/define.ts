@@ -8,6 +8,7 @@ import type {
 } from "./core.ts";
 import { aggregateSource, checkReadable, collectionManifest, normalizeAggregateMetadata, referenceManifest, referenceTarget } from "./indexing.ts";
 import { keyManifest, type ManagedKey } from "./keys.ts";
+import { sqlMethodInfo } from "./sql-method.ts";
 import { bindSql, sqlDeclaration, type SqlCatalog } from "./sql.ts";
 import { ValidationError, type Schema } from "./schema.ts";
 
@@ -707,7 +708,7 @@ function flatten(root: Component) {
   return parts;
 }
 
-const definitionKinds = ["derived", "queryMethod", "mutationMethod", "transactionMethod", "sqlAuthority", "sqlProvider"];
+const definitionKinds = ["derived", "queryMethod", "mutationMethod", "transactionMethod", "sqlAuthority", "sqlProvider", "sqlFinalizer"];
 
 /** Declare the application: its components, internals and complete public HTTP allowlist. */
 export function define<const H extends HttpMap = {}>(config: ModuleConfig<H> = {}): FlowerModule<H> {
@@ -742,9 +743,13 @@ export function define<const H extends HttpMap = {}>(config: ModuleConfig<H> = {
     if (alias.startsWith("$flower.")) throw new TypeError("HTTP aliases beginning with $flower. are reserved");
     const method = register(allowlist[alias]);
     if (method.kind !== "queryMethod" && method.kind !== "mutationMethod" && method.kind !== "transactionMethod") throw new TypeError("Only query, mutation, and transaction methods may be exposed over HTTP");
+    const terminal = sqlMethodInfo(method);
+    if (terminal && !(sqlSetting ?? []).includes(terminal.catalog)) throw new TypeError("Terminal SQL method catalog must be explicitly registered in define({sql})");
+    if (terminal) { register(terminal.finalizer, true); flat.keys.push(...terminal.terminal.signingKeys); }
     exposed[alias] = method;
     http[alias] = Object.freeze({
       name: method.name,
+      ...(terminal ? { terminal: terminal.terminal } : {}),
       kind: method.kind === "queryMethod" ? "query" as const : method.kind === "transactionMethod" ? "transaction" as const : "mutation" as const,
       ...(method.kind === "queryMethod" && method.consistency === "replica-local" ? { consistency: "replica-local" as const } : {}),
       ...(method.kind === "queryMethod" && method.cache === false ? { cache: false as const } : {}),
@@ -807,6 +812,7 @@ export function define<const H extends HttpMap = {}>(config: ModuleConfig<H> = {
     const aggregate = definition.kind === "derived" && definition.aggregate !== undefined ? normalizeAggregateMetadata(definition.aggregate) : undefined;
     definitions[name] = Object.freeze({
       kind: definition.kind, name, compute: bound(definition, runtime),
+      ...(sqlMethodInfo(definition) ? {terminal: sqlMethodInfo(definition)!.terminal} : {}),
       ...(aggregate ? { aggregate } : {}),
       ...(definition.kind === "derived" && derivedAccessOf(definition) !== undefined ? { access: derivedAccessOf(definition) } : {}),
       ...(definition.kind === "queryMethod" && definition.consistency === "replica-local" ? { consistency: "replica-local" as const } : {}),

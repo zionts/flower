@@ -120,6 +120,8 @@
           ./crates
           ./examples/goblin-pizza-rs
           ./vendor/openraft
+          # Resident-only SQL capture's narrow redb seam, once vendored.
+          (lib.fileset.maybeMissing ./vendor/redb)
           ./vendor/quickjs-ng/quickjs.wasm
           ./runtime/engine.js
         ];
@@ -146,8 +148,11 @@
         platforms = supportedSystems;
       };
 
+      # Compiling the explicit SQL artifact does not open its runtime HOLD gates.
+      # Keep the ordinary/default server without this experimental capability.
       mkFlower =
         pkgs:
+        { enableSql ? false }:
         let
           rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default;
         in
@@ -156,7 +161,7 @@
           rustc = rustToolchain;
         })
           {
-            pname = "flower";
+            pname = if enableSql then "flower-sql" else "flower";
             inherit version;
 
             src = serverSrc;
@@ -164,13 +169,20 @@
             cargoBuildFlags = [
               "--bin"
               "flower"
+            ] ++ lib.optionals enableSql [
+              "--features"
+              "sql"
             ];
             # The Rust suite (cargo test, tests/*.rs) runs from a checkout; some of
             # its timing-sensitive cases would make the package flaky to build.
             doCheck = false;
 
             meta = commonMeta pkgs // {
-              description = "A Raft-backed database of reactive TypeScript values";
+              description =
+                if enableSql then
+                  "The Flower server with experimental SQL compiled in (serving HOLD)"
+                else
+                  "A Raft-backed database of reactive TypeScript values";
               mainProgram = "flower";
             };
           };
@@ -203,11 +215,12 @@
       packages = forAllSystems (
         pkgs:
         let
-          flower = mkFlower pkgs;
+          flower = mkFlower pkgs { };
         in
         {
           inherit flower;
           default = flower;
+          flower-sql = mkFlower pkgs { enableSql = true; };
           sdk = mkSdk pkgs;
           wasi-sdk = mkWasiSdk pkgs;
         }
@@ -226,6 +239,11 @@
         {
           default = server;
           flower = server;
+          flower-sql = {
+            type = "app";
+            program = "${packages.flower-sql}/bin/flower";
+            meta.description = "The Flower server with experimental SQL compiled in (serving HOLD)";
+          };
           cli = {
             type = "app";
             program = "${packages.sdk}/bin/flower";
@@ -234,9 +252,10 @@
         }
       );
 
-      # pkgs.flower and pkgs.flower-sdk, built with this flake's pinned Nixpkgs and Rust.
+      # Explicit default-off and SQL artifacts, built with this flake's pinned tools.
       overlays.default = final: _prev: {
         flower = self.packages.${final.stdenv.hostPlatform.system}.flower;
+        flower-sql = self.packages.${final.stdenv.hostPlatform.system}.flower-sql;
         flower-sdk = self.packages.${final.stdenv.hostPlatform.system}.sdk;
       };
 
@@ -275,7 +294,8 @@
           packages = self.packages.${pkgs.stdenv.hostPlatform.system};
         in
         {
-          inherit (packages) flower sdk;
+          # Compile both artifacts; neither check claims SQL serving conformance.
+          inherit (packages) flower flower-sql sdk;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # A NixOS VM: the module bootstraps a node, the SDK deploys an example to it.

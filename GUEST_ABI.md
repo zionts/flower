@@ -71,11 +71,16 @@ flower_init() -> i32                        ; optional
 - **`flower_alloc`** returns guest memory the host writes into: invocation
   inputs and host-call responses. It traps on exhaustion.
 - **`flower_invoke`** runs one callback. `kind` is `0` query, `1` mutation,
-  `2` transaction, `3` derived, `4` dedicated SQL authority validation or
-  `5` dedicated invoker SQL provider. SQL kinds are experimental and cannot be
-  exposed as ordinary HTTP methods. `name` is UTF-8 and `args` one value. It
-  returns `ptr | len << 32` of an *outcome* that stays valid until the next
-  reset.
+  `2` transaction, `3` derived, `4` dedicated SQL authority validation,
+  `5` dedicated invoker SQL provider, **`6` readless `sqlPlan`**, or
+  **`7` readless `sqlFinalizer`**. Kind 6 invokes the terminal's existing query
+  definition using a dedicated readless profile; `sqlPlan` is not a new
+  serialized definition kind. Kind 7 invokes a dedicated `sqlFinalizer`
+  definition. These SQL callback profiles are experimental internal entrypoints,
+  not ordinary HTTP callback kinds or host-call operation numbers. Their native
+  terminal lifecycle is not implemented/enabled yet. `name` is UTF-8 and `args`
+  one value. It returns `ptr | len << 32` of an *outcome* that stays valid until
+  the next reset.
 - **`flower_manifest`** returns the module's manifest as a value (see below).
   The host calls it once per module, without host capabilities.
 - **`flower_init`**, when present, runs once while the host prepares the
@@ -120,8 +125,14 @@ malformed arguments; unknown operations and resource failures trap instead.
 | 12 | clock | none | milliseconds | all |
 | 13 | changesAt | milliseconds or null | null | all |
 | 14 | definer | true or false | null | mutations |
-| 15 | sql | operation, catalog name, input, purpose | typed result | admitted one-shot query only; experimental hard HOLD |
-| 16 | codeVersion | none | trusted code/schema SHA-256 or null | reads |
+| 15 | sql | operation, catalog name, input, purpose | typed result | legacy one-shot query only; permanently HOLD, not the terminal route |
+| 16 | codeVersion | none | trusted code/schema SHA-256 or null | queries and mutations |
+
+The ordinary-profile labels "all"/"methods" do not grant source operations to
+terminal callback kinds 6/7. Their readless contracts are described below;
+finalizer getters use trusted finish metadata, not a Records host. The native
+terminal lifecycle/capability boundary is still HOLD, not an enabled interpreter
+for these profiles.
 
 `definer(true)` and `definer(false)` bracket code that acts with the
 application's rights, such as triggers: collection access policies and derived
@@ -147,11 +158,15 @@ Entropy (opcode 0) is available only to mutations.
 
 ```json
 {
-  "definitions": {"name": {"kind": "derived|query|mutation|transaction|sqlAuthority|sqlProvider",
+  "definitions": {"name": {"kind": "derived|query|mutation|transaction|sqlAuthority|sqlProvider|sqlFinalizer",
                            "consistency": "replica-local", "receipt": false, "cache": false, "watch": false,
+                           "terminal": {"catalog": "…", "operation": "query|explain|catalog|cancel",
+                                        "finalizer": "….$sql.finalize", "signingKeys": [{…}]},
                            "aggregate": {…}, "access": {…}}},
   "http": {"alias": {"name": "definition", "kind": "query|mutation|transaction",
-                     "consistency": "replica-local", "receipt": false, "cache": false, "watch": false}},
+                     "consistency": "replica-local", "receipt": false, "cache": false, "watch": false,
+                     "terminal": {"catalog": "…", "operation": "query|explain|catalog|cancel",
+                                  "finalizer": "….$sql.finalize", "signingKeys": [{…}]}}},
   "maintenance": {"name": "…", "kind": "mutation", "onError": {…}} ,
   "authorize": {"name": "…", "result": "decision"},
   "collections": [{"name": "…", "indexes": {"index": ["field", …]}, "access": {…},
@@ -234,7 +249,7 @@ returns anything else fails with `INVALID_VALUE`, and passing it to the
 database throws a catchable error with that code.
 
 
-## Experimental SQL catalog extension (HOLD)
+## Experimental SQL catalog and terminal extension (HOLD)
 
 Optional top-level `sql` is an array of at most eight explicit catalogs. A catalog
 has `{name,version,authority,tables,relationships}`; a table has
@@ -246,24 +261,99 @@ in collections. Catalog/code/policies cut over as one schema. No collection is
 implicitly SQL-readable. Removing this metadata is not permission to downgrade
 replicas below the manifest/schema version they can read.
 
-Operation 15 takes `[operation,catalogName,input,purpose]`, where operation is
+### Terminal manifest and dedicated callback profiles
+
+The SDK's `sqlMethod` emits matching optional `terminal` metadata on its **query**
+definition and public HTTP alias:
+
+```json
+{
+  "catalog": "notes",
+  "operation": "query",
+  "finalizer": "sql.query.$sql.finalize",
+  "signingKeys": []
+}
+```
+
+`operation` is exactly `query`, `explain`, `catalog`, or `cancel`. A terminal must
+be a fresh linearizable one-shot query with explicit `cache:false,watch:false`,
+not a replica-local/mutation/transaction method. Its catalog must be explicitly
+registered in top-level `sql`; the SDK requires the exact catalog declaration in
+`define({sql:[catalog]})`. Its `finalizer` must reference a dedicated
+`sqlFinalizer` definition; the SDK generates `${methodName}.$sql.finalize` even
+without a custom application finalizer. The callback is internal, never an HTTP
+alias. `signingKeys` contains at most eight full managed-key descriptors matching
+entries in top-level `keys`, each with `sign` usage. The SDK merges these key
+declarations into that manifest and requires a custom finalizer for a nonempty
+list. Descriptor presence is not loaded-key authority.
+
+Invocation kind **6 (`sqlPlan`)** uses the terminal's query definition, not a new
+manifest definition kind. The application `plan(invoker,args)` receives only the
+actual verified principal (or null) and schema-validated method arguments. It
+returns `{input,purpose}` with both members present; input is `SqlQueryInput`,
+`{queryId}`, or null. The default plan returns `{input:args ?? null,purpose:null}`.
+There is no source/SQL/write/definer/managed-key capability in this readless
+profile. Purpose remains untrusted until catalog authority validates it.
+
+Invocation kind **7 (`sqlFinalizer`)** receives trusted callback transport:
+
+```text
+{request, result, provenance, binding}
+binding = {invoker, principal, clock, history, codeVersion, catalogVersion,
+           authorityContext, sourceRevision, partition}
+partition = {name, epoch} | null
+history = {database, incarnation} | null
+```
+
+The SDK adapts this to **exactly `finalize(ctx,execution,metadata)`**, three
+arguments. For a query, execution is `{result,provenance}`; otherwise it is the
+public explain/catalog/boolean result. Metadata contains all binding members plus
+`request`. The frozen readless context has only `principal()`, `clock()`,
+`history()`, `codeVersion()` and readonly `binding`, supplied from that trusted
+transport, not a database host. No source getter, SQL, writes, definer elevation,
+ambient `now()` or secret handle exists. With no custom finalizer the public
+result alone is returned, never query provenance.
+
+The native terminal lifecycle is **not implemented or enabled yet**. The current
+service rejects terminal requests with `SQL_TERMINAL_UNAVAILABLE`; callback
+numbers, manifest declarations and SDK adapters are not evidence of serving.
+Before enabling it, native code must enforce quota-first detached owned capture,
+drop original Records/storage pins before callbacks/SQLite, seal only authorized
+typed logical rows, and freshly validate authority/source/expiry/code/history
+before supplying this finish binding. Finalizer managed signing must be limited
+to `signingKeys` and signing operations; general managed-key access is not part
+of its profile. SourceRevision/history must bind the actual capture, never
+client args or application result fields. Agent exposure/log append still needs
+independent atomic current-recipient authorization.
+
+### Legacy host operations, permanently held
+
+Operation **15** is the legacy `ctx.sql` route, **permanently on HOLD**. It takes
+`[operation,catalogName,input,purpose]`, where operation is
 query/catalog/explain/cancel. Query/explain input is the `SqlQueryInput` of
-`sdk/sql.ts`; cancel input is `{queryId}`. No principal argument exists. Every
-alias entering SQL must declare `cache:false,watch:false`; those flags bypass
-cache lookup/coalescing/insertion and deny server watch registration, not merely
-UI/result caching. Query returns `{result,provenance}` internally; only result is
-public human data. Provider rows bind to batch-local source ordinals and native
+`sdk/sql.ts`; cancel input is `{queryId}`. No principal argument exists. Its
+one-shot aliases require `cache:false,watch:false`; those flags bypass cache
+lookup/coalescing/insertion and deny watch registration, but cannot bound an
+original retained snapshot. This is not the terminal execution route, and a
+terminal declaration must never fall back to it.
+
+Legacy query's internal type is `{result,provenance}`; only result is public
+human data. Provider rows bind to batch-local source ordinals and native
 ACL-redacted mapped columns. Policy reads join dependency certificates. Providers
 cannot write, elevate, read derived values, access managed keys or recursively
 invoke SQL. Authority's pure validation read rights never become provider rights.
+These foundation constraints do not prove a completed terminal provider runtime.
 
-Operation 16 observes bundle/schema and returns the native SHA-256 of their
+Operation **16** observes bundle/schema and returns the native SHA-256 of their
 canonical binding, or null without a deployment. It is available to queries and
 mutations for current-generation proof comparison, not user-selected generation.
+Terminal finalizer codeVersion is instead supplied in the trusted finish binding.
 
-The bounded native evaluator is compiled only with feature `sql`. **The serving
-snapshot retention bound is not proved:** `Records::sql_snapshot_reservation_bytes`
-returns None for all roots. All operation-15 calls fail before callbacks with
+Cargo default features remain `[]`; native SQLite is compiled only with feature
+`sql`. The Nix `flower-sql` artifact explicitly selects it; default `flower` does
+not. Compilation never opens the runtime gates. **Legacy serving-snapshot
+retention is not proved:** `Records::sql_snapshot_reservation_bytes()` returns
+`None` for all roots. Operation-15 calls fail before callbacks with
 `SQL_SNAPSHOT_UNBOUNDED` in that build (`SQL_UNAVAILABLE` without it). No test/public
 bypass exists. Read `SQL.md` and `src/consensus/records_sql_snapshot.md`; standalone
 SQLite tests do not establish provider-policy/end-to-end launch evidence.

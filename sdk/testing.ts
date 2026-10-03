@@ -136,6 +136,7 @@ export class TestDatabase<App = FlowerModule> {
     if (kind !== null && entry.kind !== kind && !(kind === "mutation" && entry.kind === "transaction")) {
       throw new FlowerError(`${alias} is not a ${kind}`, 422, "METHOD_KIND_MISMATCH");
     }
+    if (entry.terminal) throw new FlowerError("Terminal SQL requires the native detached capture runtime", 422, "EVALUATION_FAILED", {code:"SQL_UNAVAILABLE",message:"Terminal SQL requires the native detached capture runtime"});
     canonicalJson(args);
     const principal = this.authorize(store, alias, args as Json, options, partition, null);
     if (entry.kind === "query") return { revision: store.revision, value: plain(this.evaluate(store, "query", entry.name, args as Json, principal).value), duplicate: false };
