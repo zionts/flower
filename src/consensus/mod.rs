@@ -15,6 +15,14 @@ mod progress;
 mod read;
 mod receipts;
 mod records;
+#[cfg(feature = "sql")]
+mod sql_capture;
+#[cfg(feature = "sql")]
+pub use sql_capture::{
+    SQL_CAPTURE_MAX_BYTES, SQL_CAPTURE_MAX_METADATA_BYTES, SQL_CAPTURE_MAX_RECORDS,
+    SqlCaptureBuffer, SqlCaptureEncoding, SqlCaptureEpoch, SqlCaptureError, SqlCaptureFence,
+    SqlCaptureRequest, SqlCaptureSelection, SqlCapturedRecord, SqlCapturedSlice,
+};
 pub mod retention;
 mod snapshot_policy;
 mod store;

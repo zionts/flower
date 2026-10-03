@@ -154,7 +154,7 @@ async fn replica_fence(
             .context("unavailable: leader read fence failed")?
     };
     loop {
-        if store.snapshot_after_fence(&fence)?.is_some() {
+        if store.has_applied_fence(&fence)? {
             return Ok(fence);
         }
         progress
@@ -165,6 +165,32 @@ async fn replica_fence(
 }
 
 impl Consensus {
+    /// Fresh capture readiness without owning a Records/read-table snapshot.
+    #[cfg(feature = "sql")]
+    pub async fn sql_capture_fence(&self) -> anyhow::Result<super::SqlCaptureFence> {
+        let fence = tokio::time::timeout(self.limits.read_timeout, self.reads.replica.request())
+            .await
+            .context("unavailable: fresh SQL capture fence timed out")??;
+        self.recovering.store(false, Ordering::Release);
+        Ok(self
+            .store
+            .sql_capture_bind_fence(fence, self.partition.as_ref()))
+    }
+
+    /// Copy one native-only, resident, epoch-stable slice into an admitted
+    /// caller's preallocated buffer. No source ownership is returned.
+    #[cfg(feature = "sql")]
+    pub fn sql_capture_slice(
+        &self,
+        fence: &super::SqlCaptureFence,
+        expected: Option<&super::SqlCaptureEpoch>,
+        request: super::SqlCaptureRequest<'_>,
+        buffer: super::SqlCaptureBuffer,
+    ) -> Result<super::SqlCapturedSlice, super::SqlCaptureError> {
+        self.store
+            .sql_capture_slice(self.partition.as_ref(), fence, expected, request, buffer)
+    }
+
     /// Fresh, linearizable query data on a leader or follower, without receipts.
     /// Concurrent callers share a sealed cohort, whose authenticated leader
     /// proof begins after every member enrolled. A later caller cannot reuse it.
@@ -184,9 +210,21 @@ impl Consensus {
         Ok(snapshot)
     }
 
+    /// Validate this serving binding without retaining a Snapshot/Records root.
+    /// Startup recovery uses the exact cohort barrier of snapshot_for.
+    pub async fn check_availability(&self) -> anyhow::Result<()> {
+        self.snapshot_recovery_barrier().await?;
+        self.store.check_availability(self.partition.as_ref())
+    }
+
     /// Cheap replica-local publication. Callers must explicitly opt into stale
     /// query semantics; writers retain the leader-only read_for APIs.
     pub async fn snapshot_for(&self, request_id: Option<&str>) -> anyhow::Result<Snapshot> {
+        self.snapshot_recovery_barrier().await?;
+        self.selected_snapshot(request_id, false).await
+    }
+
+    async fn snapshot_recovery_barrier(&self) -> anyhow::Result<()> {
         if self.recovering.load(Ordering::Acquire) {
             // A previous process may have acknowledged entries whose durable
             // logs survived while the materialized state rolled back. Even an
@@ -200,7 +238,7 @@ impl Consensus {
                 .context("unavailable: startup recovery requires a quorum")?;
             self.recovering.store(false, Ordering::Release);
         }
-        self.selected_snapshot(request_id, false).await
+        Ok(())
     }
 }
 

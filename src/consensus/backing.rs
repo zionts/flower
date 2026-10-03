@@ -1,6 +1,9 @@
 //! Stored application records beneath an in-memory overlay: one table of a
 //! pinned redb read snapshot. A stored value is its write's version, eight
 //! little-endian bytes, followed by its JSON, packed (`super::packed`).
+#[cfg(feature = "sql")]
+pub(crate) mod sql_capture;
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::VecDeque;

@@ -15,6 +15,12 @@
 use super::*;
 use std::path::Path;
 
+#[path = "capture_gate.rs"]
+#[cfg_attr(not(feature = "sql"), allow(dead_code))]
+mod capture_gate;
+use capture_gate::CaptureGate;
+pub(crate) use capture_gate::{CapturePermit, CaptureUnavailable, MutationPermit};
+
 type Stage = Box<dyn FnMut(&WriteTransaction, &mut StorageTrace) -> anyhow::Result<()> + Send>;
 
 struct Job {
@@ -35,6 +41,9 @@ struct Queue {
 
 pub struct SharedDatabase {
     db: Database,
+    // One gate for every replica/root sharing this physical database. Guards
+    // own only this small gate; they never retain the redb database itself.
+    capture_gate: Arc<CaptureGate>,
     queue: std::sync::Mutex<Queue>,
     batches: AtomicU64,
     durable_batches: AtomicU64,
@@ -128,6 +137,7 @@ impl SharedDatabase {
     pub(super) fn with_database(db: Database) -> Arc<Self> {
         Arc::new(Self {
             db,
+            capture_gate: Arc::new(CaptureGate::default()),
             queue: std::sync::Mutex::default(),
             batches: AtomicU64::new(0),
             durable_batches: AtomicU64::new(0),
@@ -137,6 +147,42 @@ impl SharedDatabase {
         })
     }
 
+    /// Ordinary mutations coexist, but exclude native snapshot capture.
+    /// Blocking: acquire only inside a storage spawn_blocking job, and hold
+    /// through transaction commit/abort/drop and logical root publication.
+    /// The returned guard does not borrow or retain this database.
+    pub(crate) fn mutation_permit(&self) -> MutationPermit {
+        self.capture_gate.mutation_permit()
+    }
+
+    /// Try immediate native-copy admission across every replica in this file.
+    /// Never waits, including on the bookkeeping mutex. Busy and a paced
+    /// NextDue deadline are distinct; neither permits polling. Keep the guard
+    /// around the bounded native copy only, not SQL/guest/compiler work or I/O.
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    pub(crate) fn try_capture_permit(&self) -> Result<CapturePermit, CaptureUnavailable> {
+        self.capture_gate.try_capture_permit()
+    }
+
+    /// Raw write-capable access requires this database's live mutation permit.
+    /// The reference cannot outlive that permit. Production readers get only
+    /// begin_read; fixture-only database() intentionally bypasses exclusion.
+    pub(super) fn database_under_mutation<'a>(
+        &'a self,
+        permit: &'a MutationPermit,
+    ) -> &'a Database {
+        assert!(
+            permit.belongs_to(&self.capture_gate),
+            "foreign database mutation permit"
+        );
+        &self.db
+    }
+
+    pub(super) fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
+        self.db.begin_read()
+    }
+
+    #[cfg(test)]
     pub(super) fn database(&self) -> &Database {
         &self.db
     }
@@ -242,6 +288,11 @@ impl SharedDatabase {
         for job in &mut jobs {
             job.profile.phase(StoragePhase::BlockingQueue);
         }
+        // This method runs only in run()'s spawn_blocking worker. Keep one
+        // shared-side permit across the entire batch, including abort/drop,
+        // failed staging, retries, and commit. Cancelling Submitted::committed
+        // cannot shorten the lifetime of the actual storage job's exclusion.
+        let _mutation = self.mutation_permit();
         loop {
             if jobs.is_empty() {
                 return (jobs, Ok(()));
@@ -314,5 +365,179 @@ fn complete(jobs: Vec<Job>, result: Result<(), Arc<anyhow::Error>>) {
         job.profile.phase(StoragePhase::Flush);
         job.profile.report(result.is_ok());
         let _ = job.done.send(result.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const TEST_DEADLINE: Duration = Duration::from_secs(5);
+    const PROBE: TableDefinition<&str, u64> = TableDefinition::new("capture_gate_probe");
+
+    fn job(
+        stage: impl FnMut(&WriteTransaction, &mut StorageTrace) -> anyhow::Result<()> + Send + 'static,
+    ) -> (
+        Job,
+        tokio::sync::oneshot::Receiver<Result<(), Arc<anyhow::Error>>>,
+    ) {
+        let (done, completed) = tokio::sync::oneshot::channel();
+        (
+            Job {
+                durable: true,
+                stage: Box::new(stage),
+                profile: StorageTrace::default(),
+                done,
+                _lifetime: None,
+            },
+            completed,
+        )
+    }
+
+    #[test]
+    fn permits_do_not_borrow_or_retain_the_physical_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("flower.redb");
+        let shared = SharedDatabase::open(&path).unwrap();
+        let weak = Arc::downgrade(&shared);
+        let mutation = shared.mutation_permit();
+        drop(shared);
+        assert!(weak.upgrade().is_none());
+        // A guard retaining the database would also retain redb's file lock.
+        let shared = SharedDatabase::open(&path).unwrap();
+        drop(mutation);
+        let weak = Arc::downgrade(&shared);
+        let capture = shared.try_capture_permit().unwrap();
+        drop(shared);
+        assert!(weak.upgrade().is_none());
+        let reopened = SharedDatabase::open(&path).unwrap();
+        drop(capture);
+        drop(reopened);
+    }
+
+    #[test]
+    fn batch_excludes_capture_through_failed_staging_abort_and_restage() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = SharedDatabase::open(&directory.path().join("flower.redb")).unwrap();
+        let (survivor, mut survived) = {
+            let shared = shared.clone();
+            let mut attempts = 0;
+            job(move |transaction, _| {
+                attempts += 1;
+                assert!(matches!(
+                    shared.try_capture_permit(),
+                    Err(CaptureUnavailable::Busy)
+                ));
+                transaction.open_table(PROBE)?.insert("kept", attempts)?;
+                Ok(())
+            })
+        };
+        let (failed, mut rejected) = {
+            let shared = shared.clone();
+            job(move |transaction, _| {
+                assert!(matches!(
+                    shared.try_capture_permit(),
+                    Err(CaptureUnavailable::Busy)
+                ));
+                transaction.open_table(PROBE)?.insert("aborted", 99)?;
+                bail!("staging failed after a write")
+            })
+        };
+        let (jobs, result) = shared.commit(vec![survivor, failed]);
+        assert!(result.is_ok());
+        assert!(rejected.try_recv().unwrap().is_err());
+        complete(jobs, result);
+        assert!(survived.try_recv().unwrap().is_ok());
+        let transaction = shared.database().begin_read().unwrap();
+        let table = transaction.open_table(PROBE).unwrap();
+        assert_eq!(table.get("kept").unwrap().unwrap().value(), 2);
+        assert!(table.get("aborted").unwrap().is_none());
+        assert_eq!(shared.batches(), (1, 1, 1));
+        assert!(shared.try_capture_permit().is_ok());
+    }
+
+    #[test]
+    fn panicking_batch_drops_transaction_and_mutation_permit() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = SharedDatabase::open(&directory.path().join("flower.redb")).unwrap();
+        let (panicking, _completed) = job(|transaction, _| {
+            transaction.open_table(PROBE)?.insert("aborted", 99)?;
+            panic!("staging panicked after a write");
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = shared.commit(vec![panicking]);
+        }));
+        assert!(result.is_err());
+        assert!(shared.try_capture_permit().is_ok());
+        // The aborted transaction cannot keep redb's writer lock either.
+        let transaction = shared.database().begin_write().unwrap();
+        let table = transaction.open_table(PROBE).unwrap();
+        assert!(table.get("aborted").unwrap().is_none());
+        drop(table);
+        transaction.abort().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_submitted_future_keeps_exclusion_until_storage_finishes() {
+        struct Finished(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                if let Some(done) = self.0.take() {
+                    let _ = done.send(());
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let shared = SharedDatabase::open(&directory.path().join("flower.redb")).unwrap();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (finished, finished_rx) = tokio::sync::oneshot::channel();
+        let notice = Finished(Some(finished));
+        let mut entered = Some(entered);
+        let submitted = shared.submit(
+            true,
+            StorageTrace::default(),
+            None,
+            move |transaction, _| {
+                let _notice = &notice;
+                transaction.open_table(PROBE)?.insert("committed", 1)?;
+                entered.take().unwrap().send(()).unwrap();
+                release_rx.recv_timeout(TEST_DEADLINE).unwrap();
+                Ok(())
+            },
+        );
+        let waiter = tokio::spawn(submitted.committed());
+        tokio::time::timeout(TEST_DEADLINE, entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            shared.try_capture_permit(),
+            Err(CaptureUnavailable::Busy)
+        ));
+        release.send(()).unwrap();
+        // Stage's captured notice is dropped by complete(), only after commit
+        // has returned and released its actual blocking job's mutation permit.
+        tokio::time::timeout(TEST_DEADLINE, finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.batches(), (1, 1, 1));
+        assert!(shared.try_capture_permit().is_ok());
+        let transaction = shared.database().begin_read().unwrap();
+        assert_eq!(
+            transaction
+                .open_table(PROBE)
+                .unwrap()
+                .get("committed")
+                .unwrap()
+                .unwrap()
+                .value(),
+            1
+        );
     }
 }
