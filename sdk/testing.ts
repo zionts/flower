@@ -4,6 +4,7 @@ import { buildBundle } from "./bundle.ts";
 import { FlowerClient, FlowerError } from "./client.ts";
 import type { AliasOf, ApiOf, ArgsOf, ArgsParameter, Failure, FlowerModule, MutationAliasOf, Principal, QueryAliasOf, ResultOf } from "./core.ts";
 import { canonicalJson, type Json } from "./json.ts";
+import { METHOD_ARGS_GUARD } from "./core.ts";
 import { enforceAccess } from "./access.ts";
 import { checkReferences } from "./references.ts";
 
@@ -136,9 +137,19 @@ export class TestDatabase<App = FlowerModule> {
     if (kind !== null && entry.kind !== kind && !(kind === "mutation" && entry.kind === "transaction")) {
       throw new FlowerError(`${alias} is not a ${kind}`, 422, "METHOD_KIND_MISMATCH");
     }
-    if (entry.terminal) throw new FlowerError("Terminal SQL requires the native detached capture runtime", 422, "EVALUATION_FAILED", {code:"SQL_UNAVAILABLE",message:"Terminal SQL requires the native detached capture runtime"});
     canonicalJson(args);
     const principal = this.authorize(store, alias, args as Json, options, partition, null);
+    if (entry.terminal) {
+      const compute = this.module.definitions[entry.name]?.compute as Function & { [METHOD_ARGS_GUARD]?: (raw: unknown) => unknown };
+      try { compute?.[METHOD_ARGS_GUARD]?.(this.local(args)); }
+      catch (error) {
+        const failure = failureOf(error);
+        throw new FlowerError(`${failure.code}: ${failure.message}`, 422, "EVALUATION_FAILED", failure);
+      }
+      // Real authentication/access/schema above. No SQL plan, provider,
+      // finalizer, native result, revision or provenance is simulated here.
+      throw new FlowerError("Terminal SQL requires the native detached capture runtime", 422, "EVALUATION_FAILED", {code:"SQL_UNAVAILABLE",message:"Terminal SQL requires the native detached capture runtime"});
+    }
     if (entry.kind === "query") return { revision: store.revision, value: plain(this.evaluate(store, "query", entry.name, args as Json, principal).value), duplicate: false };
     const requestId = options.requestId ?? `test-${++this.sequence}`;
     const fingerprint = canonicalJson([alias, args as Json, principal?.subject ?? null, principal?.tenant ?? null]);

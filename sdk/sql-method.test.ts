@@ -49,3 +49,23 @@ test("terminal SQL settings are default-deny and signing-key limited",()=>{
  assert.throws(()=>sqlMethod("x",{catalog,operation:"query",signingKeys:[signer]}),/require a finalizer/);
  assert.throws(()=>sqlMethod("x",{catalog,operation:"query",finalize:()=>null,signingKeys:[key("n",{algorithm:"HS256",usages:["verify"]})]}),/signing usage/);
 });
+
+
+test("terminal native refusal follows real authentication, access and schema without executing callbacks",async()=>{
+ let plans=0,finalizers=0,accesses=0;
+ const run=sqlMethod("terminal.admitted",{catalog,operation:"query",access:"authenticated",args:v.object({sql:v.string()}),plan:()=>{plans++;return {input:{sql:"SELECT 1"},purpose:null}},finalize:()=>{finalizers++;return null}});
+ const guarded=sqlMethod("terminal.guarded",{catalog,operation:"query",access:(_ctx,principal)=>{accesses++;return principal?.subject==="allowed"},args:v.object({sql:v.string()})});
+ const db=await testDatabase(define({sql:[catalog],http:{run,guarded},auth:{authenticate:(_ctx,credential)=>typeof credential==="string"&&["allowed","blocked"].includes(credential)?{subject:credential}:null}}));
+ const rejected=(status:number,code:string)=>(error:unknown)=>typeof error==="object"&&error!==null&&(error as any).status===status&&(error as any).failure?.code===code;
+ assert.throws(()=>db.query("run",{sql:"SELECT 1"}),rejected(403,"UNAUTHENTICATED"));
+ assert.throws(()=>db.query("guarded",{sql:"SELECT 1"},{credentials:"blocked"}),rejected(403,"FORBIDDEN"));
+ assert.throws(()=>db.query("run",{sql:1} as never,{credentials:"allowed"}),rejected(422,"INVALID_ARGUMENT"));
+ assert.throws(()=>db.query("run",{sql:"SELECT 1"},{credentials:"allowed"}),rejected(422,"SQL_UNAVAILABLE"));
+ assert.equal(accesses,1);assert.equal(plans,0);assert.equal(finalizers,0);
+});
+
+test("bundled terminal argument guard crosses VM realm without evaluating its plan",async()=>{
+ const db=await testDatabase(new URL("./sql-terminal-admission-fixture.ts",import.meta.url).pathname);
+ assert.throws(()=>db.query("run",{sql:1} as never),error=>(error as any)?.failure?.code==="INVALID_ARGUMENT");
+ assert.throws(()=>db.query("run",{sql:"SELECT 1"} as never),error=>(error as any)?.failure?.code==="SQL_UNAVAILABLE");
+});

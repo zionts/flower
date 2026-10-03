@@ -469,6 +469,12 @@ export type HttpMap = { readonly [alias: string]: HttpMethod };
 export interface MethodInfo { readonly args: Schema<unknown> | null; readonly access: Access | undefined }
 const methodInfos = new WeakMap<object, MethodInfo>();
 export function methodInfo(method: object): MethodInfo { return methodInfos.get(method) ?? { args: null, access: undefined }; }
+/** Internal pure argument admission retained across bundled VM realms. */
+export const METHOD_ARGS_GUARD = Symbol.for("$flower.method.arguments");
+export function validateMethodArgs(method: object, raw: unknown): unknown {
+  return parseArgs(methodInfo(method).args, raw);
+}
+
 
 function access(value: unknown): Access | undefined {
   if (value === undefined || value === "public" || value === "authenticated" || typeof value === "function") return value as Access | undefined;

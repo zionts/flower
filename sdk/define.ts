@@ -9,6 +9,7 @@ import type {
 import { aggregateSource, checkReadable, collectionManifest, normalizeAggregateMetadata, referenceManifest, referenceTarget } from "./indexing.ts";
 import { keyManifest, type ManagedKey } from "./keys.ts";
 import { sqlMethodInfo } from "./sql-method.ts";
+import { METHOD_ARGS_GUARD, validateMethodArgs } from "./core.ts";
 import { bindSql, sqlDeclaration, type SqlCatalog } from "./sql.ts";
 import { ValidationError, type Schema } from "./schema.ts";
 
@@ -810,8 +811,14 @@ export function define<const H extends HttpMap = {}>(config: ModuleConfig<H> = {
   const definitions: Record<string, Definition> = Object.create(null);
   for (const [name, definition] of originals) {
     const aggregate = definition.kind === "derived" && definition.aggregate !== undefined ? normalizeAggregateMetadata(definition.aggregate) : undefined;
+    const compute = bound(definition, runtime);
+    if (sqlMethodInfo(definition)) Object.defineProperty(compute, METHOD_ARGS_GUARD, {
+      // Only the existing schema parser, never the terminal plan/finalizer or
+      // a host context. Native execution still validates through query.compute.
+      value: (raw: unknown) => validateMethodArgs(definition, raw),
+    });
     definitions[name] = Object.freeze({
-      kind: definition.kind, name, compute: bound(definition, runtime),
+      kind: definition.kind, name, compute,
       ...(sqlMethodInfo(definition) ? {terminal: sqlMethodInfo(definition)!.terminal} : {}),
       ...(aggregate ? { aggregate } : {}),
       ...(definition.kind === "derived" && derivedAccessOf(definition) !== undefined ? { access: derivedAccessOf(definition) } : {}),
