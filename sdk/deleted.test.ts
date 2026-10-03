@@ -222,6 +222,37 @@ test("a JSON-key parent deleted by a name-only reference still cascades and prop
   }
 });
 
+test("each trigger decodes its own source key when a name-only observer precedes tuple FK cascades", async () => {
+  for (const permanent of [false, true]) for (const raw of [false, true]) for (const retainedParent of [false, true]) {
+    const parents = collection<Json>("parents").key(tuple);
+    const children = collection<{ parent: string; n: number }>("children").references(parents, ["parent", "n"], { onDelete: "cascade" });
+    const archive = collection<Json[]>("archive"), observed = collection<Json[]>("observed");
+    const retain = (ctx: MutationContext, row: DeletedRow<any, any>) => ctx.set(archive, "all", [...(ctx.get(archive, "all") ?? []), row as unknown as Json]);
+    const record = (ctx: MutationContext, kind: string, key: Json) => ctx.set(observed, "all", [...(ctx.get(observed, "all") ?? []), { kind, key }]);
+    const db = await testDatabase(define({ collections: [children], triggers: [
+      trigger("rawObserver", collection<Json>("parents"), (ctx, change) => record(ctx, "raw", change.key)),
+      trigger("typedObserver", parents, (ctx, change) => record(ctx, "typed", change.key)),
+      ...(retainedParent ? [retainDeleted("p", parents, retain)] : []), retainDeleted("c", children, retain),
+    ], http: {
+      seed: mutation("seed", (ctx) => { ctx.set(parents, ["p", 1], {}); ctx.set(children, "c", { parent: "p", n: 1 }); return null; }),
+      drop: mutation("drop", (ctx) => {
+        if (raw) ctx.delete(collection<Json>("parents"), JSON.stringify(["p", 1]), { permanent });
+        else ctx.delete(parents, ["p", 1], { permanent });
+        return null;
+      }),
+      view: query("view", (ctx) => ({ parents: ctx.scan(parents), children: ctx.scan(children), archive: ctx.get(archive, "all") ?? [], observed: ctx.get(observed, "all") ?? [] })),
+    } }));
+    db.mutate("seed"); db.mutate("drop");
+    const view = db.query("view");
+    assert.deepEqual(view.parents, []); assert.deepEqual(view.children, []);
+    assert.deepEqual(view.observed, [
+      { kind: "raw", key: JSON.stringify(["p", 1]) }, { kind: "typed", key: ["p", 1] },
+      { kind: "raw", key: JSON.stringify(["p", 1]) }, { kind: "typed", key: ["p", 1] },
+    ]);
+    assert.deepEqual(view.archive.map((row: any) => row.collection).sort(), permanent ? [] : retainedParent ? ["children", "parents"] : ["children"]);
+  }
+});
+
 test("retention does not satisfy restrict FKs, and permanent deletion does not bypass them", async () => {
   const parents = collection<Json>("parents");
   const children = collection<{ parent: string }>("children").references(parents, "parent");

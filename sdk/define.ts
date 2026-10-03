@@ -73,8 +73,6 @@ interface Touch {
   /** A frozen plain reference the SDK built: host calls as the definer take no app object. */
   readonly target: { readonly kind: "collection"; readonly name: string };
   readonly name: string;
-  /** The collection has JSON keys (collection.key(schema)): triggers get them decoded. */
-  readonly keyed: boolean;
   readonly raw: string;
   readonly triggers: readonly Trigger[];
   /** The row before this round, or, for existence-only collections, whether it existed. */
@@ -232,13 +230,10 @@ function bind(host: Host, runtime: Runtime): Session {
     const id = name + "\u0000" + raw;
     if (touched.has(id)) return touched.get(id)!;
     const target = Object.freeze({ kind: "collection" as const, name });
-    // Trigger keys follow their declared source, even if the writer uses a fresh
-    // name-only reference with an already encoded raw key.
-    const keyed = Boolean(collectionInfo(triggers[0]!.source)?.key);
     const existence = runtime.existence.has(name);
     const known = existence && !runtime.guarded.has(name) ? exists.get(id) : undefined;
     const before = known ?? definer(() => existence ? host.get(target, raw) !== null : host.get(target, raw));
-    const entry: Touch = { target, name, keyed, raw, before, triggers };
+    const entry: Touch = { target, name, raw, before, triggers };
     touched.set(id, entry);
     return entry;
   }
@@ -357,16 +352,17 @@ function bind(host: Host, runtime: Runtime): Session {
       touched.clear();
       const removals = deleted.splice(0);
       for (const entry of batch) {
-        const key = () => entry.keyed ? JSON.parse(entry.raw) as Json : entry.raw;
         if (runtime.existence.has(entry.name)) {
           if (entry.before === entry.after) continue;
-          for (const each of entry.triggers) existenceTriggers.get(each)!(ctx, key(), entry.after as boolean, entry.permanent);
+          for (const each of entry.triggers) existenceTriggers.get(each)!(ctx, decodeKey(each.source, entry.raw), entry.after as boolean, entry.permanent);
           continue;
         }
         const after = entry.after as Json;
         if (sameValue(entry.before as Json, after)) continue;
-        const change = Object.freeze({ key: key(), before: entry.before as Json, after });
         for (const each of entry.triggers) {
+          // References to one collection may declare different key codecs. In particular, a name-only
+          // observer must not force an FK cascade to receive its encoded key instead of its tuple.
+          const change = Object.freeze({ key: decodeKey(each.source, entry.raw), before: entry.before as Json, after });
           const existence = existenceTriggers.get(each);
           if (!existence) each.run(ctx, change);
           else if ((change.before === null) !== (change.after === null)) existence(ctx, change.key, change.after !== null, entry.permanent);

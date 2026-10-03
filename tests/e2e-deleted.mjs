@@ -35,6 +35,10 @@ const restricted = collection<{parent: string}>("restricted").references(parents
 const nullable = collection<Json>("nullable");
 const archive = collection<(DeletedRow<Json, Json> & {by: string|null})[]>("archive")
   .access(({principal}) => ({read: principal.subject.eq("root"), write: false}));
+const tupleParents = collection<Json>("tupleParents").key(v.tuple([v.string(), v.int()]));
+const tupleChildren = collection<{parent: string; n: number}>("tupleChildren").references(tupleParents, ["parent", "n"], {onDelete: "cascade"});
+const tupleArchive = collection<Json[]>("tupleArchive");
+const tupleObserved = collection<Json[]>("tupleObserved");
 const changes = collection<Json[]>("changes").access(({principal}) => ({read: principal.subject.eq("root"), write: false}));
 const total = aggregate("total", {source: parents, index: "group", initial: () => 0,
   add: (n, row) => n + row.amount, remove: (n, row) => n - row.amount});
@@ -42,8 +46,12 @@ const retain = (ctx: any, row: any) => {
   ctx.set(archive, "all", [...(ctx.get(archive, "all") ?? []), {...row, by: ctx.principal()?.subject ?? null}]);
   if (row.value?.secret === "retention-fails") fail("RETENTION_FAILED", "retention rejected");
 };
-export default define({collections: [parents, children, leaves, restricted, nullable, archive, changes], definitions: [total],
-  triggers: [retainDeleted("retain:parents", parents, retain), retainDeleted("retain:children", children, retain),
+export default define({collections: [parents, children, leaves, restricted, nullable, archive, changes, tupleChildren], definitions: [total],
+  triggers: [
+    trigger("observe:rawTuple", collection<Json>("tupleParents"), (ctx, change) => ctx.set(tupleObserved, "all", [...(ctx.get(tupleObserved, "all") ?? []), {kind: "raw", key: change.key}])),
+    trigger("observe:typedTuple", tupleParents, (ctx, change) => ctx.set(tupleObserved, "all", [...(ctx.get(tupleObserved, "all") ?? []), {kind: "typed", key: change.key}])),
+    ...[tupleParents, tupleChildren].map((source) => retainDeleted("retain:" + source.name, source, (ctx, row) => ctx.set(tupleArchive, "all", [...(ctx.get(tupleArchive, "all") ?? []), row as any]))),
+    retainDeleted("retain:parents", parents, retain), retainDeleted("retain:children", children, retain),
     retainDeleted("retain:leaves", leaves, retain), retainDeleted("retain:nullable", nullable, retain),
     trigger("observe", parents, (ctx, change) => ctx.set(changes, "all", [...(ctx.get(changes, "all") ?? []), change as any]))],
   auth: {authenticate: (_ctx, credentials) => typeof credentials === "string" ? {subject: credentials} : null}, http: {
@@ -60,6 +68,9 @@ export default define({collections: [parents, children, leaves, restricted, null
     recreate: mutation("recreate", (ctx, key: string) => {const row = ctx.get(parents, key)!; ctx.delete(parents, key); ctx.set(parents, key, row); return null;}),
     abort: mutation("abort", (ctx) => {ctx.delete(parents, "rollback"); fail("ABORT", "abort before settlement");}),
     nullDrop: mutation("nullDrop", (ctx) => {ctx.delete(nullable, "null"); return null;}),
+    seedTuple: mutation("seedTuple", (ctx) => {ctx.set(tupleParents, ["p", 1], {}); ctx.set(tupleChildren, "c", {parent: "p", n: 1}); return null;}),
+    dropTuple: mutation("dropTuple", (ctx, permanent: boolean) => {ctx.delete(collection<Json>("tupleParents"), JSON.stringify(["p", 1]), {permanent}); return null;}),
+    viewTuple: query("viewTuple", (ctx) => ({parents: ctx.scan(tupleParents), children: ctx.scan(tupleChildren), archive: ctx.get(tupleArchive, "all") ?? [], observed: ctx.get(tupleObserved, "all") ?? []})),
     view: query("view", (ctx) => ({parents: ctx.scan(parents), children: ctx.scan(children), leaves: ctx.scan(leaves),
       matches: ctx.query(parents.by("group").eq("g")), page: ctx.range(parents.by("group").range({prefix: ["g"], limit: 20})),
       total: ctx.get(total, "g"), archive: ctx.get(archive, "all") ?? [], changes: ctx.get(changes, "all") ?? [], nullable: ctx.scan(nullable)})),
@@ -125,6 +136,13 @@ for (const initialization of ["per-invocation", "static"]) {
     assert.deepEqual(current.nullable, []);
     assert.equal(current.archive.length, retainedCount + 2);
     assert.equal(current.archive.at(-1).value, null);
+    for (const permanent of [false, true]) {
+      await mutate(rootUser, "seedTuple"); await mutate(rootUser, "dropTuple", permanent);
+      const tupleView = (await rootUser.query("viewTuple")).value;
+      assert.deepEqual(tupleView.parents, []); assert.deepEqual(tupleView.children, []);
+      assert.equal(tupleView.archive.length, 2, "only the normal tuple cascade is retained");
+      assert.deepEqual(tupleView.observed.slice(-2), [{kind: "raw", key: JSON.stringify(["p", 1])}, {kind: "typed", key: ["p", 1]}]);
+    }
     console.log(`PASS (${initialization}): real engine deletion retention, full hidden final payloads, decoded keys, unchanged net triggers/aggregates, caller admission, rollback, null rows and permanent FK cascade bypass`);
   } catch (error) {
     console.error(error);
