@@ -191,6 +191,51 @@ impl Consensus {
             .sql_capture_slice(self.partition.as_ref(), fence, expected, request, buffer)
     }
 
+    /// Enroll bounded dependencies only after validating all previous stamps
+    /// together against this publication. No source handles are retained.
+    #[cfg(feature = "sql")]
+    pub fn sql_capture_certify(
+        &self,
+        fence: &super::SqlCaptureFence,
+        certificate: &mut super::SqlCaptureCertificate,
+        dependencies: &[super::SqlCaptureDependency<'_>],
+    ) -> Result<super::SqlCaptureEpoch, super::SqlCaptureError> {
+        self.store
+            .sql_capture_certify(self.partition.as_ref(), fence, certificate, dependencies)
+    }
+
+    /// Capture a covered point/full-collection slice while all accumulated
+    /// dependencies still agree. Unrelated revisions need not abort capture.
+    #[cfg(feature = "sql")]
+    pub fn sql_capture_certified_slice(
+        &self,
+        fence: &super::SqlCaptureFence,
+        certificate: &super::SqlCaptureCertificate,
+        request: super::SqlCaptureRequest<'_>,
+        buffer: super::SqlCaptureBuffer,
+    ) -> Result<super::SqlCapturedSlice, super::SqlCaptureError> {
+        self.store.sql_capture_certified_slice(
+            self.partition.as_ref(),
+            fence,
+            certificate,
+            request,
+            buffer,
+        )
+    }
+
+    /// ONE final common coexistence revision, not the first slice or later
+    /// delivery revision. The controller freezes this sourceRevision at seal,
+    /// verifies range/chunk completeness, then drops capture/support/callbacks.
+    #[cfg(feature = "sql")]
+    pub fn sql_capture_validate(
+        &self,
+        fence: &super::SqlCaptureFence,
+        certificate: &super::SqlCaptureCertificate,
+    ) -> Result<super::SqlCaptureEpoch, super::SqlCaptureError> {
+        self.store
+            .sql_capture_validate(self.partition.as_ref(), fence, certificate)
+    }
+
     /// Fresh, linearizable query data on a leader or follower, without receipts.
     /// Concurrent callers share a sealed cohort, whose authenticated leader
     /// proof begins after every member enrolled. A later caller cannot reuse it.

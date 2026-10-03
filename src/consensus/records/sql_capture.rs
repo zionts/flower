@@ -14,6 +14,23 @@ fn stored_parts(bytes: &[u8]) -> Result<(u64, &[u8], usize), SqlCaptureError> {
     Ok((version, body, json_bytes))
 }
 impl Records {
+    /// Resident-only version/checked absence. No ordinary backing read, body
+    /// decode, memo, global cache or fallback walk is used for certificates.
+    pub(crate) fn sql_capture_version(&self, key: &str) -> Result<Option<u64>, SqlCaptureError> {
+        if let Some(entry) = self.map.get(key) {
+            return Ok(entry.value.as_ref().map(|_| entry.version));
+        }
+        let Some(backing) = &self.backing else {
+            return Ok(None);
+        };
+        let Some(value) = backing.capture_raw_get(key)? else {
+            return Ok(None);
+        };
+        let header = value.value().get(..8).ok_or(SqlCaptureError::Storage)?;
+        Ok(Some(u64::from_le_bytes(
+            header.try_into().map_err(|_| SqlCaptureError::Storage)?,
+        )))
+    }
     pub(crate) fn sql_capture_raw(
         &self,
         request: &SqlCaptureRequest<'_>,

@@ -79,10 +79,22 @@ pub(crate) fn next_version() -> u64 {
             block.set((next + 1, end));
             return next;
         }
-        let start = NEXT_VERSION.fetch_add(BLOCK, Ordering::Relaxed);
-        block.set((start + 1, start + BLOCK));
+        // Certificates must never accept ABA after scalar wrap. Exhaustion is
+        // fatal/fail-closed rather than silently handing out an old identity.
+        let (start, end) = reserve_version_block(&NEXT_VERSION, BLOCK)
+            .expect("record write version identity exhausted");
+        block.set((start + 1, end));
         start
     })
+}
+
+fn reserve_version_block(counter: &AtomicU64, size: u64) -> Option<(u64, u64)> {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |start| {
+            start.checked_add(size)
+        })
+        .ok()
+        .map(|start| (start, start + size))
 }
 
 /// A bound on every version handed out so far, to store alongside them.
