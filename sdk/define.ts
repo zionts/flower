@@ -1,9 +1,9 @@
 import { canonicalJson, type Json } from "./json.ts";
 import {
-  collection, collectionInfo, component, derivedAccessOf, fail, materializationOf, methodInfo, mutation, plainObject, query, rangeOwner, requireName, task, trigger,
+  collection, collectionInfo, component, derivedAccessOf, fail, materializationOf, methodInfo, mutation, plainObject, query, rangeOwner, requireName, retentionOf, task, trigger,
 } from "./core.ts";
 import type {
-  Access, AuthorizationRequest, Collection, Component, ComponentParts, Definition, Derived, Failure, FlowerModule, HttpMap,
+  Access, AuthorizationRequest, Collection, Component, ComponentParts, Definition, DeletedRow, DeleteOptions, Derived, Failure, FlowerModule, HttpMap,
   ManifestMethod, MutationContext, Principal, QueryContext, SetOptions, Task, TaskFailure, Trigger,
 } from "./core.ts";
 import { aggregateSource, checkReadable, collectionManifest, normalizeAggregateMetadata, referenceManifest, referenceTarget } from "./indexing.ts";
@@ -51,6 +51,8 @@ interface Session {
 }
 interface Runtime {
   readonly triggers: ReadonlyMap<string, readonly Trigger[]>;
+  /** One retention hook per collection name, independent of net-change triggers. */
+  readonly retentions: ReadonlyMap<string, Trigger>;
   /** Collections whose triggers only observe rows appearing or disappearing. */
   readonly existence: ReadonlySet<string>;
   readonly sessions: Map<object, Session>;
@@ -77,9 +79,11 @@ interface Touch {
   readonly triggers: readonly Trigger[];
   /** The row before this round, or, for existence-only collections, whether it existed. */
   readonly before: Json | boolean;
+  /** The last effective deletion of this row in this round bypassed retention. */
+  permanent?: boolean;
 }
 /** Internal triggers that need only a row's existence, run as (ctx, key, exists). */
-const existenceTriggers = new WeakMap<Trigger, (ctx: MutationContext, key: Json, exists: boolean) => void>();
+const existenceTriggers = new WeakMap<Trigger, (ctx: MutationContext, key: Json, exists: boolean, permanent?: boolean) => void>();
 const hosts = new WeakMap<object, Host>();
 /** Each bound context's raw host, without any definer capability. */
 const raws = new WeakMap<object, Host>();
@@ -167,7 +171,15 @@ function setClear(options: unknown): string[] {
   return [...clear] as string[];
 }
 
+function deleteOptions(options: unknown): DeleteOptions {
+  if (options === undefined) return {};
+  const { permanent } = plainObject(options, "delete options", ["permanent"]);
+  if (permanent !== undefined && typeof permanent !== "boolean") throw new TypeError("delete option permanent must be a boolean");
+  return { permanent: permanent === true };
+}
+
 function bind(host: Host, runtime: Runtime): Session {
+  const deleted: { readonly hook: Trigger; readonly event: DeletedRow<Json, Json> }[] = [];
   const touched = new Map<string, Touch>();
   // Row existence this mutation has observed or written, for existence-only collections.
   const exists = new Map<string, boolean>();
@@ -218,13 +230,17 @@ function bind(host: Host, runtime: Runtime): Session {
     const triggers = runtime.triggers.get(name);
     if (!triggers) return;
     const id = name + "\u0000" + raw;
-    if (touched.has(id)) return;
+    if (touched.has(id)) return touched.get(id)!;
     const target = Object.freeze({ kind: "collection" as const, name });
-    const keyed = Boolean(collectionInfo(reference)?.key);
+    // Trigger keys follow their declared source, even if the writer uses a fresh
+    // name-only reference with an already encoded raw key.
+    const keyed = Boolean(collectionInfo(triggers[0]!.source)?.key);
     const existence = runtime.existence.has(name);
     const known = existence && !runtime.guarded.has(name) ? exists.get(id) : undefined;
     const before = known ?? definer(() => existence ? host.get(target, raw) !== null : host.get(target, raw));
-    touched.set(id, { target, name, keyed, raw, before, triggers });
+    const entry: Touch = { target, name, keyed, raw, before, triggers };
+    touched.set(id, entry);
+    return entry;
   }
   const ctx: MutationContext = Object.freeze({
     now: () => host.now(),
@@ -278,11 +294,40 @@ function bind(host: Host, runtime: Runtime): Session {
       else host.set(reference, raw, value);
       observe(reference, raw, true);
     },
-    delete(reference: any, key: unknown) {
+    delete(reference: any, key: unknown, options?: DeleteOptions) {
       guard(reference);
+      // Validate caller objects before entering the definer scope.
+      const permanent = deleteOptions(options).permanent === true;
       const raw = encodeKey(reference, key);
-      track(reference, raw);
+      const name = reference.name as string;
+      const hook = runtime.retentions.get(name);
+      const entry = track(reference, raw);
+      if (!hook && !entry) {
+        host.delete(reference, raw);
+        observe(reference, raw, null);
+        return;
+      }
+      const target = Object.freeze({ kind: "collection" as const, name });
+      // Full reads use the application's rights, but deletion itself MUST remain under
+      // the caller's rights. A hidden row's skipped delete must never produce an event.
+      const stored = () => {
+        const value = host.get(target, raw) as Json;
+        // get() deliberately conflates a stored null and a missing row. A bounded
+        // raw-key scan distinguishes them so retention can preserve null values too.
+        const exists = value !== null || (host.scan(target, { gte: raw, lte: raw, limit: 1 }) as { key: string }[]).some((row) => row.key === raw);
+        return { value, exists };
+      };
+      const before = definer(stored);
       host.delete(reference, raw);
+      // delete cannot replace a nonnull value with null: there a raw get suffices.
+      // Only stored nulls need the exact-key scan again to distinguish a skipped delete.
+      const removed = before.exists && definer(() => before.value !== null ? host.get(target, raw) === null : !stored().exists);
+      if (removed) {
+        if (entry) entry.permanent = permanent;
+        if (hook && !permanent) deleted.push({ hook, event: Object.freeze({
+          collection: name, key: decodeKey(hook.source, raw), value: before.value, deletedAt: host.now() as number,
+        }) });
+      }
       observe(reference, raw, null);
     },
     materialize: (definition: any, args?: unknown) => { host.materialize(definition, args === undefined ? null : args); },
@@ -294,10 +339,10 @@ function bind(host: Host, runtime: Runtime): Session {
   raws.set(ctx, Object.freeze(raw));
   definers.set(ctx, definer);
   function flush() {
-    if (touched.size) definer(settle);
+    if (touched.size || deleted.length) definer(settle);
   }
   function settle() {
-    for (let round = 0; touched.size; round++) {
+    for (let round = 0; touched.size || deleted.length; round++) {
       if (round === 32) fail("TRIGGER_LOOP", "Triggers kept changing records for 32 rounds");
       // Read every after value before any trigger of this round runs: a trigger's own writes are
       // tracked for the next round, so reading them here too would report overlapping changes.
@@ -310,18 +355,24 @@ function bind(host: Host, runtime: Runtime): Session {
           : host.get(entry.target, entry.raw) as Json,
       }));
       touched.clear();
+      const removals = deleted.splice(0);
       for (const entry of batch) {
         const key = () => entry.keyed ? JSON.parse(entry.raw) as Json : entry.raw;
         if (runtime.existence.has(entry.name)) {
           if (entry.before === entry.after) continue;
-          for (const each of entry.triggers) existenceTriggers.get(each)!(ctx, key(), entry.after as boolean);
+          for (const each of entry.triggers) existenceTriggers.get(each)!(ctx, key(), entry.after as boolean, entry.permanent);
           continue;
         }
         const after = entry.after as Json;
         if (sameValue(entry.before as Json, after)) continue;
         const change = Object.freeze({ key: key(), before: entry.before as Json, after });
-        for (const each of entry.triggers) each.run(ctx, change);
+        for (const each of entry.triggers) {
+          const existence = existenceTriggers.get(each);
+          if (!existence) each.run(ctx, change);
+          else if ((change.before === null) !== (change.after === null)) existence(ctx, change.key, change.after !== null, entry.permanent);
+        }
       }
+      for (const { hook, event } of removals) retentionOf(hook)!(ctx, event);
     }
   }
   flushes.set(ctx, flush);
@@ -475,7 +526,7 @@ function materialization(definitions: readonly Definition[]): { tasks: Task[]; t
  * application's rights, as triggers do, so rows the caller can't see go too.
  */
 function referenceTriggers(collections: readonly Collection<any, any, any>[]): Trigger[] {
-  type Act = (ctx: MutationContext, raw: string) => void;
+  type Act = (ctx: MutationContext, raw: string, permanent: boolean) => void;
   const acts = new Map<string, { target: Collection<any, any, any>; acts: Act[] }>();
   // One action for each reference however many declarations carry it; the manifest checks that they agree.
   const seen = new Map<string, string>();
@@ -501,10 +552,10 @@ function referenceTriggers(collections: readonly Collection<any, any, any>[]): T
     }
   }
   return [...acts.values()].map(({ target, acts: list }) => {
-    const act = (ctx: MutationContext, key: Json, exists: boolean) => {
+    const act = (ctx: MutationContext, key: Json, exists: boolean, permanent = false) => {
       if (exists) return;
       const raw = collectionInfo(target)?.key ? canonicalJson(key) : key as string;
-      for (const each of list) each(ctx, raw);
+      for (const each of list) each(ctx, raw, permanent);
     };
     const each = trigger("$flower.references", target, (ctx, change) => {
       if (change.before !== null && change.after === null) act(ctx, change.key, false);
@@ -519,7 +570,7 @@ function referenceAct(child: Collection<any, any, any>, target: Collection<any, 
   const plain = Object.freeze({ kind: "collection" as const, name: child.name });
   const indexed = shape.fields && Object.freeze({ kind: "collection" as const, name: child.name, indexes: Object.freeze({ $references: shape.fields }) });
   const cleared = shape.fields && Object.fromEntries(shape.fields.map((field) => [field, null]));
-  return (ctx: MutationContext, raw: string) => {
+  return (ctx: MutationContext, raw: string, permanent: boolean) => {
     // Called while triggers settle, with the application's rights: the raw host reads every row.
     const host = hostContext(ctx);
     const rows: { key: string; value: Json }[] = [];
@@ -548,7 +599,7 @@ function referenceAct(child: Collection<any, any, any>, target: Collection<any, 
     }
     for (const row of rows) {
       const key = decodeKey(child, row.key);
-      if (onDelete === "cascade") ctx.delete(child, key);
+      if (onDelete === "cascade") ctx.delete(child, key, { permanent });
       else ctx.set(child, key, { ...(row.value as Record<string, Json>), ...cleared });
     }
   };
@@ -763,11 +814,21 @@ export function define<const H extends HttpMap = {}>(config: ModuleConfig<H> = {
   if (authorize) register(authorize, true);
 
   const triggers = new Map<string, Trigger[]>();
+  const retentions = new Map<string, Trigger>();
+  const triggerNames = new Map<string, Set<string>>();
   function addTrigger(each: Trigger) {
     const list = triggers.get(each.source.name) ?? [];
-    if (list.some((existing) => existing.name === each.name)) throw new TypeError(`Duplicate trigger ${JSON.stringify(each.name)}`);
-    list.push(each);
-    triggers.set(each.source.name, list);
+    const names = triggerNames.get(each.source.name) ?? new Set<string>();
+    if (names.has(each.name)) throw new TypeError(`Duplicate trigger ${JSON.stringify(each.name)}`);
+    names.add(each.name);
+    triggerNames.set(each.source.name, names);
+    if (retentionOf(each)) {
+      if (retentions.has(each.source.name)) throw new TypeError(`Duplicate retention for collection ${JSON.stringify(each.source.name)}`);
+      retentions.set(each.source.name, each);
+    } else {
+      list.push(each);
+      triggers.set(each.source.name, list);
+    }
   }
   const listed = [...flat.triggers, ...materialized.triggers];
   for (const each of listed) {
@@ -786,7 +847,7 @@ export function define<const H extends HttpMap = {}>(config: ModuleConfig<H> = {
     collections.push(each.source);
   }
   const existence = new Set([...triggers].filter(([, list]) => list.every((each) => existenceTriggers.has(each))).map(([name]) => name));
-  const runtime: Runtime = { triggers, existence, sessions: new Map(), guarded: new Set(), referring: new Set(), enforced: false };
+  const runtime: Runtime = { triggers, retentions, existence, sessions: new Map(), guarded: new Set(), referring: new Set(), enforced: false };
   if (typeof __flowerContexts !== "undefined") {
     for (const host of __flowerContexts) runtime.sessions.set(host, bind(host, runtime));
   }
