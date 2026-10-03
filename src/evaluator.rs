@@ -12,6 +12,13 @@ mod profile;
 pub(crate) mod rust_engine;
 pub(crate) mod sql;
 #[cfg(feature = "sql")]
+pub(crate) mod sql_bridge;
+#[cfg(feature = "sql")]
+pub(crate) mod sql_control;
+#[cfg(feature = "sql")]
+pub(crate) mod sql_frame;
+mod sql_registry;
+#[cfg(feature = "sql")]
 pub(crate) mod sqlite;
 pub(crate) mod staging;
 pub use rust_engine::{
@@ -695,6 +702,10 @@ fn evaluate_selected_cancellable(
     } else {
         None
     };
+    let terminal_registry = manifest
+        .as_ref()
+        .map(|manifest| sql_registry::build(&manifest.http))
+        .transpose()?;
     if let Some(manifest) = &manifest {
         // Install declarations before evaluating roots in the new bundle.
         // This field is internal and cannot be supplied by a public mutation.
@@ -717,6 +728,12 @@ fn evaluate_selected_cancellable(
         )?
     };
     limits.check()?;
+    if let Some(registry) = terminal_registry {
+        // This is in the SAME committed write set as bundle/schema/httpMethods.
+        // A capture preflight must not infer SQL absence from a legacy/missing
+        // registry, nor use this descriptor as authenticated authority.
+        result.puts.insert(sql_registry::RECORD.into(), registry);
+    }
     if let Some(manifest) = manifest {
         result.puts.insert(
             "authorizationMethod".into(),

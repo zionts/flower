@@ -175,6 +175,27 @@ pub(super) fn call(
     span_count: i32,
     result_pointer: i32,
 ) -> wasmtime::Result<i32> {
+    #[cfg(feature = "sql")]
+    if caller
+        .data()
+        .callback
+        .is_some_and(super::host::Callback::is_encoded)
+    {
+        // Check cancellation first, then deny BEFORE settings, descriptors,
+        // JSON/options/private-key parsing, clock calls or managed caches.
+        // Recorded context failure makes denial fatal even for guests which
+        // turn imported-call failures into catchable language exceptions. It
+        // is not misreported as a memory-limit/cancellation failure.
+        caller
+            .data()
+            .shared
+            .check()
+            .map_err(wasmtime::Error::from_anyhow)?;
+        caller.data_mut().encoded_crypto_denied = true;
+        return Err(wasmtime::Error::msg(
+            "SQL_CRYPTO_FORBIDDEN: crypto is unavailable on the bounded SQL route",
+        ));
+    }
     (|| -> Result<i32> {
         let shared = caller.data().shared.clone();
         shared.check()?;

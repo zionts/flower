@@ -379,6 +379,9 @@ fn minimal_guest_exposes_only_deterministic_javascript_intrinsics() {
 
 #[test]
 fn snapshotted_api_functions_are_isolated_and_application_freeze_hooks_are_not_called() {
+    // Shared engine/module setup precedes the finite invocation allowance,
+    // just as production warms its runtime before admitting timed requests.
+    warmup().unwrap();
     let code = format!(
         "{STATIC_INIT_MARKER}const originalFreeze=Object.freeze;let freezes=0;Object.freeze=function(value){{++freezes;return originalFreeze(value)}};{}",
         bundle(
@@ -391,7 +394,7 @@ fn snapshotted_api_functions_are_isolated_and_application_freeze_hooks_are_not_c
     // local to a single fresh Wasm invocation.
     let expected = json!({"ok":true,"value":{
         "before":null,"freezes":0,"frozen":true,
-        "keys":["now","clock","changesAt","principal","history","get","scan","query","range","set","delete","materialize","unmaterialize"]
+        "keys":["now","clock","changesAt","principal","history","codeVersion","get","scan","query","range","sql","set","delete","materialize","unmaterialize"]
     }});
     for _ in 0..3 {
         assert_eq!(run(&code, Value::Null).unwrap(), expected);

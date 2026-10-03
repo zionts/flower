@@ -37,6 +37,10 @@ fn invoke(source: &str, host: Value) -> (Value, Vec<(String, Value)>) {
 }
 
 #[test]
+#[allow(
+    clippy::approx_constant,
+    reason = "3.14 is an arbitrary codec decimal fixture, not an approximation of pi"
+)]
 fn results_are_plain_data_read_without_running_application_code() {
     let nested = |levels: usize| {
         let mut value = Value::Null;
