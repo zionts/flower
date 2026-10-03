@@ -12,6 +12,7 @@ fn schema(aggregate: bool) -> Schema {
         derived_access: Default::default(),
         aggregate_versions: Default::default(),
         references: Vec::new(),
+        sql: Vec::new(),
         indexes: vec![index.clone()],
         aggregates: if aggregate {
             BTreeMap::from([("total".into(), index)])
@@ -39,6 +40,7 @@ fn deploy_schema(
     apply(
         data,
         Evaluation {
+            sql_read: false,
             puts: evaluation.puts.clone(),
             deletes: evaluation.deletes.clone(),
             evaluated: vec![],
@@ -247,6 +249,7 @@ fn composite_index_distinguishes_absent_and_null_and_canonicalizes_objects() {
         derived_access: Default::default(),
         aggregate_versions: Default::default(),
         references: Vec::new(),
+        sql: Vec::new(),
         indexes: vec![IndexSpec {
             collection: "orders".into(),
             fields: vec!["shop".into(), "active".into()],
@@ -696,6 +699,7 @@ fn index_schema_metadata_reserves_memory_before_execution() {
         derived_access: Default::default(),
         aggregate_versions: Default::default(),
         references: Vec::new(),
+        sql: Vec::new(),
         indexes: vec![IndexSpec {
             collection: "orders".into(),
             fields: vec!["x".repeat(8192)],

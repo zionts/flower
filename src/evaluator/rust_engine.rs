@@ -15,6 +15,7 @@ mod indexes;
 mod ranges;
 mod reducers;
 mod references;
+mod sql;
 mod windows;
 pub use access::{Policy, Rule, validate_derived_targets, validate_targets};
 pub use indexes::{IndexSpec, Schema, valid_version};
@@ -154,6 +155,8 @@ struct Engine<'a> {
     staged: Records,
     mode: &'a str,
     principal: Value,
+    sql_method: String,
+    sql: sql::Allowance,
     /// No caller: maintenance, the authorization hook, deployments. Access
     /// policies apply only to invocations with one, even an anonymous one.
     system: bool,
@@ -313,6 +316,17 @@ fn run_with_limit_and_schema(
     let fixed_now = now.unwrap_or(stored_now).max(stored_now).max(graph_clock);
     let has_time = now.is_some() || fixed_now != stored_now;
     let query_cacheable = mode == "query" && data.reactive().cacheable();
+    let one_shot = mode == "query"
+        && data
+            .get("httpMethods")
+            .and_then(Value::as_object)
+            .is_some_and(|methods| {
+                methods.values().any(|method| {
+                    method["name"] == invocation["name"]
+                        && method["cache"] == false
+                        && method["watch"] == false
+                })
+            });
     // A reusable candidate would need certificates for both code versions.
     // Serial preparation keeps the shadow graph and active result indivisible.
     let speculative = mode == "mutation"
@@ -362,6 +376,12 @@ fn run_with_limit_and_schema(
         staged: data,
         mode,
         principal: invocation.get("$principal").cloned().unwrap_or(Value::Null),
+        sql_method: invocation
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        sql: sql::Allowance::default(),
         system: invocation.get("$principal").is_none(),
         access: HashMap::new(),
         definer: 0,
@@ -390,11 +410,12 @@ fn run_with_limit_and_schema(
         evaluated: Vec::new(),
         fatal: None,
         query_cacheable,
-        certifying: query_cacheable,
+        certifying: query_cacheable || one_shot,
         clock_polled: false,
         changes_at: None,
         speculative,
-        certificate: (query_cacheable || speculative).then(DependencyCertificate::default),
+        certificate: (query_cacheable || one_shot || speculative)
+            .then(DependencyCertificate::default),
         retained_costs: HashMap::new(),
         retained_bytes: schema_bytes,
         retained_limit,
@@ -521,6 +542,19 @@ fn list<'a>(value: &'a Value, field: &str) -> EngineResult<&'a [Value]> {
 
 impl Engine<'_> {
     fn check_fatal(&self) -> EngineResult<()> {
+        if let Some(error) = self.sql.failure.borrow().as_ref() {
+            return Err(error.clone());
+        }
+        if self
+            .sql
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(EngineError::new(
+                "SQL_DEADLINE",
+                "SQL execution deadline exceeded",
+            ));
+        }
         match &self.fatal {
             Some(error) => Err(error.clone()),
             None => self.execute.check_budget(),
@@ -1122,6 +1156,26 @@ impl Engine<'_> {
             );
         }
         self.count_operations(1)?;
+        if self.sql.callback.is_some()
+            && ![
+                "principal",
+                "history",
+                "codeVersion",
+                "get",
+                "scan",
+                "range",
+                "query",
+                "now",
+                "clock",
+                "changesAt",
+            ]
+            .contains(&operation)
+        {
+            return self.abort(
+                "SQL_CALLBACK_FORBIDDEN",
+                "SQL callbacks are pure invoker collection readers",
+            );
+        }
         let Value::Array(mut arguments) = arguments else {
             return Err(EngineError::new(
                 "INVALID_VALUE",
@@ -1130,10 +1184,26 @@ impl Engine<'_> {
         };
         let argument = |index: usize| arguments.get(index).unwrap_or(&Value::Null);
         match operation {
+            "sql" => self.sql_host(&arguments),
             "principal" => Ok(self.principal.clone().into()),
             "history" => {
                 self.marker_read(crate::consensus::HISTORY_MARKER);
                 Ok(self.base.get("$flower.retention").map_or(Value::Null, |state|json!({"database":state["database"],"incarnation":state["incarnation"]})).into())
+            }
+            "codeVersion" => {
+                self.record_read("bundle");
+                self.record_read("schema");
+                let generation = self
+                    .staged
+                    .get("bundle")
+                    .and_then(|bundle| bundle.get("hash"))
+                    .and_then(Value::as_str)
+                    .map(|hash| {
+                        let binding =
+                            json!([hash, self.staged.get("schema").unwrap_or(&Value::Null)]);
+                        crate::evaluator::hash(canonical_json(&binding).as_bytes())
+                    });
+                Ok(generation.map_or(Value::Null, Value::String).into())
             }
             "managedKey" => self.managed_key(argument(0)).map(Reply::Value),
             "now" => {
@@ -1179,6 +1249,7 @@ impl Engine<'_> {
                     let id = source_id(collection, key);
                     self.record_read(&id);
                     let value = self.source(&id).cloned();
+                    self.sql_charge_source(value.as_deref().unwrap_or(&Value::Null))?;
                     match (value, self.read_access(collection)) {
                         (Some(value), None) => self.copy_for_host(value),
                         (Some(value), Some(access)) => {
@@ -1197,6 +1268,12 @@ impl Engine<'_> {
                         (None, _) => Ok(Value::Null.into()),
                     }
                 } else {
+                    if self.sql.callback.is_some() {
+                        return self.abort(
+                            "SQL_CALLBACK_FORBIDDEN",
+                            "SQL callbacks cannot read privileged derived values",
+                        );
+                    }
                     let name = reference_name(reference, "derived")?.to_owned();
                     let args = normalize(argument(1).clone(), "INVALID_VALUE")?;
                     self.admit_derived_read(&name, &args)?;
@@ -1215,6 +1292,30 @@ impl Engine<'_> {
                 }
             }
             "scan" => {
+                if self.sql.callback.is_some() {
+                    let limit = arguments
+                        .get(1)
+                        .and_then(|options| options.get("limit"))
+                        .and_then(Value::as_u64);
+                    if limit.is_none_or(|limit| {
+                        limit == 0 || limit > crate::evaluator::sql::BATCH_ROWS as u64
+                    }) {
+                        return self.abort(
+                            "SQL_SOURCE_BUDGET",
+                            "SQL callback scans require a bounded native index range",
+                        );
+                    }
+                    if arguments
+                        .get(1)
+                        .and_then(|options| options.get("index"))
+                        .is_none()
+                    {
+                        return self.abort(
+                            "SQL_SOURCE_BUDGET",
+                            "SQL callback scans require a declared index",
+                        );
+                    }
+                }
                 if let Some(options) = arguments.get(1) {
                     let query = ranges::RangeQuery::parse_scan(argument(0), options)?;
                     let rows = self.range_rows(&query, true)?.rows;
@@ -1239,11 +1340,54 @@ impl Engine<'_> {
                 self.rows_for_host(rows)
             }
             "range" => {
+                if self.sql.callback.is_some()
+                    && argument(0)
+                        .get("options")
+                        .and_then(|options| options.get("limit"))
+                        .and_then(Value::as_u64)
+                        .is_none_or(|limit| {
+                            limit == 0 || limit > crate::evaluator::sql::BATCH_ROWS as u64
+                        })
+                {
+                    return self.abort("SQL_SOURCE_BUDGET", "SQL callback ranges must be bounded");
+                }
                 let query = ranges::RangeQuery::parse(argument(0))?;
                 Ok(self.range_rows(&query, true)?.rows)
             }
             "query" => {
                 let query = Query::parse(argument(0))?;
+                if self.sql.callback.is_some() {
+                    if !self.has_index(&query) {
+                        return self.abort(
+                            "SQL_SOURCE_BUDGET",
+                            "SQL callback queries require a declared index",
+                        );
+                    }
+                    let prefix = if query.fields.len() == 1 {
+                        vec![query.expected.clone()]
+                    } else {
+                        query.expected.as_array().cloned().ok_or_else(|| {
+                            EngineError::new(
+                                "SQL_SOURCE_BUDGET",
+                                "SQL callback query requires scalar index components",
+                            )
+                        })?
+                    };
+                    let range = ranges::RangeQuery::parse(
+                        &json!({"kind":"range","collection":query.collection,"fields":query.fields,"options":{"prefix":prefix,"limit":crate::evaluator::sql::BATCH_ROWS + 1}}),
+                    )?;
+                    let result = self.range_rows(&range, true)?.rows.into_value();
+                    let rows = result["rows"].as_array().expect("native page");
+                    if rows.len() > crate::evaluator::sql::BATCH_ROWS {
+                        return self.abort(
+                            "SQL_SOURCE_BUDGET",
+                            "SQL callback query exceeds bounded batch",
+                        );
+                    }
+                    return Ok(Reply::Value(Value::Array(
+                        rows.iter().map(|row| row["value"].clone()).collect(),
+                    )));
+                }
                 self.query_rows(&query, false)
             }
             "set" | "delete" => {
@@ -1576,6 +1720,7 @@ impl Engine<'_> {
         let query_cacheable = self.query_cacheable && certificate.is_some();
         let (query_clock_polled, query_changes_at) = (self.clock_polled, self.changes_at);
         let mode = self.mode;
+        let sql_read = self.sql.deadline.is_some();
         let output_limit = self.output_limit;
         // Newly staged values normally belong only to this private engine.
         // Release all overlay/preview references before forming the owned
@@ -1591,6 +1736,7 @@ impl Engine<'_> {
             evaluated,
             value,
             query_cacheable,
+            sql_read,
             query_clock_polled,
             query_changes_at,
             query_certificate: certificate,

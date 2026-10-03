@@ -338,3 +338,59 @@ async fn optional_cache_scratch_budget_does_not_reject_an_admissible_query() {
     );
     app.consensus.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn cache_false_bypasses_http_lookup_coalescing_and_insertion() {
+    let (_directory, app) = application(public_bundle()).await;
+    let input = json!({"name":"read","args":null});
+    read_query(&app, input.clone()).await.unwrap();
+    let snapshot = app.consensus.read().await.unwrap();
+    let mut methods = snapshot.data.get("httpMethods").unwrap().clone();
+    methods["read"]["cache"] = json!(false);
+    methods["read"]["watch"] = json!(false);
+    metadata(
+        &app,
+        BTreeMap::from([("httpMethods".into(), methods)]),
+        vec![],
+    )
+    .await;
+    let snapshot = app.consensus.read().await.unwrap();
+    let key = query_cache::key("read", &Value::Null, &Value::Null);
+    app.query_cache.insert(
+        snapshot.revision,
+        key.clone(),
+        json!("stale cache must not be used"),
+        Default::default(),
+    );
+    assert!(
+        cached_query_response(&app, &input, Some(MethodKind::Query))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let flight = app.query_cache.flight(snapshot.revision, &key).unwrap();
+    let _pending = flight.lock().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        query_http(State(app.clone()), Json(input.clone())),
+    )
+    .await
+    .expect("cache:false must not wait for a coalescing flight")
+    .unwrap();
+    assert_eq!(decode(result).await["value"]["value"], 6);
+    assert_eq!(
+        app.query_cache.get(snapshot.revision, &key, &snapshot.data),
+        Some(json!("stale cache must not be used")),
+        "cache:false must not insert either"
+    );
+    let response = watch::watch(State(app.clone()), Json(input))
+        .await
+        .unwrap_err();
+    assert_eq!(response.code, "WATCH_NOT_SUPPORTED");
+    assert_eq!(
+        app.watch_hubs.len(),
+        0,
+        "watch:false must be checked before hub registration"
+    );
+    app.consensus.shutdown().await.unwrap();
+}

@@ -574,6 +574,12 @@ impl Engine<'_> {
             None
         };
         let indexed = query.indexed(self);
+        if self.sql.callback.is_some() && !indexed {
+            return self.abort(
+                "SQL_SOURCE_BUDGET",
+                "SQL callback ranges require a declared native index",
+            );
+        }
         if query.source_keys {
             let collection = collection_id(&query.collection);
             self.marker_read(dependencies::keys_marker(&collection).expect("collection marker"));
@@ -769,6 +775,7 @@ impl Engine<'_> {
                         })?;
                     (id.clone(), key.to_owned(), value.clone())
                 };
+                self.sql_charge_source(&value)?;
                 if !visible(&key, &value) {
                     continue;
                 }

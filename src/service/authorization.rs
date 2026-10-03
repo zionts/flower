@@ -133,6 +133,8 @@ async fn authorize_inner(
     }});
     let data = state.data.clone();
     let now = app.clock.sample(state).map_err(unavailable)?;
+    let cancellation = super::cancellation::Request::new();
+    let token = cancellation.token();
     let permit = app
         .query_evaluations
         .clone()
@@ -143,7 +145,7 @@ async fn authorize_inner(
     let result = tokio::task::spawn_blocking(move || {
         let _admission = admission;
         let _permit = permit;
-        evaluator::invoke_at(data, invocation, "query", now)
+        evaluator::invoke_at_cancellable(data, invocation, "query", now, token)
     })
     .await
     .map_err(|error| unavailable(error.into()))?

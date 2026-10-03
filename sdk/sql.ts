@@ -31,6 +31,7 @@ export interface SqlReadContext {
   changesAt(time: number | null): void;
   principal(): Principal | null;
   history(): { readonly database: string; readonly incarnation: string } | null;
+  codeVersion(): string | null;
   get<T, K extends Json>(collection: Collection<T, K, any>, key: K): T | null;
   scan<T, K extends Json, I extends IndexMap>(collection: Collection<T, K, I>, options?: import("./core.ts").ScanOptions<I>): Row<T, K>[];
   range<T, K>(range: import("./core.ts").RangeQuery<T, K>): import("./core.ts").RangePage<T, K>;

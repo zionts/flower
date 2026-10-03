@@ -201,6 +201,7 @@ async fn flower_error_carries_failures_from_sse_error_events_and_watch_http_erro
     assert_eq!(
         bounded(watcher.next()).await.unwrap().unwrap(),
         QueryResult {
+            history: None,
             revision: 1,
             value: json!(1)
         }

@@ -71,7 +71,9 @@ flower_init() -> i32                        ; optional
 - **`flower_alloc`** returns guest memory the host writes into: invocation
   inputs and host-call responses. It traps on exhaustion.
 - **`flower_invoke`** runs one callback. `kind` is `0` query, `1` mutation,
-  `2` transaction or `3` derived. `name` is UTF-8 and `args` one value. It
+  `2` transaction, `3` derived, `4` dedicated SQL authority validation or
+  `5` dedicated invoker SQL provider. SQL kinds are experimental and cannot be
+  exposed as ordinary HTTP methods. `name` is UTF-8 and `args` one value. It
   returns `ptr | len << 32` of an *outcome* that stays valid until the next
   reset.
 - **`flower_manifest`** returns the module's manifest as a value (see below).
@@ -118,6 +120,8 @@ malformed arguments; unknown operations and resource failures trap instead.
 | 12 | clock | none | milliseconds | all |
 | 13 | changesAt | milliseconds or null | null | all |
 | 14 | definer | true or false | null | mutations |
+| 15 | sql | operation, catalog name, input, purpose | typed result | admitted one-shot query only; experimental hard HOLD |
+| 16 | codeVersion | none | trusted code/schema SHA-256 or null | reads |
 
 `definer(true)` and `definer(false)` bracket code that acts with the
 application's rights, such as triggers: collection access policies and derived
@@ -143,11 +147,11 @@ Entropy (opcode 0) is available only to mutations.
 
 ```json
 {
-  "definitions": {"name": {"kind": "derived|query|mutation|transaction",
-                           "consistency": "replica-local", "receipt": false,
+  "definitions": {"name": {"kind": "derived|query|mutation|transaction|sqlAuthority|sqlProvider",
+                           "consistency": "replica-local", "receipt": false, "cache": false, "watch": false,
                            "aggregate": {…}, "access": {…}}},
   "http": {"alias": {"name": "definition", "kind": "query|mutation|transaction",
-                     "consistency": "replica-local", "receipt": false}},
+                     "consistency": "replica-local", "receipt": false, "cache": false, "watch": false}},
   "maintenance": {"name": "…", "kind": "mutation", "onError": {…}} ,
   "authorize": {"name": "…", "result": "decision"},
   "collections": [{"name": "…", "indexes": {"index": ["field", …]}, "access": {…},
@@ -174,7 +178,7 @@ hook without `"result": "decision"`, holds the same way for calls whose
 or read untracked state is not reused. The host
 validates the manifest: HTTP aliases,
 maintenance and authorization must name definitions of the right kind, an
-alias's `consistency` (queries) and `receipt` (mutations) must match its
+alias's `consistency`/`cache`/`watch` (queries) and `receipt` (mutations) must match its
 definition's, and
 names starting with `$flower.` are reserved for SDK-generated definitions.
 A collection's optional `access` holds its policy: `read`, `insert`, `update`
@@ -228,3 +232,38 @@ is `Object.prototype` or `null` with only enumerable string-keyed data
 properties. Shared references are copied; cycles are rejected. A callback that
 returns anything else fails with `INVALID_VALUE`, and passing it to the
 database throws a catchable error with that code.
+
+
+## Experimental SQL catalog extension (HOLD)
+
+Optional top-level `sql` is an array of at most eight explicit catalogs. A catalog
+has `{name,version,authority,tables,relationships}`; a table has
+`{name,sources:[{name,jsonKey?}],columns,indexes?,provider,description?,grain?,coverage?}`.
+Columns are the explicit scalar descriptors of `sdk/sql.ts`; mappings are native
+`sourceField`/`sourceKey`, never inferred fields. Authority/provider references
+must target the dedicated callback kinds, and every source/index must be deployed
+in collections. Catalog/code/policies cut over as one schema. No collection is
+implicitly SQL-readable. Removing this metadata is not permission to downgrade
+replicas below the manifest/schema version they can read.
+
+Operation 15 takes `[operation,catalogName,input,purpose]`, where operation is
+query/catalog/explain/cancel. Query/explain input is the `SqlQueryInput` of
+`sdk/sql.ts`; cancel input is `{queryId}`. No principal argument exists. Every
+alias entering SQL must declare `cache:false,watch:false`; those flags bypass
+cache lookup/coalescing/insertion and deny server watch registration, not merely
+UI/result caching. Query returns `{result,provenance}` internally; only result is
+public human data. Provider rows bind to batch-local source ordinals and native
+ACL-redacted mapped columns. Policy reads join dependency certificates. Providers
+cannot write, elevate, read derived values, access managed keys or recursively
+invoke SQL. Authority's pure validation read rights never become provider rights.
+
+Operation 16 observes bundle/schema and returns the native SHA-256 of their
+canonical binding, or null without a deployment. It is available to queries and
+mutations for current-generation proof comparison, not user-selected generation.
+
+The bounded native evaluator is compiled only with feature `sql`. **The serving
+snapshot retention bound is not proved:** `Records::sql_snapshot_reservation_bytes`
+returns None for all roots. All operation-15 calls fail before callbacks with
+`SQL_SNAPSHOT_UNBOUNDED` in that build (`SQL_UNAVAILABLE` without it). No test/public
+bypass exists. Read `SQL.md` and `src/consensus/records_sql_snapshot.md`; standalone
+SQLite tests do not establish provider-policy/end-to-end launch evidence.

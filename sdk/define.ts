@@ -234,6 +234,7 @@ function bind(host: Host, runtime: Runtime): Session {
     clock: () => host.clock(),
     changesAt: (time: number | null) => { host.changesAt(time); },
     history: () => host.history(),
+    codeVersion: () => typeof host.codeVersion === "function" ? host.codeVersion() : fail("SQL_UNAVAILABLE", "Trusted code generation is unavailable in this runtime"),
     principal() {
       const principal = host.principal();
       return principal !== null && typeof principal === "object" && principal.subject === ANONYMOUS_SUBJECT ? null : principal;

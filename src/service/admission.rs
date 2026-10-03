@@ -162,10 +162,10 @@ impl Pool {
                 settings.control_queued_bytes,
                 settings.control_queued_bytes,
             ],
-            evaluator
-                .guest_memory_bytes
-                .checked_add(evaluator.rust_memory_bytes)
-                .ok_or_else(|| anyhow::anyhow!("evaluation memory reservation overflow"))?,
+            tuning::evaluation_memory_bytes(
+                evaluator.guest_memory_bytes,
+                evaluator.rust_memory_bytes,
+            )?,
         ))
     }
     /// User and control capacity; deployment work gets as much as control.

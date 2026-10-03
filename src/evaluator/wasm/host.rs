@@ -56,6 +56,8 @@ fn operation(op: i32) -> Result<&'static str> {
         12 => "clock",
         13 => "changesAt",
         14 => "definer",
+        15 => "sql",
+        16 => "codeVersion",
         _ => bail!("unknown host operation {op}"),
     })
 }

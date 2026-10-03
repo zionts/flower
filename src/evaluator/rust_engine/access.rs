@@ -1258,6 +1258,10 @@ impl Engine<'_> {
     pub(super) fn record_lookups(&mut self, reads: Vec<String>) -> EngineResult<()> {
         self.count_operations(reads.len())?;
         for id in reads {
+            if self.sql.deadline.is_some() {
+                let value = self.source(&id).cloned();
+                self.sql_charge_source(value.as_deref().unwrap_or(&Value::Null))?;
+            }
             self.record_read(id);
         }
         Ok(())
@@ -1274,8 +1278,12 @@ impl Engine<'_> {
         let (read, flip) = clock.take();
         if read {
             self.query_cacheable = false;
-            self.certifying = false;
-            self.clock_polled = true;
+            // Native SQL can certify a temporal rule only when its next flip
+            // is known. Ordinary watches/cache semantics remain unchanged.
+            if self.sql.deadline.is_none() || flip.is_none() {
+                self.certifying = false;
+                self.clock_polled = true;
+            }
         }
         match flip {
             Some(flip) => self.declare_change(&json!(flip)),

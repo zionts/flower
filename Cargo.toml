@@ -7,6 +7,11 @@ rust-version = "1.96"
 description = "A Raft-backed database of reactive values"
 license = "MIT"
 
+[features]
+default = []
+# Experimental: disabled until SQL integration/authority/resource launch gates pass.
+sql = ["dep:libsqlite3-sys"]
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1.18.1"
@@ -26,6 +31,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-executor = { version = "0.3", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
 im = "15.1"
+# Native read-only SQL: the allocator is configured before SQLite's first use.
+libsqlite3-sys = { version = "0.38.2", features = ["bundled"], optional = true }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 # Backup objects (src/consensus/backup/format.rs).
 zstd = { version = "0.14", default-features = false }

@@ -15,6 +15,7 @@ pub struct Limits {
     used: AtomicUsize,
     depth: AtomicUsize,
     failed: AtomicBool,
+    cancellation: Arc<AtomicBool>,
     native_stack_root: usize,
 }
 
@@ -26,16 +27,31 @@ fn stack_position() -> usize {
 
 impl Limits {
     pub fn new(deadline: Instant, memory_bytes: usize) -> Arc<Self> {
+        Self::new_cancellable(deadline, memory_bytes, Arc::new(AtomicBool::new(false)))
+    }
+    pub fn new_cancellable(
+        deadline: Instant,
+        memory_bytes: usize,
+        cancellation: Arc<AtomicBool>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             deadline,
             maximum: memory_bytes,
             used: AtomicUsize::new(0),
             depth: AtomicUsize::new(0),
             failed: AtomicBool::new(false),
+            cancellation,
             native_stack_root: stack_position(),
         })
     }
+    pub(in crate::evaluator) fn cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
     pub fn check(&self) -> Result<()> {
+        if self.cancelled() {
+            self.failed.store(true, Ordering::SeqCst);
+            anyhow::bail!("EVALUATION_CANCELLED: query execution cancelled");
+        }
         if Instant::now() >= self.deadline {
             self.failed.store(true, Ordering::SeqCst);
         }
@@ -123,11 +139,11 @@ impl ResourceLimiter for MemoryLimit {
         if desired > current && current != 0 {
             // Growth can change mappings. Stop protecting this instance before
             // Wasmtime touches them; grown or failed-growth cells are discarded.
-            if let Some(dirty) = &self.dirty {
-                if let Err(error) = dirty.unprotect() {
-                    self.shared.fail();
-                    return Err(wasmtime::Error::from_anyhow(error));
-                }
+            if let Some(dirty) = &self.dirty
+                && let Err(error) = dirty.unprotect()
+            {
+                self.shared.fail();
+                return Err(wasmtime::Error::from_anyhow(error));
             }
         }
         self.shared.check().map_err(wasmtime::Error::from_anyhow)?;
@@ -174,5 +190,46 @@ impl ResourceLimiter for MemoryLimit {
     }
     fn tables(&self) -> usize {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn cancellation_is_shared_by_nested_limits_and_sticky() {
+        let token = Arc::new(AtomicBool::new(false));
+        let limits =
+            Limits::new_cancellable(Instant::now() + Duration::from_secs(5), 1024, token.clone());
+        let child = limits.clone();
+        child.check().unwrap();
+        token.store(true, Ordering::Release);
+        assert!(
+            limits
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("EVALUATION_CANCELLED")
+        );
+        assert!(child.check().is_err());
+        token.store(false, Ordering::Release);
+        assert!(
+            limits.check().is_err(),
+            "a failed invocation cannot recover"
+        );
+        assert!(limits.check_sound().is_err());
+    }
+
+    #[test]
+    fn ordinary_limits_have_independent_uncancelled_tokens() {
+        let token = Arc::new(AtomicBool::new(true));
+        let cancelled =
+            Limits::new_cancellable(Instant::now() + Duration::from_secs(5), 1024, token);
+        assert!(cancelled.check().is_err());
+        Limits::new(Instant::now() + Duration::from_secs(5), 1024)
+            .check()
+            .unwrap();
     }
 }

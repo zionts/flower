@@ -34,7 +34,7 @@ export interface RequestOptions {
   retry?: RetryPolicy | boolean;
 }
 export interface MutationOptions extends RequestOptions { requestId?: string; expectedRevision?: number }
-export interface QueryResult<Value = Json> { revision: number; value: Value }
+export interface QueryResult<Value = Json> { revision: number; value: Value; /** Trusted same-snapshot identity on one-shot reads; absent on older servers. */ history?: { database: string; incarnation: string } | null }
 export interface MutationResult<Value = Json> extends QueryResult<Value> { duplicate: boolean }
 export interface WatchOptions extends WatchBudgets { signal?: AbortSignal; credentials?: Json }
 export interface WatchPollOptions extends RequestOptions { /** Integer milliseconds in 1..2147483647. Default: 250. */ intervalMs?: number }

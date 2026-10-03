@@ -796,6 +796,7 @@ impl Decodable for QueryResult<Value> {
     type Output<T> = QueryResult<T>;
     fn decode<T: DeserializeOwned>(self) -> Result<QueryResult<T>, FlowerError> {
         Ok(QueryResult {
+            history: self.history,
             revision: self.revision,
             value: serde_json::from_value(self.value).map_err(|error| {
                 FlowerError::decode(format!("Invalid watched value: {error}"), 0)
@@ -1100,6 +1101,7 @@ impl FlowerClient {
                     let item = match watcher.delta().await? {
                         Ok(delta) => match advance(&mut baseline, &delta, &budgets) {
                             Ok(()) => Ok(QueryResult {
+                                history: None,
                                 revision: delta.revision(),
                                 value: baseline.clone(),
                             }),

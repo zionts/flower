@@ -538,3 +538,45 @@ fn bootstrap_bindings_cannot_be_reached_or_shadowed_by_application_code() {
         }
     }
 }
+
+#[test]
+fn sql_callbacks_have_dedicated_read_only_kinds_without_definer_capability() {
+    warmup().unwrap();
+    for kind in ["sqlAuthority", "sqlProvider"] {
+        let source = format!(
+            "var __flowerBundle={{default:{{definitions:{{test:{{name:'test',kind:'{kind}',compute:function(ctx,args,capability){{return [Object.isFrozen(ctx),typeof ctx.set,typeof ctx.definer,typeof capability,ctx.codeVersion()]}}}}}},http:{{}}}}}};"
+        );
+        let result = execute(
+            &source,
+            "test",
+            &Value::Null,
+            kind,
+            &mut |operation, _| {
+                assert_eq!(operation, "codeVersion");
+                Ok(json!("trusted-generation"))
+            },
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["value"],
+            json!([
+                true,
+                "undefined",
+                "undefined",
+                "undefined",
+                "trusted-generation"
+            ])
+        );
+        let wrong = execute(
+            &source,
+            "test",
+            &Value::Null,
+            "derived",
+            &mut |_, _| Ok(Value::Null),
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(wrong["error"]["code"], "METHOD_KIND_MISMATCH");
+    }
+}

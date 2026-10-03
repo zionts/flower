@@ -1,0 +1,51 @@
+<section id="status" data-toc="Status and hard gate">
+<h2>Experimental foundation: unavailable</h2>
+<p><strong>HOLD, not a released SQL interface.</strong> The opt-in native evaluator is compiled only with <code>--features sql</code>. Complete serving-snapshot retention has not been hard-bounded: the native host refuses all SQL operations with <code>SQL_SNAPSHOT_UNBOUNDED</code> even in that build. The default build refuses them with <code>SQL_UNAVAILABLE</code>. There is no test/public bypass. SQLite allocator/operator unit tests are not end-to-end provider-policy conformance.</p>
+<p>The source foundation uses real SQLite virtual tables over bounded authorized native candidate pages, never a whole-organization JSON export or persistent replica. Collections are not automatically exposed. Applications must wait for the snapshot/resource/authority/cancellation gates before exposing SQL aliases. Read the repository's <code>SQL.md</code> and <code>src/consensus/records_sql_snapshot.md</code> for the precise limits, evidence, and requirements for opening the gate.</p>
+</section>
+<section id="declarations" data-toc="Declarations">
+<h2>Opt-in declarations</h2>
+<div class="table-wrap"><table><thead><tr><th>API</th><th>Contract</th></tr></thead><tbody>
+<tr><th><code data-api-symbol="sqlTable">sqlTable(spec: SqlTableSpec): SqlTable</code></th><td>Curated logical relation. Requires exactly one source or a bounded union, explicit columns and a pure projector. Registered only through a catalog.</td></tr>
+<tr><th><code data-api-symbol="SqlTableSpec">SqlTableSpec</code></th><td>Name, source or sources (1–8 collections), columns (1–64), approved indexes, description/grain/coverage, and project(ctx,batch).</td></tr>
+<tr><th><code data-api-symbol="SqlTable">SqlTable</code></th><td>Frozen declaration with kind sqlTable. One candidate may expand into many task/goal rows.</td></tr>
+<tr><th><code data-api-symbol="SqlColumn">SqlColumn</code></th><td>Name, type integer/real/text; optional nullable, description, logicalType, unit, sourceField or sourceKey. Native mappings use only the redacted source row; missing/null/redacted values stay SQL NULL.</td></tr>
+<tr><th><code data-api-symbol="SqlIndex">SqlIndex</code></th><td>Name and logical columns whose native sourceField mapping matches declared source indexes. Initial pushdown is conservative BINARY text equality only, never claimed ordering or input LIMIT.</td></tr>
+<tr><th><code data-api-symbol="SqlRelationship">SqlRelationship</code></th><td>Name, fromTable/fromColumns, toTable/toColumns, optional description. Logical metadata, not a privileged join source.</td></tr>
+<tr><th><code data-api-symbol="sqlCatalog">sqlCatalog(spec: SqlCatalogSpec): SqlCatalog</code></th><td>Explicit authority callback and logical table set. Register in define({sql:[catalog]}), atomically with code, schema and policy.</td></tr>
+<tr><th><code data-api-symbol="SqlCatalogSpec">SqlCatalogSpec</code></th><td>Name, version, tables, optional relationships, authorize(ctx,request). No default-open authority.</td></tr>
+<tr><th><code data-api-symbol="SqlCatalog">SqlCatalog</code></th><td>Frozen kind sqlCatalog declaration. Version is app-selected metadata; use trusted codeVersion() and history() for deployment/incarnation replay fencing.</td></tr>
+</tbody></table></div>
+</section>
+<section id="callbacks" data-toc="Authority and providers">
+<h2>Authority ends before providers</h2>
+<div class="table-wrap"><table><thead><tr><th>API</th><th>Contract</th></tr></thead><tbody>
+<tr><th><code data-api-symbol="SqlReadContext">SqlReadContext</code></th><td>Pure collection point reads and bounded declared-index reads, principal/history/codeVersion and certified clock/changesAt. No writes, definer elevation, derived reads, SQL recursion, managed keys, filesystem/network or entropy.</td></tr>
+<tr><th><code data-api-symbol="SqlAuthorityContext">SqlAuthorityContext</code></th><td>Dedicated pure deployed validation callback. Application auth-row read rights do not flow into providers; users cannot provide an effective principal.</td></tr>
+<tr><th><code data-api-symbol="SqlProviderContext">SqlProviderContext</code></th><td>Dedicated rights-preserving callback, not a derived value. Effective invoker, snapshot, cumulative budgets and data/policy dependencies are retained.</td></tr>
+<tr><th><code data-api-symbol="SqlAuthorityRequest">SqlAuthorityRequest</code></th><td>{catalog,invoker,purpose}; raw purpose is untrusted. Verify current human authority or a live database-local captured session grant/generation/lease and destination audience.</td></tr>
+<tr><th><code data-api-symbol="SqlAuthorityDecision">SqlAuthorityDecision</code></th><td>{principal,context,tables} or null from authorize. tables is an explicit logical allowlist, also applied to discovery. Only validated context reaches provider purpose.</td></tr>
+<tr><th><code data-api-symbol="SqlProviderInput">SqlProviderInput</code></th><td>{source:{name},rows:[{key,value}],purpose}; bounded candidates are already collection-ACL filtered/redacted. SDK decodes JSON keys; native sourceKey columns intentionally retain encoded text.</td></tr>
+<tr><th><code data-api-symbol="SqlProjectedRow">SqlProjectedRow</code></th><td>{sourceRow,cells}; sourceRow is a validated batch-local ordinal. Native mapped columns override placeholders from that exact redacted candidate.</td></tr>
+<tr><th><code data-api-symbol="SqlProviderBatch">SqlProviderBatch</code></th><td>{rows,provenance?}. Provenance is bounded trusted internal evidence; never expose it as human cells/catalogs/errors or log it on failure.</td></tr>
+</tbody></table></div>
+<p>Temporal policy helpers must use clock() and declare every known future expiry with changesAt(). Unknown/polled temporal authority fails closed. Before delivery, the service reauthorizes on current serving state and validates source/policy dependencies and expiry. Agent logging/publication still needs separate atomic current audience/exposure admission.</p>
+</section>
+<section id="execution" data-toc="Execution and transport">
+<h2>One-shot typed reads</h2>
+<div class="table-wrap"><table><thead><tr><th>API</th><th>Contract</th></tr></thead><tbody>
+<tr><th><code data-api-symbol="SqlContext">SqlContext</code></th><td>QueryContext.sql: query/catalog/explain/cancel. Every exposed SQL method requires cache:false,watch:false; server lookup/coalescing/insertion and watch registration are refused independently.</td></tr>
+<tr><th><code data-api-symbol="SqlQueryInput">SqlQueryInput</code></th><td>{sql,parameters?,maxRows?,queryId?}; positional parameters, default 100 rows, at most 1000. Query ID is ephemeral, not a row ID or authorization capability.</td></tr>
+<tr><th><code data-api-symbol="JsonScalar">JsonScalar</code></th><td>null, boolean, finite JSON number or string. Wide exact integers belong in decimal source/tagged cells, not lossy JSON numbers.</td></tr>
+<tr><th><code data-api-symbol="SqlCell">SqlCell</code></th><td>null | {integer:string} | {real:number} | {text:string}. Signed-i64 integers stay exact. Nonfinite reals and blobs fail.</td></tr>
+<tr><th><code data-api-symbol="SqlResultColumn">SqlResultColumn</code></th><td>{name,logicalType?,unit?}. Ordered descriptors preserve duplicate aliases.</td></tr>
+<tr><th><code data-api-symbol="SqlResult">SqlResult</code></th><td>{columns,rows:SqlCell[][],resultTruncated,warnings,catalogVersion}. A presentation cap can truncate; source/work failures are errors, never partial COUNT/SUM success.</td></tr>
+<tr><th><code data-api-symbol="SqlExecution">SqlExecution</code></th><td>{result,provenance}. Public human aliases return result only; private evidence is for independently reauthorized completion.</td></tr>
+<tr><th><code data-api-symbol="SqlCatalogColumn">SqlCatalogColumn</code></th><td>Public column metadata, omitting physical sourceField/sourceKey mappings.</td></tr>
+<tr><th><code data-api-symbol="SqlCatalogInfo">SqlCatalogInfo</code></th><td>{name,catalogVersion,tables,relationships}; authorized logical metadata only. Built-in sql_tables/sql_columns/sql_relationships need no durable mirror.</td></tr>
+<tr><th><code data-api-symbol="SqlExplain">SqlExplain</code></th><td>{catalogVersion,plan:[{detail}],warnings}. Logical plans never expose hidden source names/cardinality.</td></tr>
+<tr><th><code data-api-method="QueryContext.codeVersion">ctx.codeVersion(): string | null</code></th><td>Native SHA-256 binding to the current validated deployed bundle and schema/policy/catalog generation. Records dependencies. Mutations compare it for anti-replay; old/Node runtimes fail rather than synthesize a hash.</td></tr>
+</tbody></table></div>
+<p>query(catalog,input,purpose?) returns SqlExecution; catalog(catalog,purpose?) returns SqlCatalogInfo; explain(catalog,input,purpose?) returns SqlExplain; cancel(catalog,queryId,purpose?) returns boolean. Cancellation is keyed by freshly verified original/effective principal, purpose, partition and query ID, with permits retained until actual termination.</p>
+<p>Trusted one-shot HTTP envelopes add history:{database,incarnation}|null beside revision/value, from the exact native snapshot. Separate requests take fresh snapshots. The Node testDatabase refuses native SQL; the real-server harness must currently confirm the hard HOLD, not claim positive provider conformance.</p>
+</section>

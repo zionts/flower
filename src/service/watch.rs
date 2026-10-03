@@ -143,6 +143,13 @@ async fn refresh_after(
         // Every subscriber independently enters admission before capturing a
         // root, proves its consistency fence, and authorizes on every wake.
         let (state, method, permit) = query_snapshot(app, input, Some(MethodKind::Query)).await?;
+        if !method.watch {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "WATCH_NOT_SUPPORTED",
+                "this query method does not support watches".into(),
+            ));
+        }
         let authorization::Access {
             principal,
             validity: access,

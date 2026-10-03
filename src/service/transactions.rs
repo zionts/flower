@@ -910,6 +910,13 @@ async fn prepare_with_budget(
         .map_err(|_| evaluation_deadline())??;
         let data = staged.clone();
         let evaluation = tokio::time::timeout_at(deadline, async {
+            let cancellation = super::cancellation::Request::new();
+            let token = cancellation.token();
+            #[cfg(any(feature = "sql", test))]
+            let partition = app
+                .consensus
+                .partition_binding()
+                .map(|binding| binding.partition.clone());
             let permit = app
                 .evaluations
                 .clone()
@@ -920,7 +927,13 @@ async fn prepare_with_budget(
             tokio::task::spawn_blocking(move || {
                 let _admitted = admitted;
                 let _permit = permit;
-                evaluator::invoke_as(data, invocation, kind, now, principal)
+                #[cfg(any(feature = "sql", test))]
+                let _cancellation_scope = super::cancellation::scope(
+                    partition.as_deref(),
+                    principal.clone(),
+                    token.clone(),
+                );
+                evaluator::invoke_as_cancellable(data, invocation, kind, now, principal, token)
             })
             .await
             .map_err(|error| unavailable(error.into()))?

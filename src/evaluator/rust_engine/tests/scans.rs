@@ -25,6 +25,7 @@ fn install(data: &mut Records, fixture: &Fixture) {
             derived_access: Default::default(),
             aggregate_versions: Default::default(),
             references: Vec::new(),
+            sql: Vec::new(),
             indexes: vec![IndexSpec {
                 collection: "items".into(),
                 fields: vec!["tenant".into(), "score".into()],
@@ -874,6 +875,7 @@ fn undeclared_equality_queries_rerun_only_for_their_bucket() {
         derived_access: Default::default(),
         aggregate_versions: Default::default(),
         references: Vec::new(),
+        sql: Vec::new(),
         indexes: vec![IndexSpec {
             collection: "items".into(),
             fields: vec!["state".into()],

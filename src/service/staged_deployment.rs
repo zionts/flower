@@ -428,6 +428,7 @@ async fn start(app: &App, request_id: String, bundle: Value) -> Result<Value, Ap
         policies: BTreeMap::new(),
         derived_access: BTreeMap::new(),
         references: Vec::new(),
+        sql: Vec::new(),
     };
     let command = command(
         &state,

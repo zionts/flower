@@ -335,6 +335,8 @@ export interface QueryContext extends Context {
   readonly sql: SqlContext;
   /** Stable across movement; changes on a fenced disaster restore. Null before retention initialization. */
   history(): HistoryIdentity | null;
+  /** Trusted current deployed code + schema generation, including policy/catalog changes. */
+  codeVersion(): string | null;
   /** The authenticated caller, or null for anonymous and unauthenticated calls. */
   principal(): Principal | null;
 }

@@ -206,6 +206,22 @@ impl Records {
         Self::default()
     }
 
+    /// A proved upper bound on all native memory a SQL snapshot may retain.
+    /// `None` means unbounded/unknown, never zero; SQL admission must reject it.
+    ///
+    /// This gate intentionally stays closed. Map/value sizes omit persistent
+    /// validation, graph and membership roots. A backing additionally pins a
+    /// database-wide redb read transaction: concurrent writes can grow its
+    /// native allocator metadata, outside the page-cache budget. Neither the
+    /// current row count nor a deadline bounds that growth. Returning an
+    /// estimate here would turn the snapshot reservation into a soft limit.
+    /// See `records_sql_snapshot.md` for the evidence and requirements to open
+    /// the gate. In particular, this O(1) check performs no backing reads.
+    #[cfg(feature = "sql")]
+    pub(crate) fn sql_snapshot_reservation_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Records served from a stored snapshot, with derived metadata rebuilt
     /// from its reader records rather than from every record.
     pub(crate) fn backed(backing: Arc<Backing>) -> Self {
@@ -1106,6 +1122,10 @@ impl<'de> Deserialize<'de> for Records {
         deserializer.deserialize_map(RecordsVisitor)
     }
 }
+
+#[cfg(all(test, feature = "sql"))]
+#[path = "records_sql_snapshot_tests.rs"]
+mod sql_snapshot_tests;
 
 #[cfg(test)]
 mod tests {

@@ -36,8 +36,8 @@ pub use admin::{
 };
 pub use bundle::{Bundle, BundleOptions, Initialization, JavaScriptBundle, build_bundle};
 pub use client::{
-    ClientBuilder, CredentialProvider, Credentials, DEFAULT_URL, FlowerClient, MutationOptions,
-    MutationResult, QueryResult, RequestOptions, new_request_id,
+    ClientBuilder, CredentialProvider, Credentials, DEFAULT_URL, FlowerClient, HistoryIdentity,
+    MutationOptions, MutationResult, QueryResult, RequestOptions, new_request_id,
 };
 pub use error::{ErrorKind, Failure, FlowerError};
 pub use json::canonical_json;

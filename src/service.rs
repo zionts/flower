@@ -1,4 +1,5 @@
 mod admission;
+pub(crate) mod cancellation;
 mod clock;
 mod forwarding;
 mod keys;
@@ -463,7 +464,7 @@ async fn cached_query_response_inner(
     let local_method = http_method(&local, name, expected);
     if !local_method
         .as_ref()
-        .is_ok_and(|method| method.kind == MethodKind::Query)
+        .is_ok_and(|method| method.kind == MethodKind::Query && method.cache)
     {
         // This probe cannot answer a mutation or an unresolved alias. Normal
         // dispatch performs its own fresh lookup, without a redundant fence.
@@ -486,7 +487,7 @@ async fn cached_query_response_inner(
         (state, method)
     };
     transactions::ensure_unlocked(&state)?;
-    if method.kind != MethodKind::Query {
+    if method.kind != MethodKind::Query || !method.cache {
         return Ok(None);
     }
     if input.get("expectedRevision").is_some() {
@@ -694,6 +695,8 @@ async fn mutation_hint_response(
 
 struct QueryResult {
     revision: u64,
+    /// Service-pinned identity for explicitly one-shot reads; never guest generated.
+    history: Option<Value>,
     value: Value,
     validity: Validity,
     /// What the value depends on, when only writes can change it.
@@ -791,7 +794,11 @@ struct QueryAdmission {
 
 impl QueryResult {
     fn response(self) -> Json<Value> {
-        Json(json!({"revision":self.revision,"value":self.value,"duplicate":false}))
+        let mut response = json!({"revision":self.revision,"value":self.value,"duplicate":false});
+        if let Some(history) = self.history {
+            response["history"] = history;
+        }
+        Json(response)
     }
 }
 
@@ -851,16 +858,27 @@ async fn evaluate_query_authorized(
     principal: Value,
 ) -> Result<QueryEvaluation, ApiError> {
     let QueryAdmission { permit, coalesce } = admission;
-    let key = query_cache::key(
-        &method.name,
-        input.get("args").unwrap_or(&Value::Null),
-        &principal,
-    );
-    if let Some((value, certificate)) = app.query_cache.get_certified(&key, &state.data) {
+    let key = if method.cache {
+        query_cache::key(
+            &method.name,
+            input.get("args").unwrap_or(&Value::Null),
+            &principal,
+        )
+    } else {
+        // SQL arguments may be large or sensitive. An explicit opt-out does
+        // not allocate a cache/coalescing key at all.
+        String::new()
+    };
+    if let Some((value, certificate)) = method
+        .cache
+        .then(|| app.query_cache.get_certified(&key, &state.data))
+        .flatten()
+    {
         crate::telemetry::query_cache("hit");
         return Ok(QueryEvaluation::Ready(
             QueryResult {
                 revision: state.revision,
+                history: None,
                 value,
                 validity: Validity::Stable,
                 certificate: Some(certificate),
@@ -872,7 +890,7 @@ async fn evaluate_query_authorized(
     // Identical concurrent requests share a first evaluation, then recheck the
     // cache. Only proven clock-independent results can be reused. Once a first
     // evaluation finishes without a reusable result, waiters run independently.
-    let flight = coalesce
+    let flight = (method.cache && coalesce)
         .then(|| app.query_cache.flight(state.revision, &key))
         .flatten();
     let mut flight = match &flight {
@@ -901,11 +919,16 @@ async fn evaluate_query_authorized(
         },
         None => None,
     };
-    if let Some((value, certificate)) = app.query_cache.get_certified(&key, &state.data) {
+    if let Some((value, certificate)) = method
+        .cache
+        .then(|| app.query_cache.get_certified(&key, &state.data))
+        .flatten()
+    {
         crate::telemetry::query_cache("hit_after_coalesce");
         return Ok(QueryEvaluation::Ready(
             QueryResult {
                 revision: state.revision,
+                history: None,
                 value,
                 validity: Validity::Stable,
                 certificate: Some(certificate),
@@ -921,7 +944,16 @@ async fn evaluate_query_authorized(
     // can release the original request without cloning its argument tree.
     let invocation =
         json!({"name":method.name,"args":input.get("args").cloned().unwrap_or(Value::Null)});
+    let history = (!method.cache && !method.watch).then(|| state.data.get("$flower.retention").map(|history| json!({"database":history["database"],"incarnation":history["incarnation"]})).unwrap_or(Value::Null));
+    let invoker = principal.clone();
     let held_permit = permit.clone();
+    let cancellation = cancellation::Request::new();
+    let token = cancellation.token();
+    #[cfg(any(feature = "sql", test))]
+    let partition = app
+        .consensus
+        .partition_binding()
+        .map(|binding| binding.partition.clone());
     crate::telemetry::query_cache("evaluated");
     let span = tracing::info_span!(target: "flower::otel", "flower.query.evaluate");
     let worker_span = span.clone();
@@ -937,8 +969,13 @@ async fn evaluate_query_authorized(
                 );
             }
             let _permit = held_permit;
+            #[cfg(any(feature = "sql", test))]
+            let _cancellation_scope =
+                cancellation::scope(partition.as_deref(), principal.clone(), token.clone());
             let work = Work::start();
-            let result = evaluator::invoke_as(state.data, invocation, "query", now, principal);
+            let result = evaluator::invoke_as_cancellable(
+                state.data, invocation, "query", now, principal, token,
+            );
             result.map(|result| (result, work.elapsed()))
         })
         .await
@@ -957,10 +994,53 @@ async fn evaluate_query_authorized(
     }
     let (result, work) = result?;
     let validity = Validity::of(&result);
+    if result.sql_read {
+        let Some(certificate) = result.query_certificate.as_ref() else {
+            return Err(evaluation_error(anyhow::Error::new(
+                evaluator::rust_engine::EngineError::new(
+                    "SQL_POLICY_UNCERTIFIED",
+                    "SQL delivery requires complete authority and source policy dependencies",
+                ),
+            )));
+        };
+        // Finish against current serving authority, not merely the captured read.
+        // A failed final check discards data/provenance. Never silently rerun an
+        // expensive query or deliver a partial aggregate under stale authority.
+        let current = app.consensus.read_query().await.map_err(unavailable)?;
+        transactions::ensure_unlocked(&current)?;
+        let current_method = http_method(
+            &current,
+            input["name"].as_str().expect("validated method"),
+            Some(MethodKind::Query),
+        )?;
+        let current_principal =
+            authorization::authorize_admitted(app, &current, input, &permit).await?;
+        let now = app.clock.sample(&current).map_err(unavailable)?;
+        let time_valid = match validity {
+            Validity::Stable => true,
+            Validity::Until(expires) => now < expires,
+            Validity::Polled => false,
+        };
+        if current_method != method
+            || current_principal != invoker
+            || !time_valid
+            || !certificate.valid(&current.data)
+        {
+            return Err(evaluation_error(anyhow::Error::new(
+                evaluator::rust_engine::EngineError::new(
+                    "SQL_AUTHORITY_CHANGED",
+                    "SQL read authority or source policy changed before delivery",
+                ),
+            )));
+        }
+    }
     // A result that read the clock keeps its certificate for watches, which
     // also wake when it declared time changes it; only others are reusable.
     let certificate = result.query_certificate.map(Arc::new);
-    if let Some(certificate) = certificate.as_ref().filter(|_| result.query_cacheable) {
+    if let Some(certificate) = certificate
+        .as_ref()
+        .filter(|_| method.cache && result.query_cacheable)
+    {
         app.query_cache.insert(
             state.revision,
             key,
@@ -971,6 +1051,7 @@ async fn evaluate_query_authorized(
     Ok(QueryEvaluation::Ready(
         QueryResult {
             revision: state.revision,
+            history,
             value: result.value,
             validity,
             certificate,

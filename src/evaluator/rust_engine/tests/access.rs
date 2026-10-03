@@ -208,6 +208,7 @@ fn install_with(
                 .unwrap_or_default(),
             aggregate_versions: BTreeMap::new(),
             references: Vec::new(),
+            sql: Vec::new(),
         }),
     )
     .unwrap();
@@ -1350,6 +1351,7 @@ fn log_setup() -> (Records, Fixture) {
             derived_access: BTreeMap::new(),
             aggregate_versions: BTreeMap::new(),
             references: Vec::new(),
+            sql: Vec::new(),
         }),
     )
     .unwrap();

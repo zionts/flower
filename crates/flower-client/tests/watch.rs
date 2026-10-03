@@ -98,6 +98,7 @@ async fn watch_reconstructs_deltas_same_revision_clocks_and_snapshot_fallback() 
     assert_eq!(
         bounded(watcher.next()).await.unwrap().unwrap(),
         QueryResult {
+            history: None,
             revision: 1,
             value: json!({"list": [1, 2], "label": "first"})
         }
@@ -105,6 +106,7 @@ async fn watch_reconstructs_deltas_same_revision_clocks_and_snapshot_fallback() 
     assert_eq!(
         bounded(watcher.next()).await.unwrap().unwrap(),
         QueryResult {
+            history: None,
             revision: 2,
             value: json!({"fresh": true})
         }
@@ -706,18 +708,22 @@ async fn shared_producers_allow_nonzero_joins_and_reset_gaps_while_patches_requi
         values,
         [
             QueryResult {
+                history: None,
                 revision: 3,
                 value: json!({"n": 7})
             },
             QueryResult {
+                history: None,
                 revision: 4,
                 value: json!({"n": 8})
             },
             QueryResult {
+                history: None,
                 revision: 8,
                 value: json!({"n": 20})
             },
             QueryResult {
+                history: None,
                 revision: 8,
                 value: json!({"n": 21})
             },

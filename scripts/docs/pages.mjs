@@ -8,6 +8,12 @@ export const groups = [
 
 export const pages = [
   {
+    path: "reference/sql.html", group: "reference", label: "SQL foundation (HOLD)",
+    title: "Explicit catalogs. Hard safety gates.",
+    lead: "Experimental SQL declarations and native boundaries. The snapshot retention gate is not proved; all native SQL operations remain unavailable.",
+    description: "Experimental, disabled Flower SQL catalog, provider, authority, typed transport and fail-closed snapshot contracts.",
+  },
+  {
     path: "guide/index.html", group: "guide", label: "Get started",
     title: "Run Flower in five minutes.",
     lead: "Download the server, start one node, deploy an app and call it.",

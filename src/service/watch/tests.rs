@@ -33,6 +33,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<App>) {
 
 fn query_result(value: Value, revision: u64) -> QueryResult {
     QueryResult {
+        history: None,
         value,
         revision,
         validity: Validity::Stable,

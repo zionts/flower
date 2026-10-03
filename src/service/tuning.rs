@@ -82,6 +82,26 @@ pub(super) fn watch_timeout(read: Duration, evaluation: Duration) -> anyhow::Res
     Ok(timeout)
 }
 
+/// SQL's native allocator and bounded host/guest bridge are separate from the
+/// guest linear-memory and Rust coordinator budgets. Reserve them per admitted
+/// job, even for ordinary aliases: an alias may enter SQL in a nested callback.
+pub(super) fn evaluation_memory_bytes(guest: usize, rust: usize) -> Result<usize> {
+    #[cfg(feature = "sql")]
+    let sql = crate::evaluator::sql::NATIVE_BYTES
+        .checked_add(crate::evaluator::sql::BRIDGE_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("native SQL memory reservation overflow"))?;
+    #[cfg(not(feature = "sql"))]
+    let sql = 0;
+    evaluation_memory_bytes_with_sql(guest, rust, sql)
+}
+
+fn evaluation_memory_bytes_with_sql(guest: usize, rust: usize, sql: usize) -> Result<usize> {
+    guest
+        .checked_add(rust)
+        .and_then(|bytes| bytes.checked_add(sql))
+        .ok_or_else(|| anyhow::anyhow!("evaluation memory reservation overflow"))
+}
+
 pub(super) fn settings() -> Result<&'static Settings> {
     static SETTINGS: OnceLock<Result<Settings, String>> = OnceLock::new();
     SETTINGS
@@ -142,13 +162,13 @@ pub(super) fn settings() -> Result<&'static Settings> {
             let control_workers = admission("FLOWER_CONTROL_WORKERS", 1)?;
             let deployment_workers = admission("FLOWER_DEPLOYMENT_WORKERS", 1)?;
             let evaluator = crate::evaluator::config::settings().map_err(|error| error.to_string())?;
-            let per_job = evaluator.guest_memory_bytes.checked_add(evaluator.rust_memory_bytes)
-                .ok_or("evaluation memory reservation overflow")?;
+            let per_job = evaluation_memory_bytes(evaluator.guest_memory_bytes, evaluator.rust_memory_bytes)
+                .map_err(|error| error.to_string())?;
             let preparation_memory_bytes = option("FLOWER_PREPARATION_MEMORY_BYTES", per_job.saturating_mul(preparation_workers))?;
             let control_memory_bytes = option("FLOWER_CONTROL_MEMORY_BYTES", per_job.saturating_mul(control_workers))?;
             let deployment_memory_bytes = option("FLOWER_DEPLOYMENT_MEMORY_BYTES", per_job.saturating_mul(deployment_workers))?;
             if preparation_memory_bytes < per_job || control_memory_bytes < per_job || deployment_memory_bytes < per_job {
-                return Err("Preparation/control/deployment memory budgets must fit at least one guest + Rust evaluation reservation".into());
+                return Err("Preparation/control/deployment memory budgets must fit at least one guest + Rust + enabled native SQL evaluation reservation".into());
             }
             let deployment_cutover = Duration::from_millis(
                 u64::try_from(bytes("FLOWER_DEPLOYMENT_CUTOVER_MS", 1000)?)
@@ -202,6 +222,25 @@ pub(super) fn settings() -> Result<&'static Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_sql_and_bridge_memory_enter_the_whole_job_reservation() {
+        let sql = 40 * 1024 * 1024;
+        assert_eq!(
+            evaluation_memory_bytes_with_sql(128, 256, sql).unwrap(),
+            sql + 384
+        );
+        assert_eq!(evaluation_memory_bytes_with_sql(128, 256, 0).unwrap(), 384);
+        assert!(evaluation_memory_bytes_with_sql(usize::MAX, 1, sql).is_err());
+        assert!(evaluation_memory_bytes_with_sql(usize::MAX - sql + 1, 0, sql).is_err());
+        #[cfg(feature = "sql")]
+        let enabled = crate::evaluator::sql::NATIVE_BYTES
+            + crate::evaluator::sql::BRIDGE_BYTES
+            + crate::evaluator::sql::SNAPSHOT_BYTES;
+        #[cfg(not(feature = "sql"))]
+        let enabled = 0;
+        assert_eq!(evaluation_memory_bytes(128, 256).unwrap(), 384 + enabled);
+    }
 
     #[test]
     fn combined_watch_deadline_rejects_overflow() {

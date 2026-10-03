@@ -136,6 +136,9 @@ pub struct Schema {
     /// rows that exist. Each one held by fields has its index among `indexes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<super::ReferenceSpec>,
+    /// Explicit opt-in logical catalogs, cut over atomically with code and policies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sql: Vec<crate::evaluator::sql::Catalog>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -206,6 +209,9 @@ impl Schema {
             });
         let policies = self.references.iter().fold(policies, |bytes, reference| {
             bytes.saturating_add(reference.allocation_cost())
+        });
+        let policies = self.sql.iter().fold(policies, |bytes, catalog| {
+            bytes.saturating_add(catalog.allocation_cost())
         });
         policies.saturating_add(
             self.indexes.iter().chain(self.aggregates.values()).fold(
@@ -286,6 +292,15 @@ impl Schema {
                 ));
             }
         }
+        let mut catalogs = HashSet::new();
+        for catalog in &self.sql {
+            if !catalogs.insert(catalog.name.as_str()) {
+                return Err(EngineError::new("INPUT_INVALID", "Duplicate SQL catalog"));
+            }
+            catalog
+                .validate()
+                .map_err(|message| EngineError::new("INPUT_INVALID", message))?;
+        }
         self.references.sort();
         self.references.dedup();
         Ok(self)
@@ -308,6 +323,7 @@ impl Schema {
             && self.policies.is_empty()
             && self.derived_access.is_empty()
             && self.references.is_empty()
+            && self.sql.is_empty()
     }
 }
 

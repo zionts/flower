@@ -34,6 +34,8 @@ const USAGES: [&str; 6] = [
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Derived,
+    SqlAuthority,
+    SqlProvider,
     Method(MethodKind),
 }
 
@@ -41,6 +43,8 @@ struct Definition<'a> {
     kind: Kind,
     consistency: QueryConsistency,
     receipt: bool,
+    cache: bool,
+    watch: bool,
     aggregate: Option<&'a Value>,
     access: Option<&'a Value>,
 }
@@ -83,6 +87,15 @@ fn receipt(entries: &Map<String, Value>, mutation: bool) -> Result<bool> {
         (None, _) => Ok(true),
         (Some(Value::Bool(receipt)), true) => Ok(*receipt),
         _ => bail!("receipt requires a mutation method and a boolean"),
+    }
+}
+
+/// Cache and watch flags are explicit opt-outs on query definitions/aliases.
+fn query_flag(entries: &Map<String, Value>, name: &str, query: bool) -> Result<bool> {
+    match (entries.get(name), query) {
+        (None, _) => Ok(true),
+        (Some(Value::Bool(value)), true) => Ok(*value),
+        _ => bail!("{name} requires a query method and a boolean"),
     }
 }
 
@@ -296,7 +309,60 @@ fn schema(app: &Map<String, Value>, definitions: &BTreeMap<&str, Definition>) ->
         .map_err(|error| anyhow!("Invalid access rule for derived {error}"))?;
     declared_references.sort();
     declared_references.dedup();
+    let sql: Vec<super::sql::Catalog> = app
+        .get("sql")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    ensure!(
+        sql.len() <= 8,
+        "At most eight SQL catalogs can be registered"
+    );
+    let mut catalog_names = BTreeSet::new();
+    for catalog in &sql {
+        catalog.validate().map_err(anyhow::Error::msg)?;
+        ensure!(catalog_names.insert(&catalog.name), "Duplicate SQL catalog");
+        ensure!(
+            definitions
+                .get(catalog.authority.as_str())
+                .is_some_and(|definition| definition.kind == Kind::SqlAuthority),
+            "SQL authority requires its dedicated pure callback kind"
+        );
+        for table in &catalog.tables {
+            ensure!(
+                definitions
+                    .get(table.provider.as_str())
+                    .is_some_and(|definition| definition.kind == Kind::SqlProvider),
+                "SQL provider requires its dedicated invoker callback kind"
+            );
+            for source in &table.sources {
+                ensure!(
+                    declared.contains(source.name.as_str()),
+                    "SQL source collection must be declared"
+                );
+                for index in &table.indexes {
+                    let fields: Vec<String> = index
+                        .columns
+                        .iter()
+                        .map(|name| {
+                            table
+                                .columns
+                                .iter()
+                                .find(|column| column.name == *name)
+                                .and_then(|column| column.source_field.clone())
+                                .expect("validated SQL mapping")
+                        })
+                        .collect();
+                    ensure!(
+                        identities.contains(&(source.name.clone(), fields)),
+                        "SQL index must match declared native fields"
+                    );
+                }
+            }
+        }
+    }
     Ok(Schema {
+        sql,
         indexes,
         aggregates,
         aggregate_versions,
@@ -317,7 +383,8 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
                 "maintenance",
                 "collections",
                 "keys",
-                "authorize"
+                "authorize",
+                "sql"
             ]
         ),
         "Use define({{definitions, http, maintenance, collections, keys, authorize}}) to declare the application"
@@ -328,25 +395,39 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
         let definition = object(Some(value), "definition")?;
         let kind = match text(definition, "kind") {
             Some("derived") => Some(Kind::Derived),
+            Some("sqlAuthority") => Some(Kind::SqlAuthority),
+            Some("sqlProvider") => Some(Kind::SqlProvider),
             kind => method_kind(kind).map(Kind::Method),
         };
         let Some(kind) = kind.filter(|_| {
             !name.is_empty()
                 && only(
                     definition,
-                    &["kind", "consistency", "receipt", "aggregate", "access"],
+                    &[
+                        "kind",
+                        "consistency",
+                        "receipt",
+                        "cache",
+                        "watch",
+                        "aggregate",
+                        "access",
+                    ],
                 )
         }) else {
             bail!("Invalid definition: {name}");
         };
         let consistency = consistency(definition, kind == Kind::Method(MethodKind::Query))?;
         let receipt = receipt(definition, kind == Kind::Method(MethodKind::Mutation))?;
+        let cache = query_flag(definition, "cache", kind == Kind::Method(MethodKind::Query))?;
+        let watch = query_flag(definition, "watch", kind == Kind::Method(MethodKind::Query))?;
         definitions.insert(
             name.as_str(),
             Definition {
                 kind,
                 consistency,
                 receipt,
+                cache,
+                watch,
                 aggregate: definition.get("aggregate"),
                 access: definition.get("access"),
             },
@@ -367,7 +448,11 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
             bail!("Invalid HTTP method mapping: {alias}");
         };
         ensure!(
-            !alias.is_empty() && only(method, &["name", "kind", "consistency", "receipt"]),
+            !alias.is_empty()
+                && only(
+                    method,
+                    &["name", "kind", "consistency", "receipt", "cache", "watch"]
+                ),
             "Invalid HTTP method mapping: {alias}"
         );
         let mode = consistency(method, kind == MethodKind::Query)?;
@@ -380,6 +465,16 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
             receipt == target.receipt,
             "HTTP receipt must match its mutation definition: {alias}"
         );
+        let cache = query_flag(method, "cache", kind == MethodKind::Query)?;
+        let watch = query_flag(method, "watch", kind == MethodKind::Query)?;
+        ensure!(
+            cache == target.cache,
+            "HTTP cache must match its query definition: {alias}"
+        );
+        ensure!(
+            watch == target.watch,
+            "HTTP watch must match its query definition: {alias}"
+        );
         http.insert(
             alias.clone(),
             HttpMethod {
@@ -387,6 +482,8 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
                 kind,
                 consistency: mode,
                 receipt,
+                cache,
+                watch,
             },
         );
     }
@@ -418,6 +515,8 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
                         kind: MethodKind::Mutation,
                         consistency: QueryConsistency::Linearizable,
                         receipt: true,
+                        cache: true,
+                        watch: true,
                     })
                 }
             };
@@ -465,11 +564,89 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sql_catalogs_are_opt_in_and_require_dedicated_callbacks_and_registered_sources() {
+        let mut raw = serde_json::json!({
+            "definitions":{"auth":{"kind":"sqlAuthority"},"project":{"kind":"sqlProvider"},"run":{"kind":"query","cache":false,"watch":false}},
+            "http":{"run":{"name":"run","kind":"query","cache":false,"watch":false}},
+            "collections":[{"name":"physical_private","indexes":{}}],
+            "sql":[{"name":"app","version":"1","authority":"auth","tables":[{"name":"notes","sources":[{"name":"physical_private"}],"columns":[{"name":"id","type":"text","sourceKey":true}],"provider":"project"}]}]
+        });
+        let catalog = validate(&raw).unwrap();
+        assert_eq!(catalog.schema.sql.len(), 1);
+        assert_eq!(catalog.schema.sql[0].tables[0].name, "notes");
+        raw["definitions"]["project"]["kind"] = serde_json::json!("derived");
+        assert!(
+            validate(&raw)
+                .unwrap_err()
+                .to_string()
+                .contains("dedicated invoker")
+        );
+        raw["definitions"]["project"]["kind"] = serde_json::json!("sqlProvider");
+        raw["collections"] = serde_json::json!([]);
+        assert!(
+            validate(&raw)
+                .unwrap_err()
+                .to_string()
+                .contains("source collection must be declared")
+        );
+        raw["collections"] = serde_json::json!([{"name":"physical_private","indexes":{}}]);
+        raw["http"]["escape"] = serde_json::json!({"name":"project","kind":"query"});
+        assert!(
+            validate(&raw).is_err(),
+            "callbacks cannot be exposed as public methods"
+        );
+        raw.as_object_mut().unwrap().remove("sql");
+        raw["http"].as_object_mut().unwrap().remove("escape");
+        assert!(
+            validate(&raw).unwrap().schema.sql.is_empty(),
+            "no automatic collection exposure"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
     fn error(raw: Value) -> String {
         validate(&raw).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn query_cache_and_watch_flags_are_typed_query_only_and_alias_matched() {
+        let manifest = validate(&json!({
+            "definitions": {"q": {"kind":"query", "cache":false, "watch":false}},
+            "http": {"q": {"name":"q", "kind":"query", "cache":false, "watch":false}}
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(manifest.http).unwrap(),
+            json!({
+                "q": {"name":"q", "kind":"query", "cache":false, "watch":false}
+            })
+        );
+        for property in ["cache", "watch"] {
+            for kind in ["mutation", "transaction", "derived"] {
+                for value in [Value::Null, json!(false), json!(true)] {
+                    let mut definition = json!({"kind":kind});
+                    definition[property] = value;
+                    assert!(validate(&json!({"definitions":{"q":definition},"http":{}})).is_err());
+                }
+            }
+            for value in [Value::Null, json!("false"), json!(0)] {
+                let mut definition = json!({"kind":"query"});
+                definition[property] = value;
+                assert!(validate(&json!({"definitions":{"q":definition},"http":{}})).is_err());
+            }
+            let mut definition = json!({"kind":"query"});
+            definition[property] = json!(false);
+            assert!(validate(&json!({"definitions":{"q":definition},"http":{"q":{"name":"q","kind":"query"}}})).is_err());
+            let mut alias = json!({"name":"q","kind":"query"});
+            alias[property] = json!(false);
+            assert!(
+                validate(&json!({"definitions":{"q":{"kind":"query"}},"http":{"q":alias}}))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

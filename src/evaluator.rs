@@ -10,6 +10,9 @@ mod oracle;
 mod perf_tests;
 mod profile;
 pub(crate) mod rust_engine;
+pub(crate) mod sql;
+#[cfg(feature = "sql")]
+pub(crate) mod sqlite;
 pub(crate) mod staging;
 pub use rust_engine::{
     DependencyCertificate, MutationCertificate, Observation, touched, touches_everything,
@@ -24,7 +27,7 @@ mod wire;
 
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -43,6 +46,9 @@ pub struct Evaluation {
     pub value: Value,
     #[serde(default)]
     pub query_cacheable: bool,
+    /// Native SQL requires fresh dependency/authority validation before delivery.
+    #[serde(skip)]
+    pub(crate) sql_read: bool,
     /// The result read the clock without saying when it changes (ctx.now()).
     #[serde(default)]
     pub query_clock_polled: bool,
@@ -102,6 +108,12 @@ pub struct HttpMethod {
     /// again. Only mutations may give it up.
     #[serde(skip_serializing_if = "is_true")]
     pub receipt: bool,
+    /// Whether the service may reuse or coalesce a query result.
+    #[serde(skip_serializing_if = "is_true")]
+    pub cache: bool,
+    /// Whether a query may register a watch producer.
+    #[serde(skip_serializing_if = "is_true")]
+    pub watch: bool,
 }
 
 fn is_true(value: &bool) -> bool {
@@ -119,12 +131,22 @@ struct RawHttpMethod {
     consistency: Option<QueryConsistency>,
     #[serde(default)]
     receipt: Option<bool>,
+    #[serde(default, deserialize_with = "present_bool")]
+    cache: Option<bool>,
+    #[serde(default, deserialize_with = "present_bool")]
+    watch: Option<bool>,
 }
 
 fn present_consistency<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<QueryConsistency>, D::Error> {
     QueryConsistency::deserialize(deserializer).map(Some)
+}
+
+fn present_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 impl TryFrom<RawHttpMethod> for HttpMethod {
@@ -137,11 +159,16 @@ impl TryFrom<RawHttpMethod> for HttpMethod {
         if method.kind != MethodKind::Mutation && method.receipt.is_some() {
             return Err("receipt is only supported on mutation methods");
         }
+        if method.kind != MethodKind::Query && (method.cache.is_some() || method.watch.is_some()) {
+            return Err("cache and watch are only supported on query methods");
+        }
         Ok(Self {
             name: method.name,
             kind: method.kind,
             consistency: method.consistency.unwrap_or_default(),
             receipt: method.receipt.unwrap_or(true),
+            cache: method.cache.unwrap_or(true),
+            watch: method.watch.unwrap_or(true),
         })
     }
 }
@@ -369,23 +396,65 @@ pub fn invoke_at(
     )
 }
 
-/// Only trusted service code supplies a principal. Public validation rejects
-/// this internal field, including attempts through the generic call endpoint.
-pub(crate) fn invoke_as(
+/// The authorization hook runs with existing system rights, not a principal.
+/// Preserve those rights while still cancelling its blocking work on drop.
+pub(crate) fn invoke_at_cancellable(
     data: impl Into<Records>,
-    mut invocation: Value,
+    invocation: Value,
     kind: &str,
     now: u64,
-    principal: Value,
+    cancellation: Arc<AtomicBool>,
 ) -> Result<Evaluation> {
     validate_invocation(&invocation, kind)?;
-    invocation["$principal"] = principal;
-    evaluate_inner(
+    evaluate_inner_cancellable(
         data.into(),
         invocation,
         kind,
         config::settings()?.evaluation_timeout,
         Some(now),
+        cancellation,
+    )
+}
+
+/// Only trusted service code supplies a principal. Public validation rejects
+/// this internal field, including attempts through the generic call endpoint.
+pub(crate) fn invoke_as(
+    data: impl Into<Records>,
+    invocation: Value,
+    kind: &str,
+    now: u64,
+    principal: Value,
+) -> Result<Evaluation> {
+    invoke_as_cancellable(
+        data,
+        invocation,
+        kind,
+        now,
+        principal,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+/// Trusted service invocation with one cancellation token shared by Wasm,
+/// nested callbacks and native work. Cancelling never releases admission: the
+/// service retains that lease until this synchronous call actually returns.
+pub(crate) fn invoke_as_cancellable(
+    data: impl Into<Records>,
+    mut invocation: Value,
+    kind: &str,
+    now: u64,
+    principal: Value,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Evaluation> {
+    validate_invocation(&invocation, kind)?;
+    invocation["$principal"] = principal;
+    evaluate_inner_cancellable(
+        data.into(),
+        invocation,
+        kind,
+        config::settings()?.evaluation_timeout,
+        Some(now),
+        cancellation,
     )
 }
 
@@ -487,9 +556,28 @@ fn evaluate_inner(
     timeout: Duration,
     now: Option<u64>,
 ) -> Result<Evaluation> {
+    evaluate_inner_cancellable(
+        data,
+        mutation,
+        mode,
+        timeout,
+        now,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+fn evaluate_inner_cancellable(
+    data: Records,
+    mutation: Value,
+    mode: &str,
+    timeout: Duration,
+    now: Option<u64>,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Evaluation> {
     let data = data.graph_view(data.active_graph());
     let started = Instant::now();
-    let mut evaluation = evaluate_selected(data.clone(), mutation, mode, timeout, now)?;
+    let mut evaluation =
+        evaluate_selected_cancellable(data.clone(), mutation, mode, timeout, now, cancellation)?;
     if matches!(mode, "mutation" | "keyUpdate") {
         staging::maintain(
             &data,
@@ -506,10 +594,28 @@ fn evaluate_inner(
 /// execute public methods, and do not recursively maintain another generation.
 fn evaluate_selected(
     data: Records,
+    mutation: Value,
+    mode: &str,
+    timeout: Duration,
+    now: Option<u64>,
+) -> Result<Evaluation> {
+    evaluate_selected_cancellable(
+        data,
+        mutation,
+        mode,
+        timeout,
+        now,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+fn evaluate_selected_cancellable(
+    data: Records,
     mut mutation: Value,
     mode: &str,
     timeout: Duration,
     now: Option<u64>,
+    cancellation: Arc<AtomicBool>,
 ) -> Result<Evaluation> {
     anyhow::ensure!(
         now.is_none_or(|value| value <= 9_007_199_254_740_991),
@@ -522,7 +628,12 @@ fn evaluate_selected(
     // Compilation is process setup, not part of an application's execution budget.
     warmup()?;
     let deadline = Instant::now() + timeout;
-    let limits = wasm::Limits::new(deadline, config::settings()?.guest_memory_bytes);
+    let limits = wasm::Limits::new_cancellable(
+        deadline,
+        config::settings()?.guest_memory_bytes,
+        cancellation,
+    );
+    limits.check()?;
     let profile = profile::invocation(
         mode,
         mutation
@@ -659,9 +770,16 @@ struct CellExecutor {
 
 impl rust_engine::Executor for CellExecutor {
     fn check_budget(&self) -> rust_engine::EngineResult<()> {
-        self.limits
-            .check()
-            .map_err(|error| rust_engine::EngineError::new("EVALUATION_BUDGET", error.to_string()))
+        self.limits.check().map_err(|error| {
+            rust_engine::EngineError::new(
+                if self.limits.cancelled() {
+                    "EVALUATION_CANCELLED"
+                } else {
+                    "EVALUATION_BUDGET"
+                },
+                error.to_string(),
+            )
+        })
     }
 
     fn execute(
@@ -770,8 +888,8 @@ const MANIFEST: &str = r#"
         }
         return value;
     }
-    const kinds = {derived: 'derived', queryMethod: 'query', mutationMethod: 'mutation', transactionMethod: 'transaction'};
-    const members = ['http', 'maintenance', 'authorize', 'collections', 'keys'];
+    const kinds = {derived: 'derived', queryMethod: 'query', mutationMethod: 'mutation', transactionMethod: 'transaction', sqlAuthority: 'sqlAuthority', sqlProvider: 'sqlProvider'};
+    const members = ['http', 'maintenance', 'authorize', 'collections', 'keys', 'sql'];
     return () => {
         const app = record(typeof __flowerBundle !== 'undefined' && __flowerBundle.default, 'application');
         const definitions = record(app.definitions, 'definitions');
@@ -784,6 +902,8 @@ const MANIFEST: &str = r#"
             const entry = manifest.definitions[name] = {kind: kinds[definition.kind]};
             if (Object.hasOwn(definition, 'consistency')) entry.consistency = definition.consistency;
             if (Object.hasOwn(definition, 'receipt')) entry.receipt = definition.receipt;
+            if (Object.hasOwn(definition, 'cache')) entry.cache = definition.cache;
+            if (Object.hasOwn(definition, 'watch')) entry.watch = definition.watch;
             if (Object.hasOwn(definition, 'aggregate')) entry.aggregate = definition.aggregate;
             if (Object.hasOwn(definition, 'access')) entry.access = definition.access;
         }
@@ -802,7 +922,7 @@ const MANIFEST: &str = r#"
 // Values cross natively: the host encoder validates results and arguments.
 const CELL_RUNNER: &str = r#"
 ((host) => {
-    const kinds = ['query', 'mutation', 'transaction', 'derived'];
+    const kinds = ['query', 'mutation', 'transaction', 'derived', 'sqlAuthority', 'sqlProvider'];
     function ref(value) {
         if (typeof value === 'string') return value;
         if (value && (value.kind === 'collection' || value.kind === 'derived'))
@@ -815,6 +935,7 @@ const CELL_RUNNER: &str = r#"
         changesAt: (time) => host(13, time),
         principal: () => host(2),
         history: () => host(3),
+        codeVersion: () => host(16),
         get: (target, args = null) => host(4, ref(target), args),
         scan: (collection, options) => {
             const target = ref(collection);
@@ -828,7 +949,8 @@ const CELL_RUNNER: &str = r#"
             return host(5, target, options);
         },
         query: (query) => host(7, query),
-        range: (query) => host(6, query)
+        range: (query) => host(6, query),
+        sql: (operation, catalog, input, purpose) => host(15, operation, catalog, input, purpose)
     };
     const writers = {
         set: (collection, key, value, options) => options === undefined
@@ -855,10 +977,10 @@ const CELL_RUNNER: &str = r#"
         const definitions = typeof __flowerBundle !== 'undefined' && __flowerBundle.default.definitions;
         if (!definitions || !Object.hasOwn(definitions, name) || typeof definitions[name].compute !== 'function')
             throw Object.assign(new Error('Unknown derived definition: ' + name), {code: 'DEFINITION_MISSING'});
-        const expectedKind = kind === 3 ? 'derived' : kinds[kind] + 'Method';
+        const expectedKind = kind >= 3 ? kinds[kind] : kinds[kind] + 'Method';
         if (definitions[name].kind !== expectedKind)
             throw Object.assign(new Error('Definition ' + name + ' is not a ' + kinds[kind] + ' method'), {code: 'METHOD_KIND_MISMATCH'});
-        if (kind === 3) return definitions[name].compute(derivedContext, args);
+        if (kind >= 3) return definitions[name].compute(derivedContext, args);
         if (kind === 0) return definitions[name].compute(methodContext, args);
         return definitions[name].compute(methodContext, args, elevate);
     };
@@ -1289,6 +1411,77 @@ mod tests {
         ] {
             assert!(deploy_manifest(manifest).is_err(), "accepted {manifest}");
         }
+    }
+
+    #[test]
+    fn deployment_preserves_query_cache_and_watch_opt_outs() {
+        let deployed = deploy_manifest(
+            r#"{definitions:{
+            read:{name:'read',kind:'queryMethod',cache:false,watch:false,compute:()=>42}
+        },http:{read:{name:'read',kind:'query',cache:false,watch:false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            deployed.puts["httpMethods"]["read"],
+            json!({"name":"read","kind":"query","cache":false,"watch":false})
+        );
+    }
+
+    #[test]
+    fn invoke_as_cancellable_starts_with_shared_cancellation_and_ordinary_invoke_is_independent() {
+        let code = fixture_bundle(
+            r#"var __flowerBundle = {default:{read:{kind:'queryMethod',compute:()=>42}}};"#,
+        );
+        let data = BTreeMap::from([(
+            "bundle".into(),
+            json!({"hash":hash(code.as_bytes()),"javascript":code}),
+        )]);
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let error = invoke_as_cancellable(
+            data.clone(),
+            json!({"name":"read"}),
+            "query",
+            0,
+            Value::Null,
+            cancellation,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("EVALUATION_CANCELLED"));
+        assert_eq!(
+            invoke_as(data, json!({"name":"read"}), "query", 0, Value::Null)
+                .unwrap()
+                .value,
+            json!(42)
+        );
+    }
+
+    #[test]
+    fn query_cache_and_watch_registry_flags_default_true_and_reject_nonqueries() {
+        for property in ["cache", "watch"] {
+            for kind in ["mutation", "transaction"] {
+                for value in [Value::Null, json!(false), json!(true)] {
+                    let mut raw = json!({"name":"m","kind":kind});
+                    raw[property] = value;
+                    assert!(serde_json::from_value::<HttpMethod>(raw).is_err());
+                }
+            }
+            for value in [Value::Null, json!("false"), json!(0)] {
+                let mut raw = json!({"name":"m","kind":"query"});
+                raw[property] = value;
+                assert!(serde_json::from_value::<HttpMethod>(raw).is_err());
+            }
+        }
+        let ordinary: HttpMethod =
+            serde_json::from_value(json!({"name":"read","kind":"query"})).unwrap();
+        assert!(ordinary.cache && ordinary.watch);
+        assert_eq!(
+            serde_json::to_value(ordinary).unwrap(),
+            json!({"name":"read","kind":"query"})
+        );
+        let raw = json!({"name":"sql","kind":"query","cache":false,"watch":false});
+        let query: HttpMethod = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!query.cache && !query.watch);
+        assert_eq!(serde_json::to_value(query).unwrap(), raw);
     }
 
     #[test]

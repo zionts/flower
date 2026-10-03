@@ -232,7 +232,7 @@ impl Registry {
     }
 
     #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
+    pub(in crate::service) fn len(&self) -> usize {
         self.0.hubs.lock().unwrap().len()
     }
 }

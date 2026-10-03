@@ -27,7 +27,17 @@ pub const DEFAULT_URL: &str = "http://127.0.0.1:7101";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryResult<T = Value> {
     pub revision: u64,
+    /// Trusted same-snapshot identity on one-shot reads. None also covers older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryIdentity>,
     pub value: T,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryIdentity {
+    pub database: String,
+    pub incarnation: String,
 }
 
 /// `{revision, value, duplicate}`: `duplicate` is true when a retry found the original result.
