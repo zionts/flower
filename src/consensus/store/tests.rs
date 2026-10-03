@@ -902,6 +902,8 @@ fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
             tables: Tables::new(""),
             snapshot_directory: directory.to_path_buf(),
             io: Arc::new(Mutex::new(())),
+            #[cfg(feature = "sql")]
+            capture_identity: sql_capture::next_identity().unwrap(),
             snapshot_installation: AtomicU64::new(0),
             current_snapshot: PublishedLock::new(current_snapshot),
             snapshot_accounting: super::super::snapshot_policy::Accounting::new(0, None, None),

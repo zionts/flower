@@ -477,7 +477,7 @@ pub(in crate::consensus) fn holds_replica(
     database: &SharedDatabase,
     prefix: &str,
 ) -> anyhow::Result<bool> {
-    let transaction = database.database().begin_read()?;
+    let transaction = database.begin_read()?;
     for table in transaction.list_tables()? {
         let name = table.name();
         if name != shared::FILE_META.name() && name.starts_with(prefix) {

@@ -326,9 +326,15 @@ async fn recovered_leader_serves_no_fence_before_tail_replay_in_a_new_term() {
     reads.push(tokio::spawn(async move { c.snapshot_for(None).await }));
     let c = leader.partition("garden", 1).unwrap();
     let partition = tokio::spawn(async move { c.snapshot_for(None).await });
+    let c = leader.partition("garden", 1).unwrap();
+    let availability = tokio::spawn(async move { c.check_availability().await });
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(reads.iter().all(|read| !read.is_finished()));
     assert!(!partition.is_finished());
+    assert!(
+        !availability.is_finished(),
+        "availability cannot bypass recovery"
+    );
     assert!(leader.recovering.load(Ordering::Acquire));
     assert_eq!(leader.local_snapshot().await.revision, 0);
 
@@ -349,6 +355,11 @@ async fn recovered_leader_serves_no_fence_before_tail_replay_in_a_new_term() {
         .unwrap();
     assert_eq!(snapshot.revision, 1);
     assert_eq!(snapshot.data["source:[\"counter\",\"one\"]"], 23);
+    tokio::time::timeout(Duration::from_secs(5), availability)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(!leader.recovering.load(Ordering::Acquire));
     let entries = leader.store.clone().try_get_log_entries(5..).await.unwrap();
     let barriers = entries
@@ -583,6 +594,15 @@ async fn recovery_gate_rejects_local_queries_without_quorum_then_allows_replica_
                     .await
                     .is_err()
             );
+            assert!(node.raft().check_availability().await.is_err());
+            assert!(
+                node.raft()
+                    .partition("garden", 1)
+                    .unwrap()
+                    .check_availability()
+                    .await
+                    .is_err()
+            );
             // Diagnostics remain accessible without opening application serving.
             assert_eq!(node.raft().local_snapshot().await.revision, 0);
             assert_eq!(node.raft().metrics().id, 1);
@@ -600,6 +620,14 @@ async fn recovery_gate_rejects_local_queries_without_quorum_then_allows_replica_
         2,
         "the recovery gate is one-time, not a perpetual quorum requirement for local reads"
     );
+    nodes[0].raft().check_availability().await.unwrap();
+    nodes[0]
+        .raft()
+        .partition("garden", 1)
+        .unwrap()
+        .check_availability()
+        .await
+        .unwrap();
     nodes[0].stop().await;
 }
 

@@ -10,7 +10,7 @@ license = "MIT"
 [features]
 default = []
 # Experimental: disabled until SQL integration/authority/resource launch gates pass.
-sql = ["dep:libsqlite3-sys"]
+sql = ["dep:libsqlite3-sys", "redb/flower-resident-reads"]
 
 [dependencies]
 anyhow = "1"
@@ -79,4 +79,5 @@ codegen-units = 1
 
 # The leader's own log append does not block replication. See vendor/openraft/FLOWER.md.
 [patch.crates-io]
+redb = { path = "vendor/redb" }
 openraft = { path = "vendor/openraft" }

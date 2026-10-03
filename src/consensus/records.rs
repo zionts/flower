@@ -8,6 +8,9 @@
 //! to the backing. A value read from the backing is kept by this instance, so
 //! references to it live as long as the Records; clones start without them.
 
+#[cfg(feature = "sql")]
+mod sql_capture;
+
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};

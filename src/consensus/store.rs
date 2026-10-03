@@ -16,6 +16,8 @@ mod lazy_flush;
 mod persistence;
 mod shared;
 pub use shared::SharedDatabase;
+#[cfg(feature = "sql")]
+mod sql_capture;
 
 mod partition_storage;
 use partition_storage::*;
@@ -412,6 +414,8 @@ impl PendingWrites {
 }
 
 struct Inner {
+    #[cfg(feature = "sql")]
+    capture_identity: u64,
     id: u64,
     shared: Arc<SharedDatabase>,
     tables: Tables,
@@ -502,7 +506,11 @@ struct DatabaseWork {
 
 impl DatabaseWork {
     fn run<T>(self, operation: impl FnOnce(&Database) -> T) -> T {
-        operation(self.shared.database())
+        // All direct redb writes and apply/rebase/publication work pass here.
+        // This shared-side permit lives in the actual blocking job, not its
+        // cancelled awaiting future. Shared batch commits have their own one.
+        let _mutation = self.shared.mutation_permit();
+        operation(self.shared.database_under_mutation(&_mutation))
     }
 }
 
@@ -535,7 +543,10 @@ impl Store {
                 Some(shared) => shared,
                 None => SharedDatabase::open(&directory.join("flower.redb"))?,
             };
-            let db = shared.database();
+            // An already-shared database may host live SQL on other replicas.
+            // Cover startup table creation and state construction as well.
+            let _mutation = shared.mutation_permit();
+            let db = shared.database_under_mutation(&_mutation);
             // Hosted replicas and a lone replica never mix in one file.
             let names: Vec<String> = db
                 .begin_read()?
@@ -635,6 +646,8 @@ impl Store {
                 io: Arc::new(Mutex::new(())),
                 appending: Arc::new(PublishedLock::new(Vec::new())),
                 pending: Arc::default(),
+                #[cfg(feature = "sql")]
+                capture_identity: sql_capture::next_identity()?,
                 snapshot_installation: AtomicU64::new(0),
                 current_snapshot: PublishedLock::new(current_snapshot),
                 snapshot_accounting,
@@ -719,6 +732,18 @@ impl Store {
         }
     }
 
+    /// Metadata-only serving check. No snapshot, backing or row clone escapes.
+    pub(super) fn check_availability(
+        &self,
+        binding: Option<&PartitionBinding>,
+    ) -> anyhow::Result<()> {
+        let published = self.inner.published.read().expect("published state lock");
+        if let Some(binding) = binding {
+            partitions::active(published.partitions.get(&binding.partition), binding)?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn snapshot(&self) -> Snapshot {
         self.inner.state.read().await.application.clone()
     }
@@ -750,9 +775,27 @@ impl Store {
         })
     }
 
-    /// Test the fence and retain its immutable data root under one short lock.
-    /// A metrics read followed by an unrelated state read would not establish
-    /// that the captured state belongs to the observed applied log position.
+    /// Fence readiness without cloning/pinning either persistent root.
+    pub(super) fn has_applied_fence(&self, fence: &super::read::ReadFence) -> anyhow::Result<bool> {
+        let state = self.inner.published.read().expect("published state lock");
+        let Some(applied) = state.last_applied else {
+            return Ok(false);
+        };
+        if applied.index < fence.applied.index {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            !(applied.index == fence.applied.index && applied != fence.applied)
+                && applied.leader_id >= fence.applied.leader_id
+                && state.revision >= fence.revision
+                && (applied != fence.applied || state.revision == fence.revision),
+            "local publication does not match read fence"
+        );
+        Ok(true)
+    }
+
+    /// Test-only retained snapshot; production readiness never needs a clone.
+    #[cfg(test)]
     pub(super) fn snapshot_after_fence(
         &self,
         fence: &super::read::ReadFence,

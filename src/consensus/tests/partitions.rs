@@ -945,3 +945,47 @@ async fn root_apply_cost_with_many_partitions() {
         );
     }
 }
+
+#[tokio::test]
+async fn availability_checks_current_binding_without_capturing_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(1, directory.path().into()).await.unwrap();
+    let mut index = 0;
+    store.check_availability(None).unwrap();
+    assert!(store.check_availability(Some(&binding("shop", 1))).is_err());
+    apply(
+        &mut store,
+        &mut index,
+        control(PartitionCommand::Create {
+            partition: "shop".into(),
+            epoch: 1,
+            operation: "create-shop".into(),
+        }),
+    )
+    .await;
+    assert!(store.check_availability(Some(&binding("shop", 1))).is_err());
+    apply(
+        &mut store,
+        &mut index,
+        control(PartitionCommand::Activate {
+            partition: "shop".into(),
+            epoch: 1,
+            operation: "create-shop".into(),
+        }),
+    )
+    .await;
+    store.check_availability(Some(&binding("shop", 1))).unwrap();
+    assert!(store.check_availability(Some(&binding("shop", 2))).is_err());
+    apply(
+        &mut store,
+        &mut index,
+        control(PartitionCommand::Freeze {
+            transfer: transfer("shop"),
+            expected_revision: 0,
+        }),
+    )
+    .await;
+    assert!(store.check_availability(Some(&binding("shop", 1))).is_err());
+    store.check_availability(None).unwrap();
+    store.close().await.unwrap();
+}
