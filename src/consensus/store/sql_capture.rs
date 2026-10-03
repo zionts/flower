@@ -103,5 +103,11 @@ impl Store {
     }
 }
 
+mod selective;
+
+#[cfg(test)]
+mod liveness_tests;
+#[cfg(test)]
+mod selective_tests;
 #[cfg(test)]
 mod tests;

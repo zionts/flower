@@ -243,7 +243,7 @@ Anchors: `src/consensus/partitions.rs::{Consensus::partition,Discard}`;
 `src/service.rs::App`; `src/service/query_cache.rs::{QueryCache,Entry}`;
 `src/service/partitions/router.rs::Registry::{app,refresh}`.
 
-## Evidence and next candidate (not implemented)
+## Primitive evidence and selective candidate history
 
 The first positive stored-input witness is
 `records/sql_capture/tests.rs::sql_capture_paired_disk_copy_is_positive_without_memo_parse_or_escaping_read_pin`:
@@ -283,7 +283,8 @@ appearance/disappearance. `Records::rebase` preserves these membership tokens
 and logical versions rather than rebuilding them, which is a source-grounded
 reason the candidate may tolerate physical rebases.
 
-This is **a proposal, not a SQL certificate implementation or liveness proof**.
+The selective candidate was subsequently implemented in the followup below;
+it does not make ordinary evaluator certificates an acceptable substitute.
 The existing `DependencyCertificate::valid` is not a safe drop-in: its changed
 window-marker branch walks `range_versions`, and other validation performs
 ordinary Records reads. The new validator must have no fallback walk and no
@@ -298,3 +299,103 @@ Anchors: `src/consensus/records.rs::{generation,rebase,raw_version}`;
 `src/evaluator/rust_engine/dependencies.rs::DependencyCertificate::valid_records`;
 `src/consensus/{sql_capture.rs,records/sql_capture/tests.rs,
 store/sql_capture/tests.rs,store/capture_gate.rs,store/shared.rs}`.
+
+## Selective dependency extension (followup, not activation)
+
+The strict-R API is retained. A separate selective API permits unrelated
+revision advances without weakening the current-publication/mutation barrier:
+
+```rust
+SqlCaptureCertificate::from_reserved(&fence, Box<[u8]>)
+Consensus::sql_capture_certify(&fence, &mut certificate, &[dependencies])
+Consensus::sql_capture_certified_slice(&fence, &certificate, request, buffer)
+Consensus::sql_capture_validate(&fresh_fence, &certificate) -> SqlCaptureEpoch
+```
+
+The certificate owns at most 128 selectors and a caller-pre-admitted/pre-touched
+key slab of at most 512 KiB. `reservation_bytes` includes the fixed slots; its
+bounded binding clone and native scratch remain additional. No root, source
+handle, callback, Value, iterator or database is retained. Private expected
+stamps cannot be caller-forged/reset. Selector overflow refuses; changed
+existing stamps are never adopted. Admission/retry failure is not permission
+to discard dependencies and continue with the same partly captured input.
+
+`Point(key)` refers to a physical key, including explicitly checked absence.
+A new fallible resident-only getter reads an overlay scalar or a checked
+8-byte backing version header, without ordinary `raw_version`, decoding,
+memo/global-cache fill or spool fallback. `Collection(name)` takes a **raw,
+unencoded logical collection name**; quota-first encoding before exclusion
+constructs `collection:<canonical JSON string>` in the admitted slab. It is
+the entire collection's VALUE generation, not `keys:` or a window marker.
+
+Each certify call compares every previous expected dependency and stamps new
+ones against ONE current publication under the same resident/exclusion scope.
+Each certified slice again checks every accumulated dependency. Coverage is
+mandatory: points/chunks must match a certified point or whole source
+collection; ranges must lie inside one certified collection's canonical native
+source-key prefix, with a bounded exclusive upper no later than that prefix's
+comma-to-hyphen successor. Unbounded/arbitrary/index ranges are refused. This
+is full-collection certification even for a narrower captured range, not a
+claim of separately proved window/prefix change tracking.
+
+The controller must finish complete logical relations/support, check chunk
+representation/version/encoding/length/offset consistency, request a **fresh
+fence**, and validate ALL accumulated selectors at ONE final publication.
+That returned selected revision is **Rseal**, the common coexistence witness
+for all copied inputs. Freeze it as sourceRevision; never substitute first-
+slice R or a later delivery R. The storage certificate does not certify
+controller completeness, row policy, omitted dependencies, temporal expiry,
+or final authorization by itself. Delivery still requires fresh validation
+and current authorization. Clock-polled permissions need an independently
+proved future expiry; a marker alone cannot certify passage of wall time.
+
+Physical rebase preserves logical versions/generations but not necessarily raw
+encoding. Install/Store/partition-binding identity protects marker resets and
+version reuse. A positive point version rejects rewrite ABA. A checked absent
+point that was created and removed before the final publication can remain
+valid: it certifies absence at Rseal, not “never existed.” Include full
+collection VALUE generation to reject intervening published membership changes.
+An insert/delete collapsed inside ONE atomic apply batch has no observable
+intermediate publication and need not change an absent generation. The
+process version generator now reserves blocks with checked atomic addition;
+identity exhaustion is fatal/fail-closed rather than reusing old scalars.
+Stored high-water exhaustion also prevents new blocks; no wrap is permitted.
+
+### Measured selective storage evidence
+
+All **22 capture tests passed** on the followup tree. The real native-backed
+10,000-row fixtures pre-reserve their raw frame before capture; they decode
+copied input outside the guard and require every distinct row, exact count and
+sum. Actual same-selected-root/partition unrelated-collection writes,
+persistence, blank control publication and persisted votes run on a background
+executor between slices while copied input remains owned. Busy retry is allowed
+only after an actual completed storage notification; Paced uses its supplied
+wake deadline. No all-abort, zero-row or truncated aggregate counts as success.
+
+| Fixture | Slices | Writes / votes | Exact count / sum | Elapsed | Common Rseal |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Root, native plain backing | 313 | 314 / 314 | 10,000 / 49,995,000 | 2.547 s | 317 (initial 3) |
+| Scoped, native paired backing | 313 | 314 / 314 | 10,000 / 49,995,000 | 2.210 s | 317 (initial 3) |
+
+Both retained exactly 99,063 raw body bytes. Cancellation fixtures abort a
+waiting root/scoped capture controller while keeping 32 copied rows (sum 496),
+then complete an actual selected-row rewrite, persistence, control and vote in
+8.95 / 16.92 ms. These are observations, not hard timing or RSS caps.
+
+Focused regressions reject presence-neutral relevant rewrites, insertion
+phantoms, deletion, membership ABA across distinct serving publications,
+uncovered points/ranges, excessive selector count/bytes, cross-Store reuse and
+**real same-R snapshot installation**. They preserve final checked absence and
+positive raw versions through actual rebase. Records regressions 28 PASS,
+writer/gate regressions 14 PASS; SQL/default library checks and fmt/diff pass.
+Library clippy exits zero with the same 21 preexisting warnings. The earlier
+full-workspace failures remain unclassified/not green; this is not a full-suite
+or terminal integration acceptance claim.
+
+This extension does not complete the native scratch ledger above, establish
+cold-source usability, or prove a terminal SQLite/HTTP success. Specifically,
+paired scalar version checks still allocate redb tuple-key vectors; range bounds,
+redb cursor paths and im overlay traversal allocate too. Their input bounds are
+known but no enforced native scratch allocator capability is provided here.
+Controller integration, hard native allocation accounting and real terminal
+SQL admission/execution/authorization/delivery remain required separately.

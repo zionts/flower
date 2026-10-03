@@ -3,6 +3,12 @@
 //! The capture caller reserves and supplies its buffer before acquiring a slice.
 //! Returned values own only copied bytes and scalar epoch/offset metadata. They
 //! cannot prolong any database read transaction or persistent Records root.
+mod certificate;
+pub use certificate::{
+    SQL_CAPTURE_MAX_DEPENDENCIES, SQL_CAPTURE_MAX_DEPENDENCY_BYTES, SqlCaptureCertificate,
+    SqlCaptureDependency,
+};
+
 use super::{PartitionBinding, read::ReadFence};
 use std::{fmt, ops::Range};
 
@@ -92,7 +98,9 @@ impl SqlCaptureRequest<'_> {
             } => {
                 if !valid_key(lower)
                     || upper.is_some_and(|key| !valid_key(key) || key <= lower)
-                    || after.is_some_and(|key| !valid_key(key) || key < lower)
+                    || after.is_some_and(|key| {
+                        !valid_key(key) || key < lower || upper.is_some_and(|upper| key >= upper)
+                    })
                 {
                     return Err(SqlCaptureError::InvalidRequest);
                 }

@@ -423,3 +423,15 @@ fn sql_capture_resident_nested_scopes_cannot_renew_quota_and_panic_resets_it() {
     drop(table);
     reader.close().unwrap();
 }
+
+#[test]
+fn sql_capture_version_identity_exhaustion_never_wraps_or_renews_old_blocks() {
+    let counter = AtomicU64::new(u64::MAX - 1024);
+    assert_eq!(
+        reserve_version_block(&counter, 1024),
+        Some((u64::MAX - 1024, u64::MAX))
+    );
+    assert_eq!(reserve_version_block(&counter, 1024), None);
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    assert_eq!(reserve_version_block(&counter, 1), None);
+}
