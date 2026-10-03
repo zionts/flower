@@ -580,3 +580,49 @@ fn sql_callbacks_have_dedicated_read_only_kinds_without_definer_capability() {
         assert_eq!(wrong["error"]["code"], "METHOD_KIND_MISMATCH");
     }
 }
+
+#[test]
+fn terminal_plan_and_finalizer_have_readless_callback_kinds() {
+    warmup().unwrap();
+    for (kind, definition_kind) in [("sqlPlan", "queryMethod"), ("sqlFinalizer", "sqlFinalizer")] {
+        let metadata = if kind == "sqlPlan" {
+            "terminal:{},"
+        } else {
+            ""
+        };
+        let source = format!(
+            "var __flowerBundle={{default:{{definitions:{{test:{{name:'test',kind:'{definition_kind}',{metadata}compute:function(ctx,args,capability){{return [Object.isFrozen(ctx),typeof ctx.get,typeof ctx.scan,typeof ctx.now,typeof ctx.sql,typeof ctx.set,typeof capability,ctx.principal(),ctx.clock(),ctx.history(),ctx.codeVersion()]}}}}}},http:{{}}}}}};"
+        );
+        let result = execute(
+            &source,
+            "test",
+            &Value::Null,
+            kind,
+            &mut |operation, _| {
+                Ok(match operation {
+                    "principal" => json!({"subject":"verified"}),
+                    "clock" => json!(1000),
+                    "history" => json!({"database":"db","incarnation":"epoch"}),
+                    "codeVersion" => json!("generation"),
+                    operation => panic!("terminal readless host {operation}"),
+                })
+            },
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["value"],
+            json!([true,"undefined","undefined","undefined","undefined","undefined","undefined",{"subject":"verified"},1000,{"database":"db","incarnation":"epoch"},"generation"])
+        );
+        let wrong = execute(
+            &source,
+            "test",
+            &Value::Null,
+            "sqlProvider",
+            &mut |_, _| Ok(Value::Null),
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(wrong["error"]["code"], "METHOD_KIND_MISMATCH");
+    }
+}

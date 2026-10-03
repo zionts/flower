@@ -810,6 +810,14 @@ async fn evaluate_query(
     mut now: u64,
     mut permit: admission::Permit,
 ) -> Result<QueryResult, ApiError> {
+    if method.terminal.is_some() {
+        return Err(evaluation_error(anyhow::Error::new(
+            evaluator::rust_engine::EngineError::new(
+                "SQL_TERMINAL_UNAVAILABLE",
+                "Detached terminal SQL capture is not enabled until its storage/frame/finish gates pass",
+            ),
+        )));
+    }
     if input.get("expectedRevision").is_some() {
         return Err(invalid(anyhow::anyhow!(
             "expectedRevision applies only to mutation methods"

@@ -156,24 +156,51 @@ fn rejects_writes_recursion_other_statements_and_unapproved_functions() {
     let mut source = data(vec![vec![vec![SqlCell::Integer(1)]]]);
     for sql in [
         "DELETE FROM items",
+        "INSERT INTO items(id) VALUES (2)",
+        "UPDATE items SET id=2",
         "CREATE TABLE bad(x)",
         "PRAGMA temp_store",
         "ATTACH ':memory:' AS other",
         "SELECT random()",
         "SELECT date('now')",
         "SELECT load_extension('bad')",
-        "SELECT readfile('/etc/passwd')",
         "SELECT * FROM sqlite_schema",
-        "SELECT * FROM pragma_database_list",
         "SELECT rowid FROM items",
         "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10) SELECT sum(x) FROM n",
     ] {
-        assert!(
-            run(sql, &[], std::slice::from_ref(&table), &mut source).is_err(),
-            "must reject {sql}"
+        assert_eq!(
+            run(sql, &[], std::slice::from_ref(&table), &mut source),
+            Err(SqlError::Forbidden),
+            "policy taxonomy: {sql}"
         );
     }
-    assert!(run("SELECT 1; SELECT 2", &[], &[], &mut source).is_err());
+    for sql in [
+        "SELECT 1; SELECT 2",
+        "SELECT * FROM raw_unregistered",
+        "SELECT from",
+        "SELECT readfile('/etc/passwd')",
+    ] {
+        assert_eq!(
+            run(sql, &[], std::slice::from_ref(&table), &mut source),
+            Err(SqlError::InvalidSql),
+            "invalid SQL taxonomy: {sql}"
+        );
+    }
+    assert_eq!(source.calls, 0, "rejected SQL must not call a Source");
+    assert_eq!(
+        source.tables,
+        vec![vec![vec![SqlCell::Integer(1)]]],
+        "DML refusal must preserve source rows"
+    );
+    assert!(
+        run(
+            "SELECT * FROM pragma_database_list",
+            &[],
+            std::slice::from_ref(&table),
+            &mut source
+        )
+        .is_err()
+    );
     assert!(
         run(
             "SELECT 1; -- permitted trailing comment",
@@ -472,6 +499,8 @@ fn high_cardinality_sort_hits_native_quota_without_leak_or_spill() {
             },
             failure: Cell::new(None),
             work: Cell::new(0),
+            referenced: Cell::new(0),
+            prepare_only: false,
         };
         assert_eq!(
             execute_scoped("SELECT id FROM items ORDER BY name DESC", &[], &context),
@@ -567,4 +596,100 @@ fn post_init_unscoped_native_allocations_are_rejected() {
         run("SELECT 42", &[], &[], &mut data(vec![])).unwrap().rows,
         vec![vec![SqlCell::Integer(42)]]
     );
+}
+
+#[test]
+fn referenced_table_preparation_never_runs_sources_and_tracks_logical_reads_exactly() {
+    let tables = [
+        table("notes", &["id", "title"], &[0]),
+        table("people", &["id", "name"], &[0]),
+        table("unrelated", &["id"], &[]),
+    ];
+    for (sql, expected) in [
+        ("SELECT 1", [false, false, false]),
+        ("SELECT count(*) FROM notes", [true, false, false]),
+        (
+            "SELECT n.title,p.name FROM notes n JOIN people p ON n.id=p.id",
+            [true, true, false],
+        ),
+        (
+            "SELECT id FROM people UNION ALL SELECT id FROM notes",
+            [true, true, false],
+        ),
+        (
+            "WITH logical AS (SELECT id FROM notes) SELECT * FROM logical",
+            [true, false, false],
+        ),
+        (
+            "SELECT id FROM notes WHERE id IN (SELECT id FROM people)",
+            [true, true, false],
+        ),
+        (
+            "SELECT 'unrelated' AS unrelated FROM notes",
+            [true, false, false],
+        ),
+        ("SELECT id FROM NoTeS", [true, false, false]),
+    ] {
+        let referenced =
+            referenced_tables(sql, &[], &tables, QueryOptions::default(), &mut || Ok(())).unwrap();
+        for (index, expected) in expected.iter().enumerate() {
+            assert_eq!(referenced.contains(index), *expected, "{sql}");
+        }
+        assert!(!referenced.contains(MAX_TABLES));
+    }
+    for (sql, expected) in [
+        ("DELETE FROM notes", SqlError::Forbidden),
+        ("SELECT 1; SELECT 2", SqlError::InvalidSql),
+        ("SELECT * FROM raw_physical", SqlError::InvalidSql),
+    ] {
+        assert_eq!(
+            referenced_tables(sql, &[], &tables, QueryOptions::default(), &mut || Ok(())),
+            Err(expected)
+        );
+    }
+    assert_eq!(
+        referenced_tables(
+            "SELECT id FROM notes",
+            &[],
+            &tables,
+            QueryOptions::default(),
+            &mut || Err(SqlError::Cancelled)
+        ),
+        Err(SqlError::Cancelled)
+    );
+}
+
+#[test]
+fn preparation_rust_scratch_is_charged_before_allocation_and_released() {
+    let quota = Quota::new(1024);
+    let buffer = QuotaBuffer::c_text(&quota, &[b"abc", b"def"]).unwrap();
+    assert_eq!(buffer.bytes.capacity(), 7);
+    assert_eq!(quota.used(), 7);
+    assert_eq!(
+        unsafe { CStr::from_ptr(buffer.pointer()) }.to_bytes(),
+        b"abcdef"
+    );
+    drop(buffer);
+    assert_eq!(quota.used(), 0);
+    let quota = Quota::new(6);
+    assert!(matches!(
+        QuotaBuffer::c_text(&quota, &[b"abcdef"]),
+        Err(SqlError::MemoryLimit)
+    ));
+    assert_eq!(quota.used(), 0);
+    assert!(quota.failed());
+    // A 64KiB statement must reserve its complete exact C-string before native
+    // connection/statement buffers can allocate. No untracked SQL copy exists.
+    let sql = format!("SELECT 1{}", " ".repeat(MAX_SQL_BYTES - 8));
+    let result = referenced_tables(
+        &sql,
+        &[],
+        &[],
+        QueryOptions {
+            max_native_bytes: MAX_SQL_BYTES,
+            ..QueryOptions::default()
+        },
+        &mut || Ok(()),
+    );
+    assert_eq!(result, Err(SqlError::MemoryLimit));
 }

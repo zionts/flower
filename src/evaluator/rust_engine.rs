@@ -465,6 +465,21 @@ fn run_with_limit_and_schema(
             ));
         }
         let name = string(&invocation["name"], "invocation.name", "INPUT_INVALID")?;
+        if engine
+            .staged
+            .get("httpMethods")
+            .and_then(Value::as_object)
+            .is_some_and(|methods| {
+                methods
+                    .values()
+                    .any(|method| method["name"] == name && method.get("terminal").is_some())
+            })
+        {
+            return engine.abort(
+                "SQL_TERMINAL_UNAVAILABLE",
+                "Terminal SQL cannot enter an ordinary Records invocation",
+            );
+        }
         let args = invocation.get("args").cloned().unwrap_or(Value::Null);
         let mut host = |operation: &str, arguments: Value| engine.method_host(operation, arguments);
         let value = execute.execute(mode, name, &args, &mut host);

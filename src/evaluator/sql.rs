@@ -221,3 +221,45 @@ impl Catalog {
         })
     }
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct TerminalMethod {
+    pub catalog: String,
+    pub operation: Operation,
+    pub finalizer: String,
+    #[serde(default)]
+    pub signing_keys: Vec<serde_json::Value>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Operation {
+    Query,
+    Explain,
+    Catalog,
+    Cancel,
+}
+
+impl TerminalMethod {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if !identifier(&self.catalog)
+            || self.finalizer.is_empty()
+            || self.finalizer.len() > 256
+            || self.signing_keys.len() > 8
+        {
+            return Err("Invalid terminal SQL metadata");
+        }
+        if !distinct(
+            self.signing_keys
+                .iter()
+                .filter_map(|key| key["name"].as_str()),
+        ) || self.signing_keys.iter().any(|key| {
+            !key["usages"]
+                .as_array()
+                .is_some_and(|usages| usages.iter().any(|usage| usage == "sign"))
+        }) {
+            return Err("Invalid terminal SQL signing keys");
+        }
+        Ok(())
+    }
+}

@@ -8,8 +8,9 @@ mod allocator;
 mod init;
 mod vtab;
 
+use std::alloc::{Layout, alloc};
 use std::cell::{Cell, RefCell};
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::Arc;
@@ -229,6 +230,68 @@ impl Drop for Lease {
     }
 }
 
+// Exact Rust allocation payloads, admitted BEFORE the allocator is called.
+// Vec::with_capacity/format!/CString temporaries would otherwise bypass the
+// SQLite owner allocator. Capacity is exact and no push can grow these buffers.
+fn exact_vec<T>(capacity: usize) -> Result<Vec<T>, SqlError> {
+    if capacity == 0 {
+        return Ok(Vec::new());
+    }
+    if size_of::<T>() == 0 {
+        return Err(SqlError::InvalidRequest);
+    }
+    let layout = Layout::array::<T>(capacity).map_err(|_| SqlError::MemoryLimit)?;
+    let pointer = unsafe { alloc(layout) };
+    if pointer.is_null() {
+        return Err(SqlError::MemoryLimit);
+    }
+    Ok(unsafe { Vec::from_raw_parts(pointer.cast::<T>(), 0, capacity) })
+}
+struct QuotaBuffer {
+    bytes: Vec<u8>,
+    _lease: Lease,
+}
+impl QuotaBuffer {
+    fn new(quota: &Arc<Quota>, capacity: usize) -> Result<Self, SqlError> {
+        let lease = Lease::new(quota, capacity)?;
+        let bytes = exact_vec(capacity)?;
+        Ok(Self {
+            bytes,
+            _lease: lease,
+        })
+    }
+    fn append(&mut self, bytes: &[u8]) -> Result<(), SqlError> {
+        if self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|len| len > self.bytes.capacity())
+        {
+            return Err(SqlError::MemoryLimit);
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn c_text(quota: &Arc<Quota>, parts: &[&[u8]]) -> Result<Self, SqlError> {
+        let capacity = parts.iter().try_fold(1usize, |sum, part| {
+            sum.checked_add(part.len()).ok_or(SqlError::MemoryLimit)
+        })?;
+        if parts.iter().any(|part| part.contains(&0)) {
+            return Err(SqlError::InvalidRequest);
+        }
+        let mut buffer = Self::new(quota, capacity)?;
+        for part in parts {
+            buffer.append(part)?;
+        }
+        buffer.append(&[0])?;
+        Ok(buffer)
+    }
+    fn pointer(&self) -> *const c_char {
+        debug_assert_eq!(self.bytes.last(), Some(&0));
+        self.bytes.as_ptr().cast()
+    }
+}
+
 struct Context<'a> {
     source: RefCell<&'a mut dyn Source>,
     check: RefCell<&'a mut dyn FnMut() -> Result<(), SqlError>>,
@@ -237,6 +300,8 @@ struct Context<'a> {
     options: QueryOptions,
     failure: Cell<Option<SqlError>>,
     work: Cell<u64>,
+    referenced: Cell<u128>,
+    prepare_only: bool,
 }
 impl Context<'_> {
     fn fail(&self, error: SqlError) -> SqlError {
@@ -357,10 +422,9 @@ fn validate(
         }
         for (j, column) in table.columns.iter().enumerate() {
             if !identifier(column)
-                || matches!(
-                    column.to_ascii_lowercase().as_str(),
-                    "rowid" | "_rowid_" | "oid"
-                )
+                || ["rowid", "_rowid_", "oid"]
+                    .iter()
+                    .any(|hidden| column.eq_ignore_ascii_case(hidden))
                 || table.columns[..j]
                     .iter()
                     .any(|c| c.eq_ignore_ascii_case(column))
@@ -416,8 +480,57 @@ pub fn execute(
         options,
         failure: Cell::new(None),
         work: Cell::new(0),
+        referenced: Cell::new(0),
+        prepare_only: false,
     };
     execute_scoped(sql, parameters, &context)
+}
+
+/// Exact logical relations authorized while preparing one statement. This
+/// creates no Source cursor, executes no user opcode, and retains no database,
+/// statement or source capability on return. All referenced inputs must be
+/// captured completely under their independent caps unless a separately proved
+/// mandatory restriction is available. A native planner preference is NOT such
+/// a restriction, and this API deliberately does not expose it as one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReferencedTables(u128);
+impl ReferencedTables {
+    pub fn contains(self, table: usize) -> bool {
+        table < MAX_TABLES && self.0 & (1u128 << table) != 0
+    }
+}
+pub fn referenced_tables(
+    sql: &str,
+    parameters: &[SqlCell],
+    tables: &[VirtualTable],
+    options: QueryOptions,
+    check: &mut dyn FnMut() -> Result<(), SqlError>,
+) -> Result<ReferencedTables, SqlError> {
+    struct NoSource;
+    impl Source for NoSource {
+        fn scan(&mut self, _: ScanRequest<'_>) -> Result<Batch, SqlError> {
+            Err(SqlError::Provider)
+        }
+    }
+    validate(sql, parameters, tables, options)?;
+    init::initialize()?;
+    let quota = Quota::new(options.max_native_bytes);
+    let _scope = Scope::enter(quota.clone()).ok_or(SqlError::Unavailable)?;
+    let mut source = NoSource;
+    let context = Context {
+        source: RefCell::new(&mut source),
+        check: RefCell::new(check),
+        tables,
+        quota,
+        options,
+        failure: Cell::new(None),
+        work: Cell::new(0),
+        referenced: Cell::new(0),
+        prepare_only: true,
+    };
+    execute_scoped(sql, parameters, &context)?;
+    context.status()?;
+    Ok(ReferencedTables(context.referenced.get()))
 }
 
 fn execute_scoped(
@@ -427,7 +540,16 @@ fn execute_scoped(
 ) -> Result<SqlResult, SqlError> {
     context.poll(PROGRESS_QUANTUM)?; // reserve the first progress quantum in advance
     // Bindings outlive database/module callbacks: declaration order matters.
-    let mut bindings = Vec::with_capacity(context.tables.len());
+    let _bindings_lease = Lease::new(
+        &context.quota,
+        context
+            .tables
+            .len()
+            .checked_mul(size_of::<Box<vtab::Binding>>())
+            .ok_or(SqlError::MemoryLimit)?,
+    )?;
+    let mut bindings = exact_vec(context.tables.len())?;
+    let sql = QuotaBuffer::c_text(&context.quota, &[sql.as_bytes()])?;
     let mut handle = ptr::null_mut();
     let code = unsafe {
         ffi::sqlite3_open_v2(
@@ -499,14 +621,13 @@ fn execute_scoped(
         }
         ffi::sqlite3_progress_handler(db, PROGRESS_QUANTUM as c_int, Some(progress), data);
     }
-    let sql = CString::new(sql).map_err(|_| SqlError::InvalidRequest)?;
     let mut stmt = ptr::null_mut();
     let mut tail = ptr::null();
     let rc = unsafe {
         ffi::sqlite3_prepare_v3(
             db,
-            sql.as_ptr(),
-            sql.as_bytes().len() as c_int,
+            sql.pointer(),
+            (sql.bytes.len() - 1) as c_int,
             0,
             &mut stmt,
             &mut tail,
@@ -546,6 +667,14 @@ fn execute_scoped(
     let count = unsafe { ffi::sqlite3_column_count(stmt) } as usize;
     if count == 0 || count > MAX_COLUMNS {
         return Err(SqlError::InvalidSql);
+    }
+    if context.prepare_only {
+        context.status()?;
+        return Ok(SqlResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            truncated: false,
+        });
     }
     // A conservative encoded-output bound also covers String/Vec capacity and
     // the outer row Vec's geometric growth. Reserve before Rust allocations.
@@ -713,6 +842,9 @@ unsafe extern "C" fn authorizer(
     _: *const c_char,
 ) -> c_int {
     let context = unsafe { &*data.cast::<Context<'_>>() };
+    if context.poll(1).is_err() {
+        return ffi::SQLITE_DENY;
+    }
     let allow = match action {
         ffi::SQLITE_SELECT => true,
         ffi::SQLITE_READ => {
@@ -722,12 +854,18 @@ unsafe extern "C" fn authorizer(
             // unqualified logical tables; ordinary column reads require main.
             let database = unsafe { string(db) };
             (database.eq_ignore_ascii_case(b"main") || database.is_empty() && column.is_empty())
-                && context.tables.iter().any(|t| {
-                    t.name.as_bytes().eq_ignore_ascii_case(table)
+                && context.tables.iter().enumerate().any(|(index, t)| {
+                    let readable = t.name.as_bytes().eq_ignore_ascii_case(table)
                         && (column.is_empty()
                             || t.columns
                                 .iter()
-                                .any(|c| c.as_bytes().eq_ignore_ascii_case(column)))
+                                .any(|c| c.as_bytes().eq_ignore_ascii_case(column)));
+                    if readable {
+                        context
+                            .referenced
+                            .set(context.referenced.get() | (1u128 << index));
+                    }
+                    readable
                 })
         }
         ffi::SQLITE_FUNCTION => {

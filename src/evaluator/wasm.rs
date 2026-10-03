@@ -173,6 +173,8 @@ fn kind_number(kind: &str) -> Result<i32> {
         "derived" => 3,
         "sqlAuthority" => 4,
         "sqlProvider" => 5,
+        "sqlPlan" => 6,
+        "sqlFinalizer" => 7,
         _ => anyhow::bail!("unknown callback kind {kind}"),
     })
 }
