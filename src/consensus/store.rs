@@ -20,6 +20,8 @@ pub use shared::SharedDatabase;
 mod sql_capture;
 #[cfg(feature = "sql")]
 mod sql_registry_meta;
+#[cfg(feature = "sql")]
+mod sql_source;
 
 mod partition_storage;
 use partition_storage::*;
@@ -464,6 +466,30 @@ struct Inner {
     backup: Arc<backup::Hooks>,
 }
 
+#[cfg(feature = "sql")]
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // All real blocking/background work owns this Inner strongly. A
+        // cancelled waiter cannot retire it while such work can still publish.
+        let pool = super::sql_registry::source_registry().unwrap_or_else(|_| std::process::abort());
+        sql_source::retire(pool, self.capture_identity);
+    }
+}
+
+/// A startup worker's output, including its still-armed native source slot.
+/// Dropping a cancelled spawn_blocking output retires only after that real
+/// worker finished. These are transient startup owners, not new Store fields.
+struct OpenedStore {
+    shared: Arc<SharedDatabase>,
+    tables: Tables,
+    state: StoredState,
+    directory: PathBuf,
+    snapshot_accounting: Arc<super::snapshot_policy::Accounting>,
+    current_snapshot: Option<SnapshotMeta<u64, BasicNode>>,
+    #[cfg(feature = "sql")]
+    source_startup: sql_source::PreparingStore,
+}
+
 #[derive(Clone)]
 pub(super) struct Store {
     inner: Arc<Inner>,
@@ -521,10 +547,34 @@ impl DatabaseWork {
 
 impl Store {
     pub(super) async fn open(id: u64, storage: Storage) -> anyhow::Result<Self> {
-        let (shared, tables, state, directory, snapshot_accounting, current_snapshot) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        // Explicit one-process TEST fixture only. Production requires the real
+        // provided native global before any disk startup or Store exposure.
+        #[cfg(all(test, feature = "sql"))]
+        sql_source::test_bootstrap()?;
+        #[cfg(feature = "sql")]
+        let source_startup = sql_source::PreparingStore::begin()?;
+        Self::open_started(
+            id,
+            storage,
+            #[cfg(feature = "sql")]
+            source_startup,
+        )
+        .await
+    }
+
+    async fn open_started(
+        id: u64,
+        storage: Storage,
+        #[cfg(feature = "sql")] source_startup: sql_source::PreparingStore,
+    ) -> anyhow::Result<Self> {
+        let opened = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let (shared, prefix, directory) = match storage {
                 Storage::Directory(directory) => (None, String::new(), directory),
-                Storage::Shared { database, prefix, directory } => (Some(database), prefix, directory),
+                Storage::Shared {
+                    database,
+                    prefix,
+                    directory,
+                } => (Some(database), prefix, directory),
             };
             let tables = Tables::new(&prefix);
             let directory = if directory.is_absolute() {
@@ -560,10 +610,16 @@ impl Store {
                 .filter(|name| name != shared::FILE_META.name() && name != SQL_REGISTRY_META_NAME)
                 .collect();
             if prefix.is_empty() && names.iter().any(|name| name.contains('/')) {
-                bail!("{} holds the database of several hosted replicas; start it with --replica", directory.display());
+                bail!(
+                    "{} holds the database of several hosted replicas; start it with --replica",
+                    directory.display()
+                );
             }
             if !prefix.is_empty() && names.iter().any(|name| !name.contains('/')) {
-                bail!("{} holds a single replica's database; host replicas in a new data directory", directory.display());
+                bail!(
+                    "{} holds a single replica's database; host replicas in a new data directory",
+                    directory.display()
+                );
             }
             let mut transaction = db.begin_write()?;
             transaction.set_durability(Durability::Immediate)?;
@@ -594,7 +650,10 @@ impl Store {
                     && vote.committed
                     && vote.leader_id.node_id == id
                 {
-                    let vote = Vote { committed: false, ..vote };
+                    let vote = Vote {
+                        committed: false,
+                        ..vote
+                    };
                     meta.insert("vote", serde_json::to_vec(&vote)?.as_slice())?;
                 }
             }
@@ -618,28 +677,56 @@ impl Store {
             state.application = stored_application(db, tables, state.application.revision)?;
             partition_storage::load_served_partitions(db, tables, &mut state.partitions)?;
             let current_snapshot = checkpoint;
-            let snapshot_index=read_snapshot_metadata(db, tables)?.and_then(|meta|meta.last_log_id.map(|id|id.index));
-            let applied_index=state.last_applied.map(|id|id.index);
-            let mut unsnapshotted_bytes=0u128;
-            if let Some(applied)=applied_index && snapshot_index.is_none_or(|snapshot|snapshot<applied) {
-                let transaction=db.begin_read()?;
-                let logs=transaction.open_table(tables.logs)?;
-                let start=snapshot_index.map_or(std::ops::Bound::Unbounded,std::ops::Bound::Excluded);
-                for entry in logs.range((start,std::ops::Bound::Included(applied)))? {
-                    unsnapshotted_bytes=unsnapshotted_bytes.saturating_add(super::packed::json_len(entry?.1.value()) as u128);
+            let snapshot_index = read_snapshot_metadata(db, tables)?
+                .and_then(|meta| meta.last_log_id.map(|id| id.index));
+            let applied_index = state.last_applied.map(|id| id.index);
+            let mut unsnapshotted_bytes = 0u128;
+            if let Some(applied) = applied_index
+                && snapshot_index.is_none_or(|snapshot| snapshot < applied)
+            {
+                let transaction = db.begin_read()?;
+                let logs = transaction.open_table(tables.logs)?;
+                let start =
+                    snapshot_index.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                for entry in logs.range((start, std::ops::Bound::Included(applied)))? {
+                    unsnapshotted_bytes = unsnapshotted_bytes
+                        .saturating_add(super::packed::json_len(entry?.1.value()) as u128);
                 }
             }
-            let snapshot_accounting=super::snapshot_policy::Accounting::new(unsnapshotted_bytes,applied_index,snapshot_index);
+            let snapshot_accounting = super::snapshot_policy::Accounting::new(
+                unsnapshotted_bytes,
+                applied_index,
+                snapshot_index,
+            );
             // A file's fsync does not persist newly created directory entries.
             // Flush the database's directory and each newly created ancestor.
             #[cfg(unix)]
             for path in directories_to_sync {
                 std::fs::File::open(path)?.sync_all()?;
             }
-            Ok((shared, tables, state, directory, snapshot_accounting, current_snapshot))
+            Ok(OpenedStore {
+                shared,
+                tables,
+                state,
+                directory,
+                snapshot_accounting,
+                current_snapshot,
+                #[cfg(feature = "sql")]
+                source_startup,
+            })
         })
         .await
         .context("open database worker")??;
+        let OpenedStore {
+            shared,
+            tables,
+            state,
+            directory,
+            snapshot_accounting,
+            current_snapshot,
+            #[cfg(feature = "sql")]
+            source_startup,
+        } = opened;
         let lazy = Arc::new(lazy_flush::LazyFlush::default());
         lazy.update_membership(&state.membership);
         let store = Self {
@@ -652,7 +739,7 @@ impl Store {
                 appending: Arc::new(PublishedLock::new(Vec::new())),
                 pending: Arc::default(),
                 #[cfg(feature = "sql")]
-                capture_identity: sql_capture::next_identity()?,
+                capture_identity: source_startup.identity(),
                 snapshot_installation: AtomicU64::new(0),
                 current_snapshot: PublishedLock::new(current_snapshot),
                 snapshot_accounting,
@@ -669,6 +756,8 @@ impl Store {
             }),
             raft_lifetime: None,
         };
+        #[cfg(feature = "sql")]
+        source_startup.finish(&store.inner)?;
         lazy_flush::spawn(
             Arc::downgrade(&store.inner),
             store.inner.holders.clone(),
@@ -743,6 +832,8 @@ impl Store {
         binding: Option<&PartitionBinding>,
     ) -> anyhow::Result<()> {
         let published = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
         if let Some(binding) = binding {
             partitions::active(published.partitions.get(&binding.partition), binding)?;
         }
@@ -772,6 +863,8 @@ impl Store {
     /// publication as query data, including blank/membership/rejected entries.
     pub(super) fn read_fence(&self) -> anyhow::Result<super::read::ReadFence> {
         let state = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
         Ok(super::read::ReadFence {
             applied: state
                 .last_applied
@@ -783,6 +876,8 @@ impl Store {
     /// Fence readiness without cloning/pinning either persistent root.
     pub(super) fn has_applied_fence(&self, fence: &super::read::ReadFence) -> anyhow::Result<bool> {
         let state = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(false);
         };
@@ -806,6 +901,8 @@ impl Store {
         fence: &super::read::ReadFence,
     ) -> anyhow::Result<Option<Snapshot>> {
         let state = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(None);
         };
@@ -893,6 +990,8 @@ impl Store {
         all: bool,
     ) -> anyhow::Result<Snapshot> {
         let state = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
         let snapshot = partitions::active(state.partitions.get(&binding.partition), binding)?;
         let requests = if all {
             snapshot.requests.clone()
@@ -920,6 +1019,8 @@ impl Store {
         binding: Option<&PartitionBinding>,
     ) -> anyhow::Result<Option<Snapshot>> {
         let state = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(None);
         };

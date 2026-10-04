@@ -32,6 +32,8 @@ impl Store {
                 .published
                 .try_read()
                 .map_err(|_| SqlCaptureError::Busy)?;
+            super::super::sql_source::require_ready(&self.inner)
+                .map_err(|_| SqlCaptureError::Storage)?;
             let applied = published
                 .last_applied
                 .ok_or(SqlCaptureError::FenceNotReady)?;
