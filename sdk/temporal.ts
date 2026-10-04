@@ -205,8 +205,11 @@ export interface EnqueueOptions {
   /** Groups take turns: each ready group's next job goes before any group's second. */
   readonly group?: string;
 }
-export interface ClaimOptions<P = Json> {
-  /** Jobs to take at most. Default 1; 0 takes none, to leave the line with waitMs 0. */
+/** Detached JSON supplied to admission: every nested object and array is frozen. */
+type QueuePrevious<T> = T extends readonly (infer E)[] ? readonly QueuePrevious<E>[]
+  : T extends object ? { readonly [K in keyof T]: QueuePrevious<T[K]> } : T;
+export interface ClaimOptions<P = Json, R = Json> {
+  /** Jobs to take at most. Default 1; with admit at most 64. 0 takes none, to leave the line with waitMs 0. */
   readonly max?: number;
   readonly leaseMs?: number;
   /**
@@ -215,8 +218,16 @@ export interface ClaimOptions<P = Json> {
    * leaves the line. Claim again before it ends to keep waiting, and keep your place.
    */
   readonly waitMs?: number;
-  /** Checks each job before handing it out; a job it refuses is cancelled, and the claim takes the next. */
-  readonly admit?: (claim: Claim<P>) => boolean;
+  /**
+   * Checks a proposed claim before any lease, attempt, fencing or turn writes, as the
+   * caller (not the queue's definer). `previous` is a deeply frozen, detached copy of
+   * the actual stored job, including an expired lease or a delayed schedule.
+   * Both inputs are bounded JSON snapshots; the proposed claim is frozen too.
+   * A refusal cancels an unchanged job and takes the next. A job the callback writes
+   * or deletes is preserved, is not leased, and is not considered again in this call.
+   * At most 64 candidates are checked; all snapshots share one work/byte allowance.
+   */
+  readonly admit?: (claim: Claim<P>, previous: QueuePrevious<Job<P, R>>) => boolean;
 }
 
 export interface QueueView<P = Json, R = Json> {
@@ -224,7 +235,7 @@ export interface QueueView<P = Json, R = Json> {
   /** Lease the next job, or return null. */
   claim(ctx: MutationContext, owner: string, options?: { readonly leaseMs?: number }): Claim<P> | null;
   /** Lease up to max jobs, in order, and join or leave the line. */
-  claimMany(ctx: MutationContext, owner: string, options?: ClaimOptions<P>): Claim<P>[];
+  claimMany(ctx: MutationContext, owner: string, options?: ClaimOptions<P, R>): Claim<P>[];
   /** Extend a current lease; the fencing token stays the same. */
   renew(ctx: MutationContext, lease: LeaseIdentity, options?: { readonly leaseMs?: number }): Claim<P>;
   /** Extend each current lease: its new expiry, or null when it was lost. */
@@ -332,6 +343,111 @@ const PROMOTE = 64;
 /** How far stats counts each kind of job, by default and at most. */
 const COUNT_UP_TO = 100;
 const MAX_COUNT_UP_TO = 10_000;
+
+// Admission does not create a new host allowance: these are conservative SDK
+// sublimits of the existing 100,000-operation / 16-MiB-output / depth-128 guest
+// limits. The real guest's heap and fuel remain authoritative. One allowance
+// covers every candidate, both copies, and post-callback comparisons in a call.
+const ADMIT_WORK = 100_000;
+const ADMIT_BYTES = 16 * 1024 * 1024;
+const ADMIT_DEPTH = 128;
+interface AdmissionBudget { work: number; bytes: number }
+function admissionCharge(budget: AdmissionBudget, work: number, bytes = 0): void {
+  if (work > budget.work || bytes > budget.bytes) {
+    fail("EVALUATION_BUDGET", "Queue admission snapshot exceeds the guest work or byte limit");
+  }
+  budget.work -= work;
+  budget.bytes -= bytes;
+}
+/** Preflight actual host JSON, without a key array, serializer, or copy tree. */
+function admissionPreflight(value: unknown, budget: AdmissionBudget, copy: boolean, depth = 0): void {
+  if (depth > ADMIT_DEPTH) fail("EVALUATION_BUDGET", "Queue admission JSON nesting exceeds 128");
+  // Reserve traversal AND copying, or the current-row traversal/equality walk.
+  // prepare() separately reserves the saved-side equality walk before copying.
+  const work = 2;
+  admissionCharge(budget, work);
+  if (value === null || typeof value === "boolean") {
+    admissionCharge(budget, 0, copy ? 5 : 0);
+    return;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Queue admission requires finite JSON numbers");
+    admissionCharge(budget, 0, copy ? 24 : 0); // longest finite JSON number
+    return;
+  }
+  if (typeof value === "string") {
+    // UTF-16 length first: refuse huge strings before visiting their contents.
+    admissionCharge(budget, value.length * work, copy ? 2 : 0);
+    if (!copy) return;
+    for (let index = 0; index < value.length; ++index) {
+      const unit = value.charCodeAt(index);
+      let bytes = unit < 32 ? 6 : unit === 34 || unit === 92 ? 2 : unit < 128 ? 1 : unit < 2048 ? 2 : 3;
+      if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < value.length &&
+          value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) {
+        bytes = 4;
+        ++index;
+      } else if (unit >= 0xd800 && unit <= 0xdfff) bytes = 6;
+      admissionCharge(budget, 0, bytes);
+    }
+    return;
+  }
+  if (typeof value !== "object") throw new TypeError("Queue admission requires native JSON values");
+  const array = Array.isArray(value);
+  const prototype = Object.getPrototypeOf(value);
+  if (array ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("Queue admission requires plain native JSON");
+  }
+  admissionCharge(budget, 0, copy ? 2 : 0);
+  if (array) {
+    const length = Object.getOwnPropertyDescriptor(value, "length")!.value as number;
+    if (length > budget.work / work) admissionCharge(budget, length * work);
+    for (let index = 0; index < length; ++index) {
+      const property = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!property?.enumerable || !("value" in property)) throw new TypeError("Queue admission requires dense native JSON arrays");
+      admissionCharge(budget, work, copy ? 1 : 0);
+      admissionPreflight(property.value, budget, copy, depth + 1);
+    }
+  } else {
+    // ctx.get returns native, validated JSON (no hidden/symbol properties or
+    // proxies). for-in avoids allocating an unbounded Object.keys/ownKeys list.
+    for (const key in value) {
+      const property = Object.getOwnPropertyDescriptor(value, key);
+      if (property === undefined) continue;
+      if (!property.enumerable || !("value" in property)) throw new TypeError("Queue admission requires JSON data properties");
+      admissionCharge(budget, work, copy ? 2 : 0);
+      admissionPreflight(key, budget, copy, depth + 1);
+      admissionPreflight(property.value, budget, copy, depth + 1);
+    }
+  }
+}
+/** Only called after the complete raw job AND claim passed the shared preflight. */
+function admissionCopy<T>(value: T): QueuePrevious<T> {
+  if (value === null || typeof value !== "object") return value as QueuePrevious<T>;
+  const result: any = Array.isArray(value) ? [] : {};
+  for (const key in value) {
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (property === undefined) continue;
+    // defineProperty keeps an authentic JSON "__proto__" field a data property.
+    Object.defineProperty(result, key, { value: admissionCopy(property.value), enumerable: true, writable: true, configurable: true });
+  }
+  return Object.freeze(result) as QueuePrevious<T>;
+}
+/** No stringify/copy: both sides were preflighted, and the saved side is frozen. */
+function admissionEqual(value: unknown, previous: unknown): boolean {
+  if (value === null || previous === null || typeof value !== "object" || typeof previous !== "object") return Object.is(value, previous);
+  if (Array.isArray(value) !== Array.isArray(previous)) return false;
+  if (Array.isArray(value) && value.length !== (previous as unknown[]).length) return false;
+  let count = 0;
+  for (const key in value) {
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (property === undefined) continue;
+    const saved = Object.getOwnPropertyDescriptor(previous, key);
+    if (saved === undefined || !admissionEqual(property.value, saved.value)) return false;
+    ++count;
+  }
+  for (const key in previous) if (Object.getOwnPropertyDescriptor(previous, key) !== undefined) --count;
+  return count === 0;
+}
 
 /** Leased durable work with fencing tokens, retries, delays and renewal, in ordinary records. */
 export function queue<P = Json, R = Json>(name: string, options: QueueOptions<P, R> = {}): Queue<P, R> {
@@ -464,6 +580,87 @@ export function queue<P = Json, R = Json>(name: string, options: QueueOptions<P,
       if (legacy !== undefined && legacy.queued === undefined && (selected === null || before(legacy, selected))) selected = legacy;
       return selected;
     }
+    /** Read-only selection for admission: no promotion or effective job is written or reconstructed. */
+    function pendingAt(job: Job<P, R>, now: number): number | null {
+      if (job.state === "pending") return job.availableAt !== null && job.availableAt <= now ? job.availableAt : null;
+      if (job.state === "leased" && job.lease !== null && job.lease.expiresAt <= now &&
+          (policy === null || job.attempts < policy.maxAttempts)) return job.lease.expiresAt;
+      return null;
+    }
+    function unleased(ctx: MutationContext, now: number, skipped: readonly (readonly [string, string])[]): Row<Job<P, R>, [string, string]> | null {
+      let selected: Row<Job<P, R>, [string, string]> | null = null;
+      function consider(row: Row<Job<P, R>, [string, string]>) {
+        if (skipped.some((key) => key[0] === row.key[0] && key[1] === row.key[1])) return;
+        const at = pendingAt(row.value, now);
+        if (at === null) return;
+        const order = selected === null ? -1 : priorityOf(row.value) - priorityOf(selected.value) ||
+          turnOf(row.value) - turnOf(selected.value) || at - pendingAt(selected.value, now)!;
+        if (selected === null || order < 0 || order === 0 && canonicalJson(row.key) < canonicalJson(selected.key)) selected = row;
+      }
+      // A callback can leave a candidate pending. Read past previously considered
+      // rows without promoting them or allocating another unbounded skip list.
+      for (const row of pages(ctx, records.by("turns"), { prefix: [scope, "now"] })) {
+        if (skipped.some((key) => key[0] === row.key[0] && key[1] === row.key[1]) || pendingAt(row.value, now) === null) continue;
+        consider(row);
+        break;
+      }
+      for (const row of ctx.range(records.by("later").range({ prefix: [scope, "later"], lte: now, limit: PROMOTE })).rows) consider(row);
+      for (const row of pages(ctx, records.by("leases"), { prefix: [scope, "leased"], lte: now })) consider(row);
+      for (const row of pages(ctx, records.by("ready"), { prefix: [scope, "pending"], lte: now })) {
+        if (row.value.queued !== undefined || skipped.some((key) => key[0] === row.key[0] && key[1] === row.key[1])) continue;
+        consider(row);
+        break;
+      }
+      return selected;
+    }
+    function prepare(ctx: MutationContext, owner: string, leaseMs: number, now: number,
+      skipped: readonly (readonly [string, string])[], budget: AdmissionBudget) {
+      const selected = unleased(ctx, now, skipped);
+      if (selected === null) return null;
+      // The range's payload and IDs are not evidence of the old row. This actual
+      // raw get MUST precede effective(), promotions, and all queue lease writes.
+      const at = selected.key;
+      const raw = ctx.get(records, at);
+      if (raw === null || pendingAt(raw, now) === null) return null;
+      const token = (ctx.get(fencing, canonicalJson([name, scope]))?.last ?? 0) + 1;
+      integer(token, "Fencing token", 1);
+      const history = ctx.history();
+      const proposed: Claim<P> = {
+        scope, id: at[1], payload: raw.payload, owner, token, expiresAt: now + leaseMs,
+        attempt: raw.attempts + 1, ...(history === null ? {} : { history }),
+      };
+      // Reserve BOTH full traversals/copies before allocating the first detached
+      // tree. No serializer, key-array allocation, Date, or context wrapper.
+      const before = budget.work;
+      admissionPreflight(raw, budget, true);
+      // Even a callback that removes most fields must not make the saved-side
+      // comparison uncharged. Reserve its full walk NOW, before either copy.
+      admissionCharge(budget, (before - budget.work) / 2);
+      admissionPreflight(proposed, budget, true);
+      const previous = admissionCopy(raw);
+      const claim = admissionCopy(proposed) as Claim<P>;
+      return { at, previous, claim };
+    }
+    function grant(ctx: MutationContext, at: [string, string], raw: Job<P, R>, claim: Claim<P>, now: number): Claim<P> {
+      const selected = effective(raw, now);
+      const counter = canonicalJson([name, scope]);
+      ctx.set(fencing, counter, { last: claim.token });
+      const priority = priorityOf(selected);
+      const turn = turnOf(selected);
+      const last = ctx.get(turns, clockKey(priority));
+      if (last === null || last.at < turn) ctx.set(turns, clockKey(priority), { at: turn });
+      if (selected.group !== null && selected.group !== undefined && ctx.get(turns, groupKey(priority, selected.group))?.at === turn + 1) {
+        ctx.delete(turns, groupKey(priority, selected.group));
+      }
+      const granted: Lease = { owner: claim.owner, token: claim.token, expiresAt: claim.expiresAt,
+        ...(claim.history === undefined ? {} : { history: claim.history }) };
+      const job: Job<P, R> = {
+        ...selected, state: "leased", availableAt: null, lease: granted, leaseExpiresAt: granted.expiresAt,
+        attempts: selected.attempts + 1, updatedAt: now, priority, group: selected.group ?? null, turn, queued: null,
+      };
+      ctx.set(records, at, job);
+      return claim;
+    }
     function lease(ctx: MutationContext, owner: string, leaseMs: number, now: number): Claim<P> | null {
       const selected = next(ctx, now);
       if (!selected) return null;
@@ -511,14 +708,15 @@ export function queue<P = Json, R = Json>(name: string, options: QueueOptions<P,
       }
       return null;
     }
-    function claimMany(ctx: MutationContext, owner: string, claimOptions: ClaimOptions<P> = {}): Claim<P>[] {
+    function claimMany(ctx: MutationContext, owner: string, claimOptions: ClaimOptions<P, R> = {}): Claim<P>[] {
       requireName(owner, "Lease owner");
       const choice = plainObject(claimOptions, "Claim options", ["max", "leaseMs", "waitMs", "admit"]);
       const max = (choice.max ?? 1) as number;
       integer(max, "max");
       const leaseMs = leaseLength(choice.leaseMs);
-      const admit = choice.admit as ClaimOptions<P>["admit"];
+      const admit = choice.admit as ClaimOptions<P, R>["admit"];
       if (admit !== undefined && typeof admit !== "function") throw new TypeError("admit must be a function");
+      if (admit !== undefined && max > MAX_CLAIMS) throw new RangeError(`max is at most ${MAX_CLAIMS} with admit`);
       const waitMs = choice.waitMs as number | undefined;
       if (waitMs !== undefined) integer(waitMs, "waitMs");
       const now = clock(ctx);
@@ -549,13 +747,41 @@ export function queue<P = Json, R = Json>(name: string, options: QueueOptions<P,
         definer(ctx, () => { overtake(); take(); wait(); });
         return claims;
       }
-      definer(ctx, overtake);
-      while (claims.length < max) {
-        const claim = definer(ctx, () => lease(ctx, owner, leaseMs, now));
-        if (claim === null) break;
-        const id = claim.id;
-        if (admit(claim)) claims.push(claim);
-        else definer(ctx, () => ctx.delete(records, key(id)));
+      const budget: AdmissionBudget = { work: ADMIT_WORK, bytes: ADMIT_BYTES };
+      // Fixed by the existing claim bound, not an unbounded callback/replacement
+      // loop. Only plain keys are retained, never a context/host capability.
+      const skipped: [string, string][] = [];
+      let overtaken = false;
+      while (claims.length < max && skipped.length < MAX_CLAIMS) {
+        const prepared = definer(ctx, () => prepare(ctx, owner, leaseMs, now, skipped, budget));
+        if (prepared === null) break;
+        skipped.push(prepared.at);
+        // Critically OUTSIDE definer: applications cannot use admission to read
+        // or write unrelated protected records with the queue's rights.
+        const accepted = admit(prepared.claim, prepared.previous);
+        const granted = definer(ctx, () => {
+          const raw = ctx.get(records, prepared.at);
+          if (raw === null) return null; // callback deletion stays deleted
+          // These native JSON scalars can prove a replacement without walking
+          // or copying its potentially larger quarantine body. They are only
+          // equality checks, never source/authentication authority.
+          if (raw.state !== prepared.previous.state || raw.id !== prepared.previous.id ||
+              raw.scope !== prepared.previous.scope || raw.attempts !== prepared.previous.attempts) return null;
+          admissionPreflight(raw, budget, false);
+          if (!admissionEqual(raw, prepared.previous)) return null; // preserve replacement/quarantine
+          if (!accepted) {
+            ctx.delete(records, prepared.at); // ordinary unchanged refusal still cancels
+            return null;
+          }
+          // A reentrant callback might itself have claimed another job. Never
+          // issue the stale proposed fencing token or overwrite its new lease.
+          const token = (ctx.get(fencing, canonicalJson([name, scope]))?.last ?? 0) + 1;
+          if (token !== prepared.claim.token) return null;
+          if (raw.scope !== scope || raw.id !== prepared.at[1]) fail("INVALID_JOB", "Stored queue identity does not match its key");
+          if (!overtaken) { overtake(); overtaken = true; }
+          return grant(ctx, prepared.at, raw, prepared.claim, now);
+        });
+        if (granted !== null) claims.push(granted);
       }
       definer(ctx, wait);
       return claims;

@@ -39,6 +39,23 @@ const methods = {
   // An app method that works a job inline for whoever calls it: bookkeeping, not the caller's rights.
   claimInline: mutation("claimInline", { args: v.object({ owner: id, waitMs: v.optional(v.int({ min: 0 })) }) }, (ctx, { owner, waitMs }) =>
     work.claimMany(ctx, owner, { max: 1, ...(waitMs === undefined ? {} : { waitMs }) }).map((claim) => ({ id: claim.id, token: claim.token }))),
+  admissionBoundary: mutation("admissionBoundary", (ctx) => {
+    let observed: unknown;
+    const claims = work.claimMany(ctx, "inline", { admit: (claim, previous) => {
+      // The previous snapshot can expose this selected job, just as a claim
+      // exposes its payload; it does NOT give unrelated definer access.
+      observed = {
+        previous, current: ctx.get(work.records, ["", claim.id]),
+        session: ctx.get(sessions, previous.payload.session),
+        denied: (() => {
+          try { ctx.set(sessions, "unrelated", { owner: "bob" }); return "ALLOWED"; }
+          catch (error) { return (error as { code?: string }).code ?? "UNKNOWN"; }
+        })(),
+      };
+      return true;
+    } });
+    return { observed, claims };
+  }),
   finishInline: mutation("finishInline", { args: v.object({ id, owner: id, token: v.int() }) }, (ctx, lease) => work.complete(ctx, lease, { words: 1 }).state),
   forge: mutation("forge", { args: v.object({ id, session: id }) }, (ctx, { id, session }) => {
     ctx.set(work.records, ["", id], { ...work.get(ctx, id)!, payload: { session, text: "forged" } });
@@ -168,4 +185,23 @@ test("the queue's bookkeeping acts for the application even when the caller's ru
   assert.equal(db.query("job", "b1", bob), "completed");
   // Her own view of bob's jobs is still empty.
   assert.deepEqual(db.query("mine", null, alice), []);
+});
+
+test("pre-lease admission runs outside the queue's definer using the authentic bound context", async () => {
+  const db = await testDatabase(app);
+  db.mutate("start", "hidden-session", bob);
+  db.mutate("ask", { session: "hidden-session", id: "hidden-job", text: "authentic" }, bob);
+  const { observed, claims } = db.mutate("admissionBoundary", null, alice) as {
+    observed: { previous: { state: string; attempts: number; payload: Payload }; current: unknown; session: unknown; denied: string };
+    claims: { id: string; token: number }[];
+  };
+  assert.equal(observed.current, null);
+  assert.equal(observed.session, null);
+  assert.equal(observed.denied, "ACCESS_DENIED");
+  assert.deepEqual(observed.previous.payload, { session: "hidden-session", text: "authentic" });
+  assert.equal(observed.previous.state, "pending");
+  assert.equal(observed.previous.attempts, 0);
+  assert.deepEqual(claims.map(({ id, token }) => ({ id, token })), [{ id: "hidden-job", token: 1 }]);
+  assert.equal(db.query("job", "hidden-job", bob), "leased");
+  assert.equal(db.query("job", "hidden-job", alice), null);
 });
