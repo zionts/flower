@@ -18,6 +18,8 @@ mod records;
 #[cfg(feature = "sql")]
 pub(crate) mod sql_capture;
 #[cfg(feature = "sql")]
+pub(crate) mod sql_registry;
+#[cfg(feature = "sql")]
 pub use sql_capture::{
     SQL_CAPTURE_MAX_BYTES, SQL_CAPTURE_MAX_DEPENDENCIES, SQL_CAPTURE_MAX_DEPENDENCY_BYTES,
     SQL_CAPTURE_MAX_METADATA_BYTES, SQL_CAPTURE_MAX_RECORDS, SqlCaptureBuffer,
