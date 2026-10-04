@@ -3,7 +3,7 @@ use crate::service::admission::Class;
 use std::{mem::size_of, task::Poll};
 
 fn config() -> AdmissionConfig {
-    // Keep the actual 432 MiB SQL blanket job contract; no cheap terminal job.
+    // Actual unchanged 432 MiB SQL blanket job, not a cheap terminal job.
     let per_job = 432 * 1024 * 1024;
     AdmissionConfig {
         workers: [2, 1, 1],
@@ -12,49 +12,79 @@ fn config() -> AdmissionConfig {
         per_job,
     }
 }
-fn node() -> NodeAdmission {
+fn node() -> &'static NodeAdmission {
     NodeAdmission::prepare(config(), NodeLimits::default()).unwrap()
+}
+/// ONE real GLOBAL/mmap per isolated OS child. No resetting/replacing statics,
+/// no per-test native pools in a shared process, no toy native-ready fixture.
+fn isolated(name: &str) -> bool {
+    const CHILD: &str = "FLOWER_NODE_K7_NATIVE_TEST";
+    let full = format!("service::sql_node::tests::{name}");
+    if std::env::var(CHILD).ok().as_deref() == Some(full.as_str()) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &full, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &full)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated real native child {full} failed\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // A misspelled filter must not count as a native positive.
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    false
 }
 
 #[test]
-fn one_worker_default_refused_before_native_or_heap_allocation() {
-    let mut config = config();
-    config.workers[0] = 1;
-    config.memory[0] = config.per_job;
-    let (result, operations, bytes) =
-        crate::allocation_probe::measure(|| NodeAdmission::prepare(config, NodeLimits::default()));
+fn missing_bootstrap_does_not_create_a_pool() {
+    if !isolated("missing_bootstrap_does_not_create_a_pool") {
+        return;
+    }
+    let (result, operations, bytes) = crate::allocation_probe::measure(NodeAdmission::global);
+    assert_eq!(result.err(), Some(NodeResourceError::BootstrapMissing));
     assert_eq!((operations, bytes), (0, 0));
-    let error = result.err().unwrap();
-    assert_eq!(
-        error,
-        NodeResourceError::InsufficientUserMemory {
-            configured: config.per_job,
-            per_job: config.per_job
-        }
-    );
+    assert!(GLOBAL.result.get().is_none());
+    assert!(!GLOBAL.attempted.load(Ordering::Acquire));
+}
+
+#[test]
+fn one_worker_default_refused_before_allocation_and_failure_never_retries() {
+    if !isolated("one_worker_default_refused_before_allocation_and_failure_never_retries") {
+        return;
+    }
+    let mut bad = config();
+    bad.workers[0] = 1;
+    bad.memory[0] = bad.per_job;
+    let (result, operations, bytes) =
+        crate::allocation_probe::measure(|| NodeAdmission::prepare(bad, NodeLimits::default()));
+    let error = NodeResourceError::InsufficientUserMemory {
+        configured: bad.per_job,
+        per_job: bad.per_job,
+    };
+    assert_eq!(result.err(), Some(error));
+    assert_eq!((operations, bytes), (0, 0));
     let diagnostic = error.to_string();
     assert!(diagnostic.contains("FLOWER_PREPARATION_MEMORY_BYTES=452984832"));
     assert!(diagnostic.contains("16777216-byte"));
     assert!(diagnostic.contains("one-worker default is insufficient"));
-    let too_small = AdmissionConfig {
-        memory: [
-            config.per_job + NODE_BASELINE_BYTES - 1,
-            config.per_job,
-            config.per_job,
-        ],
-        ..config
-    };
-    assert_eq!(
-        NodeAdmission::prepare(too_small, NodeLimits::default()).err(),
-        Some(NodeResourceError::InsufficientUserMemory {
-            configured: too_small.memory[0],
-            per_job: config.per_job
-        })
-    );
+    assert_eq!(NodeAdmission::global().err(), Some(error));
+    let (result, operations, bytes) = crate::allocation_probe::measure(|| {
+        NodeAdmission::prepare(config(), NodeLimits::default())
+    });
+    assert_eq!(result.err(), Some(error));
+    assert_eq!((operations, bytes), (0, 0));
 }
 
 #[test]
 fn exact_minimum_carves_user_only_without_capacity_or_default_rewrite() {
+    if !isolated("exact_minimum_carves_user_only_without_capacity_or_default_rewrite") {
+        return;
+    }
     let config = config();
     let carved = config.carved().unwrap();
     assert_eq!(carved.memory[0], config.per_job);
@@ -72,7 +102,7 @@ fn exact_minimum_carves_user_only_without_capacity_or_default_rewrite() {
         serde_json::Value::Null
     );
     assert_eq!(metrics["registryReservedCells"], serde_json::Value::Null);
-    assert_eq!(metrics["allocatorBacking"], "HOLD");
+    assert_eq!(metrics["nativePhysicalAggregate"], "HOLD");
     assert!(metrics["construction"].as_str().unwrap().contains("HOLD"));
     for (i, bytes) in carved.memory.into_iter().enumerate() {
         assert_eq!(
@@ -83,7 +113,10 @@ fn exact_minimum_carves_user_only_without_capacity_or_default_rewrite() {
 }
 
 #[test]
-fn hard_limits_can_only_be_lowered_before_construction() {
+fn hard_limits_are_lower_only_and_published_limits_are_immutable() {
+    if !isolated("hard_limits_are_lower_only_and_published_limits_are_immutable") {
+        return;
+    }
     let hard = NodeLimits::default();
     assert_eq!(hard.validate(), Ok(hard));
     let lower = NodeLimits {
@@ -122,10 +155,7 @@ fn hard_limits_can_only_be_lowered_before_construction() {
             ..hard
         },
     ] {
-        let (result, operations, bytes) =
-            crate::allocation_probe::measure(|| NodeAdmission::prepare(config(), invalid));
-        assert_eq!(result.err(), Some(NodeResourceError::InvalidLimits));
-        assert_eq!((operations, bytes), (0, 0));
+        assert_eq!(invalid.validate(), Err(NodeResourceError::InvalidLimits));
     }
     let node = NodeAdmission::prepare(config(), lower).unwrap();
     let (bytes, cells) = node.remaining_registry_limits().unwrap();
@@ -136,73 +166,228 @@ fn hard_limits_can_only_be_lowered_before_construction() {
         node.reserve_registry_mapping(4096, 3).err(),
         Some(NodeResourceError::InvalidRegistryReservation)
     );
-    assert_eq!(node.remaining_registry_limits().unwrap().1, 2);
+    assert_eq!(
+        NodeAdmission::prepare(config(), hard).err(),
+        Some(NodeResourceError::BootstrapMismatch)
+    );
+    let mut other = config();
+    other.workers[0] += 1;
+    assert_eq!(
+        NodeAdmission::prepare(other, lower).err(),
+        Some(NodeResourceError::BootstrapMismatch)
+    );
+    assert!(std::ptr::eq(
+        node,
+        NodeAdmission::prepare(config(), lower).unwrap()
+    ));
 }
 
 #[test]
-fn exact_native_ledger_inline_lease_and_real_arc_allocation_layout() {
+fn invalid_first_limits_latch_without_native_or_heap_allocation() {
+    if !isolated("invalid_first_limits_latch_without_native_or_heap_allocation") {
+        return;
+    }
+    let bad = NodeLimits {
+        cancel_slots: MAX_CANCEL_SLOTS + 1,
+        ..NodeLimits::default()
+    };
+    let (result, operations, bytes) =
+        crate::allocation_probe::measure(|| NodeAdmission::prepare(config(), bad));
+    assert_eq!(result.err(), Some(NodeResourceError::InvalidLimits));
+    assert_eq!((operations, bytes), (0, 0));
+    assert_eq!(
+        NodeAdmission::prepare(config(), NodeLimits::default()).err(),
+        Some(NodeResourceError::InvalidLimits)
+    );
+}
+
+#[test]
+fn exact_real_pool_mapping_global_static_and_caller_layouts_zero_arc_allocation() {
+    if !isolated("exact_real_pool_mapping_global_static_and_caller_layouts_zero_arc_allocation") {
+        return;
+    }
     let layout = AllocationLayout::native().unwrap();
     assert_eq!(layout.page_bytes, 4096);
-    assert_eq!(layout.control_mapped_bytes, 4096);
+    assert_eq!(layout.pool_layout, Layout::new::<Pool>());
     assert_eq!(layout.control_layout, Layout::new::<Control>());
+    assert_eq!(layout.mapping_layout, Layout::new::<NativeMapping>());
+    assert_eq!(
+        layout.mapped_bytes,
+        round_pages(size_of::<NativeMapping>(), layout.page_bytes).unwrap()
+    );
+    assert_eq!(layout.node_handle_layout, Layout::new::<NodeAdmission>());
+    assert_eq!(layout.admission_handle_layout, Layout::new::<Owner>());
+    assert_eq!(layout.strong_input_layout, Layout::new::<StrongInput>());
     assert_eq!(
         layout.associated_lease_layout,
         Layout::new::<BaselineLease>()
     );
+    let global = layout.bootstrap_region;
+    assert_eq!(global.address, std::ptr::from_ref(&GLOBAL).addr());
+    assert_eq!(global.layout, Layout::new::<Bootstrap>());
+    assert_eq!(global.page_start, global.address & !(layout.page_bytes - 1));
+    assert_eq!(global.page_end - global.page_start, global.page_bytes);
     assert_eq!(
-        layout.associated_lease_layout.size(),
-        size_of::<BaselineLease>()
+        global.page_bytes,
+        region_page_bytes(global.address, global.layout.size(), layout.page_bytes).unwrap()
     );
     let (node, operations, bytes) = crate::allocation_probe::measure(node);
-    // REAL Pool::with_deployment, not a mock pool/fabricated allocator count.
-    assert_eq!(operations, 1);
-    assert_eq!(bytes, layout.admission_arc_requested_layout.size());
-    assert_eq!(node.metrics()["admissionArcRequestedBytes"], bytes);
+    // Actual Pool constructor BY VALUE into the real mmap, not a fake allocator
+    // count for a toy pool. The global pointer/ledger are actual native objects.
+    assert_eq!((operations, bytes), (0, 0));
+    let mapped = std::ptr::from_ref(node.owner).addr();
+    let pool = node.admission();
+    assert!(matches!(pool, Owner::NativeStatic(_)));
+    assert_eq!(std::ptr::from_ref(&*pool).addr(), mapped);
+    assert!(
+        std::ptr::from_ref(&node.owner.control).addr() + layout.control_layout.size()
+            <= mapped + layout.mapped_bytes
+    );
+    assert!(global.address <= std::ptr::from_ref(node).addr());
+    assert!(
+        std::ptr::from_ref(node).addr() + size_of::<NodeAdmission>()
+            <= global.address + global.layout.size()
+    );
     assert_eq!(
         node.remaining_registry_limits().unwrap(),
         (
-            NODE_BASELINE_BYTES - layout.control_mapped_bytes - bytes,
+            NODE_BASELINE_BYTES - layout.mapped_bytes - global.page_bytes,
             MAX_REGISTRY_CELLS
         )
     );
     eprintln!(
-        "native node layout: control={} align={} map={} PoolArcRequested={} align={} sourceInlineLease={} align={}",
+        "native mapped layout: Pool={}/{} Control={}/{} mapping={}/{} mapped={} NodeInline={}/{} OwnerInline={}/{} StrongInput={}/{} SourceLease={}/{} GLOBALaddr={:#x} GLOBAL={}/{} GLOBALpageStart={:#x} GLOBALpages={} mapaddr={:#x}",
+        layout.pool_layout.size(),
+        layout.pool_layout.align(),
         layout.control_layout.size(),
         layout.control_layout.align(),
-        layout.control_mapped_bytes,
-        layout.admission_arc_requested_layout.size(),
-        layout.admission_arc_requested_layout.align(),
+        layout.mapping_layout.size(),
+        layout.mapping_layout.align(),
+        layout.mapped_bytes,
+        layout.node_handle_layout.size(),
+        layout.node_handle_layout.align(),
+        layout.admission_handle_layout.size(),
+        layout.admission_handle_layout.align(),
+        layout.strong_input_layout.size(),
+        layout.strong_input_layout.align(),
         layout.associated_lease_layout.size(),
-        layout.associated_lease_layout.align()
+        layout.associated_lease_layout.align(),
+        global.address,
+        global.layout.size(),
+        global.layout.align(),
+        global.page_start,
+        global.page_bytes,
+        mapped
     );
 }
 
 #[test]
-fn actual_mapping_is_written_resident_not_an_mlock_or_kernel_proof() {
+fn concurrent_startup_attempts_share_one_real_cold_native_owner() {
+    if !isolated("concurrent_startup_attempts_share_one_real_cold_native_owner") {
+        return;
+    }
+    let barrier = std::sync::Barrier::new(4);
+    let addresses = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let (node, operations, bytes) = crate::allocation_probe::measure(|| {
+                        NodeAdmission::prepare(config(), NodeLimits::default()).unwrap()
+                    });
+                    assert_eq!((operations, bytes), (0, 0));
+                    std::ptr::from_ref(node.owner).addr()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(addresses.iter().all(|address| *address == addresses[0]));
+    assert_eq!(
+        std::ptr::from_ref(NodeAdmission::global().unwrap().owner).addr(),
+        addresses[0]
+    );
+}
+
+#[test]
+fn reservation_overflow_and_bad_source_layouts_leave_actual_ledger_unchanged() {
+    if !isolated("reservation_overflow_and_bad_source_layouts_leave_actual_ledger_unchanged") {
+        return;
+    }
     let node = node();
-    let mut resident = [0u8; 1];
+    let before = node.remaining_registry_limits().unwrap();
+    for (bytes, cells) in [(0, 1), (4095, 1), (4096, 0), (4096, MAX_REGISTRY_CELLS + 1)] {
+        assert_eq!(
+            node.reserve_registry_mapping(bytes, cells).err(),
+            Some(NodeResourceError::InvalidRegistryReservation)
+        );
+    }
+    assert_eq!(
+        node.reserve_native_constant(0).err(),
+        Some(NodeResourceError::InvalidRegistryReservation)
+    );
+    assert_eq!(
+        node.reserve_native_constant(usize::MAX).err(),
+        Some(NodeResourceError::BaselineExhausted)
+    );
+    assert_eq!(node.remaining_registry_limits().unwrap(), before);
+    let ticket = node.reserve_native_constant(4096).unwrap();
+    assert_eq!(
+        node.reserve_native_constant(usize::MAX).err(),
+        Some(NodeResourceError::LayoutOverflow)
+    );
+    assert_eq!(node.remaining_registry_limits().unwrap().0, before.0 - 4096);
+    drop(ticket);
+    assert_eq!(node.remaining_registry_limits().unwrap().0, before.0 - 4096);
+}
+
+#[test]
+fn actual_mapping_pretouched_and_remains_after_every_caller_drop() {
+    if !isolated("actual_mapping_pretouched_and_remains_after_every_caller_drop") {
+        return;
+    }
+    let (pointer, layout) = {
+        let node = node().try_clone().unwrap();
+        let pool = node.admission();
+        assert!(pool.ptr_eq(&node.admission()));
+        let pointer = std::ptr::from_ref(node.owner).cast::<libc::c_void>();
+        (pointer, node.allocation_layout())
+    };
+    let mut resident = [0u8; 8];
+    assert!(layout.mapped_bytes / layout.page_bytes <= resident.len());
     assert_eq!(
         unsafe {
             libc::mincore(
-                node.owner.0.as_ptr().cast(),
-                node.owner.control().control_mapped_bytes,
+                pointer.cast_mut(),
+                layout.mapped_bytes,
                 resident.as_mut_ptr(),
             )
         },
         0
     );
-    assert_eq!(resident[0] & 1, 1);
-    assert_eq!(node.metrics()["allocatorBacking"], "HOLD");
+    for page in &resident[..layout.mapped_bytes / layout.page_bytes] {
+        assert_eq!(page & 1, 1);
+    }
+    let node = NodeAdmission::global().unwrap();
+    assert_eq!(
+        std::ptr::from_ref(node.owner).cast::<libc::c_void>(),
+        pointer
+    );
+    assert_eq!(
+        node.admission().metrics()["classes"][0]["memoryBudgetBytes"],
+        config().per_job
+    );
+    assert_eq!(node.metrics()["nativePhysicalAggregate"], "HOLD");
 }
 
 #[test]
-fn actual_region_offsets_and_all_layout_overflows_refuse() {
+fn actual_region_offsets_and_layout_overflows_refuse() {
     assert_eq!(region_page_bytes(4096, 4096, 4096), Ok(4096));
     assert_eq!(region_page_bytes(4097, 4096, 4096), Ok(8192));
     assert_eq!(region_page_bytes(4096 + 4095, 1, 4096), Ok(4096));
-    // Arithmetic only: the cancellation owner's actual static address is HOLD.
-    assert_eq!(region_page_bytes(4096, 38_944, 4096), Ok(40_960));
-    assert_eq!(region_page_bytes(4096 + 4088, 38_944, 4096), Ok(45_056));
     for (address, bytes, page) in [
         (usize::MAX, 1, 4096),
         (0, usize::MAX, 4096),
@@ -222,43 +407,54 @@ fn actual_region_offsets_and_all_layout_overflows_refuse() {
 }
 
 #[test]
-fn handles_share_real_baseline_and_admission_without_heap_allocations() {
+fn handles_and_leases_share_actual_permanent_owner_without_allocations_or_refunds() {
+    if !isolated("handles_and_leases_share_actual_permanent_owner_without_allocations_or_refunds") {
+        return;
+    }
     let node = node();
     let (other, operations, bytes) = crate::allocation_probe::measure(|| node.try_clone().unwrap());
     assert_eq!((operations, bytes), (0, 0));
-    assert_eq!(node.owner.0, other.owner.0);
-    assert!(Arc::ptr_eq(&node.admission(), &other.admission()));
+    assert!(std::ptr::eq(node.owner, other.owner));
+    let (pool, operations, bytes) = crate::allocation_probe::measure(|| other.admission());
+    assert_eq!((operations, bytes), (0, 0));
+    assert!(pool.ptr_eq(&node.admission()));
+    let (before, _) = node.remaining_registry_limits().unwrap();
     let (ticket, operations, bytes) =
         crate::allocation_probe::measure(|| other.reserve_native_constant(4096).unwrap());
     assert_eq!((operations, bytes), (0, 0));
-    assert!(Arc::ptr_eq(&ticket.admission, &node.admission()));
-    assert_eq!(ticket.owner.0, node.owner.0);
-    assert_eq!(node.metrics()["nativeConstantReservedBytes"], 4096);
+    assert!(ticket.admission().ptr_eq(&node.admission()));
+    assert!(std::ptr::eq(ticket.owner, node.owner));
+    assert!(!ticket.is_registry_mapping());
+    assert_eq!(ticket.allocation_layout(), node.allocation_layout());
     drop(ticket);
-    assert_eq!(node.metrics()["nativeConstantReservedBytes"], 0);
+    assert_eq!(node.metrics()["nativeConstantReservedBytes"], 4096);
+    assert_eq!(node.remaining_registry_limits().unwrap().0, before - 4096);
 }
 
 #[tokio::test]
-async fn two_handles_cold_warm_partition_lanes_share_capacity_and_fair_controls() {
+async fn real_pool_fifo_shared_partition_lanes_and_control_deployment_capacity() {
+    if !isolated("real_pool_fifo_shared_partition_lanes_and_control_deployment_capacity") {
+        return;
+    }
     let node = node();
-    let replica_two = node.try_clone().unwrap();
-    let partition_cold = replica_two.try_clone().unwrap();
-    let partition_warm = partition_cold.try_clone().unwrap();
+    let other = node.try_clone().unwrap();
     let one = node.admission();
-    let two = replica_two.admission();
-    let cold = partition_cold.admission();
-    let warm = partition_warm.admission();
+    let two = other.admission();
+    let cold = other.try_clone().unwrap().admission();
+    let warm = cold.clone();
     for handle in [&two, &cold, &warm] {
-        assert!(Arc::ptr_eq(&one, handle));
+        assert!(one.ptr_eq(handle));
     }
     let first = one
-        .acquire("replica-one/root".into(), Class::User, 100)
+        .acquire("busy/root".into(), Class::User, 100)
         .await
         .unwrap();
-    let mut next = Box::pin(two.acquire("replica-two/root".into(), Class::User, 100));
-    let mut later = Box::pin(cold.acquire("replica-two/partition".into(), Class::User, 100));
-    assert!(matches!(futures_util::poll!(&mut next), Poll::Pending));
-    assert!(matches!(futures_util::poll!(&mut later), Poll::Pending));
+    let mut a = Box::pin(two.acquire("a".into(), Class::User, 100));
+    let mut a2 = Box::pin(cold.acquire("a".into(), Class::User, 100));
+    let mut b = Box::pin(warm.acquire("b".into(), Class::User, 100));
+    assert!(matches!(futures_util::poll!(&mut a), Poll::Pending));
+    assert!(matches!(futures_util::poll!(&mut a2), Poll::Pending));
+    assert!(matches!(futures_util::poll!(&mut b), Poll::Pending));
     let control = cold
         .acquire("partition/control".into(), Class::Control, 100)
         .await
@@ -271,21 +467,51 @@ async fn two_handles_cold_warm_partition_lanes_share_capacity_and_fair_controls(
         assert_eq!(one.metrics()["classes"][i]["active"], 1);
     }
     drop(first);
-    let next = next.await.unwrap();
-    assert!(matches!(futures_util::poll!(&mut later), Poll::Pending));
-    drop(next);
-    drop(later.await.unwrap());
+    let a = a.await.unwrap();
+    assert!(matches!(futures_util::poll!(&mut b), Poll::Pending));
+    drop(a);
+    let b = b.await.unwrap();
+    assert!(matches!(futures_util::poll!(&mut a2), Poll::Pending));
+    drop(b);
+    drop(a2.await.unwrap());
     drop(control);
     drop(deployment);
     for i in 0..3 {
         assert_eq!(one.metrics()["classes"][i]["active"], 0);
     }
-    // This admission-lane test does NOT construct two physical Store/Consensus
-    // instances or a serving router. Their mandatory resource APIs are HOLD.
+    assert_eq!(one.metrics()["classes"][0]["retainedInputBytes"], 0);
+    // Actual admission lanes, NOT two physical Store/router/native SQL proof.
 }
 
 #[test]
-fn constants_and_one_source_mapping_share_total_without_second_pool_or_reset() {
+fn strong_metadata_lease_keeps_native_pool_and_charge_until_final_owner_drop() {
+    if !isolated("strong_metadata_lease_keeps_native_pool_and_charge_until_final_owner_drop") {
+        return;
+    }
+    let pool = node().admission();
+    let (retained, operations, bytes) =
+        crate::allocation_probe::measure(|| pool.retain_strong(Class::User, 777).unwrap());
+    assert_eq!((operations, bytes), (0, 0));
+    // Native writer metadata can Arc its Basis; this tests the REAL opaque
+    // retained charge, not a fake Basis/Consensus constructor.
+    let metadata = std::sync::Arc::new(retained);
+    let queued = metadata.clone();
+    drop(pool);
+    drop(metadata);
+    let pool = NodeAdmission::global().unwrap().admission();
+    assert_eq!(pool.metrics()["classes"][0]["retainedInputBytes"], 777);
+    drop(queued);
+    assert_eq!(pool.metrics()["classes"][0]["retainedInputBytes"], 0);
+    assert!(matches!(pool, Owner::NativeStatic(_)));
+}
+
+#[test]
+fn constants_and_single_source_mapping_share_total_without_reset_or_fake_cleanup_credit() {
+    if !isolated(
+        "constants_and_single_source_mapping_share_total_without_reset_or_fake_cleanup_credit",
+    ) {
+        return;
+    }
     let node = node();
     let (before, cells) = node.remaining_registry_limits().unwrap();
     let native = node.reserve_native_constant(3 * 4096).unwrap();
@@ -293,10 +519,8 @@ fn constants_and_one_source_mapping_share_total_without_second_pool_or_reset() {
         node.remaining_registry_limits().unwrap(),
         (before - 3 * 4096, cells)
     );
-    let unrounded = node.remaining_registry_limits().unwrap().0;
-    let available = unrounded / 4096 * 4096;
-    let tail = unrounded - available;
-    let tail_ticket = (tail > 0).then(|| node.reserve_native_constant(tail).unwrap());
+    let available = node.remaining_registry_limits().unwrap().0;
+    assert!(available.is_multiple_of(4096));
     assert_eq!(
         node.reserve_registry_mapping(available + 1, cells).err(),
         Some(NodeResourceError::InvalidRegistryReservation)
@@ -308,7 +532,7 @@ fn constants_and_one_source_mapping_share_total_without_second_pool_or_reset() {
     let ticket = node.reserve_registry_mapping(available, cells).unwrap();
     assert_eq!(ticket.reserved_bytes(), available);
     assert_eq!(ticket.reserved_cells(), cells);
-    assert_eq!(node.metrics()["registryMappedReservedBytes"], available);
+    assert!(ticket.is_registry_mapping());
     assert_eq!(
         node.reserve_registry_mapping(4096, 1).err(),
         Some(NodeResourceError::RegistryAlreadyIssued)
@@ -318,8 +542,11 @@ fn constants_and_one_source_mapping_share_total_without_second_pool_or_reset() {
         Some(NodeResourceError::BaselineExhausted)
     );
     drop(ticket);
-    assert_eq!(node.metrics()["registryMappedReservedBytes"], 0);
-    assert_eq!(node.metrics()["registryReservedCells"], 0);
+    drop(native);
+    // Untyped cleanup is NOT a refund. Source cap can never be recreated.
+    assert_eq!(node.metrics()["registryMappedReservedBytes"], available);
+    assert_eq!(node.metrics()["registryReservedCells"], cells);
+    assert_eq!(node.metrics()["nativeConstantReservedBytes"], 3 * 4096);
     assert_eq!(
         node.reserve_registry_mapping(4096, 1).err(),
         Some(NodeResourceError::RegistryAlreadyIssued)
@@ -328,104 +555,15 @@ fn constants_and_one_source_mapping_share_total_without_second_pool_or_reset() {
         node.remaining_registry_limits(),
         Err(NodeResourceError::RegistryAlreadyIssued)
     );
-    drop(tail_ticket);
-    drop(native);
-    assert_eq!(node.metrics()["baselineReservedBytes"], NODE_BASELINE_BYTES);
 }
 
 #[test]
-fn native_mapping_unmaps_before_ticket_and_baseline_final_drop() {
-    struct ActualMapping {
-        pointer: NonNull<libc::c_void>,
-        bytes: usize,
-        ticket: BaselineLease,
+fn overflow_and_too_small_native_limits_preflight_refuse() {
+    if !isolated("overflow_and_too_small_native_limits_preflight_refuse") {
+        return;
     }
-    impl Drop for ActualMapping {
-        fn drop(&mut self) {
-            assert_eq!(
-                unsafe { libc::munmap(self.pointer.as_ptr(), self.bytes) },
-                0
-            );
-            // Final cleanup still holds the prepaid charge after actual unmap.
-            assert_eq!(
-                self.ticket
-                    .owner
-                    .control()
-                    .accounting
-                    .lock()
-                    .unwrap()
-                    .registry_bytes,
-                self.bytes
-            );
-            assert_eq!(Arc::strong_count(&self.ticket.admission), 1);
-        }
-    }
-    let node = node();
-    let ticket = node.reserve_registry_mapping(4096, 1).unwrap();
-    let ledger = node.owner.0.as_ptr().cast::<libc::c_void>();
-    let ledger_bytes = node.owner.control().control_mapped_bytes;
-    let pointer = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    assert_ne!(pointer, libc::MAP_FAILED);
-    let pointer = NonNull::new(pointer).unwrap();
-    unsafe {
-        std::ptr::write_volatile(pointer.as_ptr().cast::<u8>(), 1);
-    }
-    let retained = ActualMapping {
-        pointer,
-        bytes: 4096,
-        ticket,
-    };
-    drop(node);
-    let mut resident = [0u8; 1];
-    assert_eq!(
-        unsafe { libc::mincore(ledger, ledger_bytes, resident.as_mut_ptr()) },
-        0
-    );
-    assert_eq!(
-        retained
-            .ticket
-            .owner
-            .control()
-            .owners
-            .load(Ordering::Acquire),
-        1
-    );
-    assert_eq!(
-        retained.ticket.admission.metrics()["classes"][0]["memoryBudgetBytes"],
-        config().per_job
-    );
-    drop(retained);
-    // Run serially: no new mappings intervene between final Drop and mincore.
-    assert_eq!(
-        unsafe { libc::mincore(pointer.as_ptr(), 4096, resident.as_mut_ptr()) },
-        -1
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ENOMEM)
-    );
-    assert_eq!(
-        unsafe { libc::mincore(ledger, ledger_bytes, resident.as_mut_ptr()) },
-        -1
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ENOMEM)
-    );
-}
-
-#[test]
-fn overflow_and_too_small_native_limits_refuse_before_allocating() {
-    for config in [
+    // Pure config preflight; multiple invalid configs do NOT reset GLOBAL.
+    for bad in [
         AdmissionConfig {
             per_job: 0,
             ..config()
@@ -443,12 +581,16 @@ fn overflow_and_too_small_native_limits_refuse_before_allocating() {
             per_job: usize::MAX,
             ..config()
         },
+        AdmissionConfig {
+            memory: [
+                config().memory[0] - 1,
+                config().memory[1],
+                config().memory[2],
+            ],
+            ..config()
+        },
     ] {
-        let (result, operations, bytes) = crate::allocation_probe::measure(|| {
-            NodeAdmission::prepare(config, NodeLimits::default())
-        });
-        assert!(result.is_err());
-        assert_eq!((operations, bytes), (0, 0));
+        assert!(bad.carved().is_err());
     }
     let limits = NodeLimits {
         registry_bytes: 1,
@@ -458,25 +600,21 @@ fn overflow_and_too_small_native_limits_refuse_before_allocating() {
         crate::allocation_probe::measure(|| NodeAdmission::prepare(config(), limits));
     assert_eq!(result.err(), Some(NodeResourceError::BaselineExhausted));
     assert_eq!((operations, bytes), (0, 0));
-    let node = node();
     assert_eq!(
-        node.reserve_native_constant(usize::MAX).err(),
+        NodeAdmission::prepare(config(), NodeLimits::default()).err(),
         Some(NodeResourceError::BaselineExhausted)
     );
-    let a = node.reserve_native_constant(4096).unwrap();
-    assert_eq!(
-        node.reserve_native_constant(usize::MAX).err(),
-        Some(NodeResourceError::LayoutOverflow)
-    );
-    drop(a);
 }
 
 #[test]
 fn poisoned_metrics_are_unknown_not_zero_and_do_not_admit_or_credit() {
+    if !isolated("poisoned_metrics_are_unknown_not_zero_and_do_not_admit_or_credit") {
+        return;
+    }
     let node = node();
     let ticket = node.reserve_native_constant(4096).unwrap();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _lock = node.owner.control().accounting.lock().unwrap();
+        let _lock = node.owner.control.accounting.lock().unwrap();
         panic!("intentional ledger poison");
     }));
     assert_eq!(
@@ -498,7 +636,7 @@ fn poisoned_metrics_are_unknown_not_zero_and_do_not_admit_or_credit() {
     drop(ticket);
     let poisoned = node
         .owner
-        .control()
+        .control
         .accounting
         .lock()
         .err()
@@ -508,8 +646,10 @@ fn poisoned_metrics_are_unknown_not_zero_and_do_not_admit_or_credit() {
 }
 
 #[test]
-fn native_owner_and_inline_lease_are_send_sync_static() {
+fn native_handles_and_inline_leases_are_send_sync_static() {
     fn require<T: Send + Sync + 'static>() {}
     require::<NodeAdmission>();
+    require::<Owner>();
+    require::<StrongInput>();
     require::<BaselineLease>();
 }

@@ -1,24 +1,18 @@
-//! The independently constructible admission/baseline part of node resources.
+//! Permanent mapped admission/baseline bootstrap, NOT a native-ready node.
 //!
-//! This is NOT a native-ready `NodeResources` constructor. The actual source
-//! RegistryPool, Store/Consensus constructors and cancellation static-region
-//! owner must be coupled before startup can use it. No serving path calls this
-//! module yet. A byte reservation is not an RSS/mlock/allocator-backing proof.
-//!
-//! The approved 16 MiB baseline is permanently carved from USER preparation
-//! capacity, not added to it. Every native allocation must acquire a strong
-//! baseline lease before allocation and retain it until AFTER its final unmap /
-//! owner cleanup. A single source mapping can be admitted, never a replacement
-//! pool or a per-router pool. Source cells, staging and replacement witnesses
-//! must all use that one source-owned mapping.
-use super::admission::Pool;
+//! ONE process-global startup attempt publishes ONE page-rounded, pre-touched
+//! mmap containing the actual admission::Pool BY VALUE and its native ledger.
+//! No native Arc/Box allocator backing, deallocation, reset or per-router pool.
+//! Startup/source/Store/cancellation wiring remains HOLD until the parent couples
+//! their real owner APIs, BEFORE ANY Store open or listener/liveness publication.
+//! The existing 16 MiB USER carve and 432 MiB job reservation remain unchanged.
+use super::admission::{Owner, Pool, StrongInput};
 use std::{
     alloc::Layout,
     fmt,
-    ptr::NonNull,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -153,7 +147,9 @@ pub(crate) enum NodeResourceError {
     InvalidRegistryReservation,
     MappingFailed,
     Poisoned,
-    OwnerCounterExhausted,
+    BootstrapMissing,
+    BootstrapFailed,
+    BootstrapMismatch,
 }
 impl fmt::Display for NodeResourceError {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -170,31 +166,41 @@ impl fmt::Display for NodeResourceError {
             Self::BaselineExhausted => out.write_str("SQL node registry/control baseline exhausted; no extra pool or capacity increase is allowed"),
             Self::RegistryAlreadyIssued => out.write_str("the node's one source registry mapping was already issued; it cannot be recreated or reset"),
             Self::InvalidRegistryReservation => out.write_str("source registry reservation must fit its actual mapped bytes and immutable cell ceiling"),
-            Self::MappingFailed => out.write_str("SQL node baseline control mapping failed before native source construction"),
+            Self::MappingFailed => out.write_str("SQL node admission/ledger mapping failed before native source construction"),
             Self::Poisoned => out.write_str("SQL node baseline ledger poisoned"),
-            Self::OwnerCounterExhausted => out.write_str("SQL node baseline strong owner counter exhausted"),
+            Self::BootstrapMissing => out.write_str("SQL node admission bootstrap is missing; native construction is HOLD"),
+            Self::BootstrapFailed => out.write_str("SQL node admission bootstrap already failed or unwound; no retry/reset is allowed"),
+            Self::BootstrapMismatch => out.write_str("SQL node admission bootstrap is immutable; a different configuration/limits cannot create another pool"),
         }
     }
 }
 impl std::error::Error for NodeResourceError {}
 
-/// Exact requested Arc allocation layout, not a claim about malloc's retained
-/// arenas/pages. ArcInner is repr(C), two AtomicUsize counters followed by data
-/// in the pinned native toolchain. A native allocator probe must check this
-/// against the real Arc<Pool> request; wider allocator backing remains HOLD.
-#[repr(C)]
-struct ArcAllocation<T> {
-    strong: AtomicUsize,
-    weak: AtomicUsize,
-    value: T,
-}
-
+/// Report actual caller-inline layouts. These are not invented page spans:
+/// a source/caller must include its inline owner/lease in its REAL owned mapping
+/// or stack allowance. The source mapping reservation includes its inline lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AllocationLayout {
+    pub(crate) pool_layout: Layout,
     pub(crate) control_layout: Layout,
-    pub(crate) control_mapped_bytes: usize,
-    pub(crate) admission_arc_requested_layout: Layout,
+    pub(crate) mapping_layout: Layout,
+    pub(crate) mapped_bytes: usize,
+    pub(crate) node_handle_layout: Layout,
+    pub(crate) admission_handle_layout: Layout,
+    pub(crate) strong_input_layout: Layout,
     pub(crate) associated_lease_layout: Layout,
+    pub(crate) bootstrap_region: StaticRegion,
+    pub(crate) page_bytes: usize,
+}
+/// Actual address, sizeof/alignment and page span of the live GLOBAL object.
+/// Parent must union overlapping source-bootstrap/cancellation static pages with
+/// this span, not charge sizeof-aligned fiction or silently grow the baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StaticRegion {
+    pub(crate) address: usize,
+    pub(crate) layout: Layout,
+    pub(crate) page_start: usize,
+    pub(crate) page_end: usize,
     pub(crate) page_bytes: usize,
 }
 impl AllocationLayout {
@@ -208,21 +214,40 @@ impl AllocationLayout {
         let page = -1;
         let page_bytes = usize::try_from(page)
             .ok()
-            .filter(|page| page.is_power_of_two() && *page >= Layout::new::<Control>().align())
+            .filter(|page| {
+                page.is_power_of_two() && *page >= Layout::new::<NativeMapping>().align()
+            })
             .ok_or(NodeResourceError::UnsupportedPlatform)?;
+        let address = std::ptr::from_ref(&GLOBAL).addr();
+        let layout = Layout::new::<Bootstrap>();
+        let page_start = address & !(page_bytes - 1);
+        let span_bytes = region_page_bytes(address, layout.size(), page_bytes)?;
+        let bootstrap_region = StaticRegion {
+            address,
+            layout,
+            page_start,
+            page_end: page_start
+                .checked_add(span_bytes)
+                .ok_or(NodeResourceError::LayoutOverflow)?,
+            page_bytes: span_bytes,
+        };
         Ok(Self {
+            pool_layout: Layout::new::<Pool>(),
             control_layout: Layout::new::<Control>(),
-            control_mapped_bytes: round_pages(Layout::new::<Control>().size(), page_bytes)?,
-            admission_arc_requested_layout: Layout::new::<ArcAllocation<Pool>>(),
+            mapping_layout: Layout::new::<NativeMapping>(),
+            mapped_bytes: round_pages(Layout::new::<NativeMapping>().size(), page_bytes)?,
+            node_handle_layout: Layout::new::<NodeAdmission>(),
+            admission_handle_layout: Layout::new::<Owner>(),
+            strong_input_layout: Layout::new::<StrongInput>(),
             associated_lease_layout: Layout::new::<BaselineLease>(),
+            bootstrap_region,
             page_bytes,
         })
     }
 }
 
-/// Exact page span of a REAL region, including its actual starting-page offset.
-/// Native owners must provide their actual static/mapped address and extent.
-/// A sizeof-only cancellation constant cannot prove this value.
+/// Exact page span of a REAL region, including its starting-page offset.
+/// Arithmetic only, NOT an unsafe numeric native-readiness verifier.
 pub(crate) fn region_page_bytes(
     address: usize,
     bytes: usize,
@@ -256,89 +281,81 @@ struct Accounting {
     registry_ever_issued: bool,
 }
 struct Control {
-    owners: AtomicUsize,
     accounting: Mutex<Accounting>,
     limits: NodeLimits,
-    page_bytes: usize,
-    control_mapped_bytes: usize,
-    admission_arc_requested_bytes: usize,
+    config: AdmissionConfig,
+    layout: AllocationLayout,
 }
-struct StrongOwner(NonNull<Control>);
-// The mapping contains only immutable limits, a mutex and atomic owner count.
-// Every pointer handle owns a counted reference; no weak pointer can survive it.
-unsafe impl Send for StrongOwner {}
-unsafe impl Sync for StrongOwner {}
-impl StrongOwner {
-    fn control(&self) -> &Control {
-        unsafe { self.0.as_ref() }
-    }
-    fn try_clone(&self) -> Result<Self, NodeResourceError> {
-        let mut count = self.control().owners.load(Ordering::Relaxed);
-        loop {
-            let next = count
-                .checked_add(1)
-                .filter(|count| *count <= isize::MAX as usize)
-                .ok_or(NodeResourceError::OwnerCounterExhausted)?;
-            match self.control().owners.compare_exchange_weak(
-                count,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(Self(self.0)),
-                Err(current) => count = current,
-            }
-        }
-    }
+#[repr(C)]
+struct NativeMapping {
+    admission: Pool,
+    control: Control,
 }
-impl Drop for StrongOwner {
-    fn drop(&mut self) {
-        if self.control().owners.fetch_sub(1, Ordering::Release) == 1 {
-            std::sync::atomic::fence(Ordering::Acquire);
-            let bytes = self.control().control_mapped_bytes;
-            unsafe {
-                std::ptr::drop_in_place(self.0.as_ptr());
-                // Leak rather than mint capacity if a native unmap fails. There
-                // is no retry/new registry mapping and no baseline credit path.
-                let _ = libc::munmap(self.0.as_ptr().cast(), bytes);
-            }
-        }
-    }
+struct Bootstrap {
+    // OnceLock normally retries after an initializer unwinds. The attempt flag
+    // forbids such a retry from mmap'ing/minting another admission owner.
+    attempted: AtomicBool,
+    result: OnceLock<Result<NodeAdmission, NodeResourceError>>,
 }
+static GLOBAL: Bootstrap = Bootstrap {
+    attempted: AtomicBool::new(false),
+    result: OnceLock::new(),
+};
 
-/// Finished shared-admission component, deliberately not the complete node.
-/// Clone handles through `try_clone`; they share BOTH the ledger and real Pool.
-/// The eventual native NodeResources owns this before opening any Store.
+/// Native handle to the permanent mapping. The GLOBAL holds the original handle
+/// for process life; all clones/leases borrow the SAME actual mapped Pool.
+/// Deliberately no Drop/unmap, refactory, reset or native-ready constructor.
+#[derive(Clone, Copy)]
 pub(crate) struct NodeAdmission {
-    // Field drop order: the real Pool owner is cleaned up before the last node
-    // mapping, not after the baseline owner disappears.
-    admission: Arc<Pool>,
-    owner: StrongOwner,
-    configured_user_bytes: usize,
-    remaining_user_bytes: usize,
-    per_job: usize,
+    owner: &'static NativeMapping,
 }
 impl NodeAdmission {
+    /// Startup-only attempt. Repeated matching calls borrow the published owner;
+    /// failure is latched, mismatches refuse, and no path creates another Pool.
+    /// Parent must call this BEFORE ANY Store. No serving path is wired here.
     pub(crate) fn prepare(
         config: AdmissionConfig,
         limits: NodeLimits,
+    ) -> Result<&'static Self, NodeResourceError> {
+        let result = GLOBAL.result.get_or_init(|| {
+            if GLOBAL.attempted.swap(true, Ordering::AcqRel) {
+                return Err(NodeResourceError::BootstrapFailed);
+            }
+            Self::prepare_once(config, limits)
+        });
+        let node = result.as_ref().map_err(|error| *error)?;
+        if node.owner.control.config != config || node.owner.control.limits != limits {
+            return Err(NodeResourceError::BootstrapMismatch);
+        }
+        Ok(node)
+    }
+    /// Never lazily creates an owner. Missing/bad bootstrap is native HOLD.
+    pub(crate) fn global() -> Result<&'static Self, NodeResourceError> {
+        GLOBAL
+            .result
+            .get()
+            .ok_or(NodeResourceError::BootstrapMissing)?
+            .as_ref()
+            .map_err(|error| *error)
+    }
+    fn prepare_once(
+        config: AdmissionConfig,
+        limits: NodeLimits,
     ) -> Result<Self, NodeResourceError> {
-        // Complete numeric/layout preflight BEFORE mmap, Pool construction, any
-        // Store open, listener bind or liveness publication. No defaults change.
+        // Complete preflight BEFORE any mmap, Store open, bind or publication.
         let limits = limits.validate()?;
         let carved = config.carved()?;
         let layout = AllocationLayout::native()?;
-        let initial = layout
-            .control_mapped_bytes
-            .checked_add(layout.admission_arc_requested_layout.size())
+        layout
+            .mapped_bytes
+            .checked_add(layout.bootstrap_region.page_bytes)
             .filter(|bytes| *bytes < limits.registry_bytes)
             .ok_or(NodeResourceError::BaselineExhausted)?;
-        let _ = initial;
         #[cfg(target_os = "linux")]
         let pointer = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                layout.control_mapped_bytes,
+                layout.mapped_bytes,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -347,74 +364,59 @@ impl NodeAdmission {
         };
         #[cfg(not(target_os = "linux"))]
         let pointer = libc::MAP_FAILED;
-        if pointer == libc::MAP_FAILED {
+        if pointer == libc::MAP_FAILED || pointer.is_null() {
+            // Never retry or invent capacity. Even a bizarre successful null
+            // mapping is conservatively retained, not deallocated/recreated.
             return Err(NodeResourceError::MappingFailed);
         }
-        let Some(pointer) = NonNull::new(pointer.cast::<Control>()) else {
-            unsafe {
-                libc::munmap(pointer, layout.control_mapped_bytes);
-            }
-            return Err(NodeResourceError::MappingFailed);
-        };
+        let pointer = pointer.cast::<NativeMapping>();
         unsafe {
-            // Every mapped page is written before publishing any owner. This
-            // is physical pre-touch, not an mlock/RSS/kernel entitlement claim.
-            for offset in (0..layout.control_mapped_bytes).step_by(layout.page_bytes) {
-                std::ptr::write_volatile(pointer.as_ptr().cast::<u8>().add(offset), 0);
+            for offset in (0..layout.mapped_bytes).step_by(layout.page_bytes) {
+                std::ptr::write_volatile(pointer.cast::<u8>().add(offset), 0);
             }
-            pointer.as_ptr().write(Control {
-                owners: AtomicUsize::new(1),
-                accounting: Mutex::new(Accounting {
-                    native_constant_bytes: 0,
-                    registry_bytes: 0,
-                    registry_cells: 0,
-                    registry_ever_issued: false,
-                }),
-                limits,
-                page_bytes: layout.page_bytes,
-                control_mapped_bytes: layout.control_mapped_bytes,
-                admission_arc_requested_bytes: layout.admission_arc_requested_layout.size(),
+            pointer.write(NativeMapping {
+                // Actual constructor is BY VALUE; no Arc::new then hidden heap.
+                admission: Pool::value(carved.workers, carved.memory, carved.input, carved.per_job),
+                control: Control {
+                    accounting: Mutex::new(Accounting {
+                        native_constant_bytes: 0,
+                        registry_bytes: 0,
+                        registry_cells: 0,
+                        registry_ever_issued: false,
+                    }),
+                    limits,
+                    config,
+                    layout,
+                },
             });
+            // The sole successful mapping is never dropped or unmapped. This
+            // reference is valid for process life, including after all callers
+            // disappear. GLOBAL publication supplies synchronized visibility.
+            Ok(Self { owner: &*pointer })
         }
-        let owner = StrongOwner(pointer);
-        let admission =
-            Pool::with_deployment(carved.workers, carved.memory, carved.input, carved.per_job);
-        Ok(Self {
-            admission,
-            owner,
-            configured_user_bytes: config.memory[0],
-            remaining_user_bytes: carved.memory[0],
-            per_job: config.per_job,
-        })
     }
     pub(crate) fn try_clone(&self) -> Result<Self, NodeResourceError> {
-        let owner = self.owner.try_clone()?;
-        Ok(Self {
-            admission: self.admission.clone(),
-            owner,
-            configured_user_bytes: self.configured_user_bytes,
-            remaining_user_bytes: self.remaining_user_bytes,
-            per_job: self.per_job,
-        })
+        Ok(*self)
     }
-    pub(super) fn admission(&self) -> Arc<Pool> {
-        self.admission.clone()
+    pub(super) fn admission(&self) -> Owner {
+        Owner::NativeStatic(&self.owner.admission)
+    }
+    pub(crate) fn allocation_layout(&self) -> AllocationLayout {
+        self.owner.control.layout
     }
 
-    /// Prepay an actual native constant/control allocation. This ticket must be
-    /// installed in its real owner BEFORE a numeric unsafe native initializer is
-    /// called; the number itself is NOT proof. Exact static page spans and token
-    /// Arc/owner allocation layouts still need the cancellation owner's API.
+    /// Numeric bookkeeping seam only, NOT native readiness. Parent supplies
+    /// real owner-linked constant/page reservations before allocation and unions
+    /// their actual static spans. All charges remain permanent even if a ticket
+    /// is dropped: uncertain cleanup cannot mint credit or a replacement pool.
     pub(crate) fn reserve_native_constant(
         &self,
         bytes: usize,
     ) -> Result<BaselineLease, NodeResourceError> {
         self.reserve(bytes, 0, false)
     }
-    /// Inherent budget seam only: NOT an assumed RegistryAdmission trait impl.
-    /// The real RegistryPool must supply its exact page-rounded mapping bytes,
-    /// including its own control + this associated INLINE lease's real Layout.
-    /// Its final munmap MUST precede dropping the returned non-cloneable lease.
+    /// The actual source must include its own control + this INLINE lease's real
+    /// Layout in its page-rounded mapping bytes. Exactly one mapping, ever.
     pub(crate) fn reserve_registry_mapping(
         &self,
         bytes: usize,
@@ -428,18 +430,15 @@ impl NodeAdmission {
         cells: usize,
         registry: bool,
     ) -> Result<BaselineLease, NodeResourceError> {
-        let control = self.owner.control();
+        let control = &self.owner.control;
         if bytes == 0
             || (registry
                 && (cells == 0
                     || cells > control.limits.registry_cells
-                    || !bytes.is_multiple_of(control.page_bytes)))
+                    || !bytes.is_multiple_of(control.layout.page_bytes)))
         {
             return Err(NodeResourceError::InvalidRegistryReservation);
         }
-        // Clone strong ownership before changing accounting; failure never
-        // leaves a booked allocation with no owner.
-        let owner = self.owner.try_clone()?;
         let mut state = control
             .accounting
             .lock()
@@ -457,8 +456,9 @@ impl NodeAdmission {
             state.registry_bytes
         };
         control
-            .control_mapped_bytes
-            .checked_add(control.admission_arc_requested_bytes)
+            .layout
+            .mapped_bytes
+            .checked_add(control.layout.bootstrap_region.page_bytes)
             .and_then(|total| total.checked_add(constants))
             .and_then(|total| total.checked_add(registry_bytes))
             .filter(|total| *total <= control.limits.registry_bytes)
@@ -469,19 +469,18 @@ impl NodeAdmission {
             state.registry_cells = cells;
             state.registry_ever_issued = true;
         }
-        drop(state);
         Ok(BaselineLease {
-            admission: self.admission.clone(),
-            owner,
+            admission: self.admission(),
+            owner: self.owner,
             bytes,
             cells,
             registry,
         })
     }
-    /// Budget available for the source's layout calculation AFTER all actual
-    /// other constant/control/page reservations. Not a layout or readiness proof.
+    /// Remaining same-16-MiB source budget, AFTER real mapping/GLOBAL span and
+    /// prior actual constants. Not a physical/native/ready claim.
     pub(crate) fn remaining_registry_limits(&self) -> Result<(usize, usize), NodeResourceError> {
-        let control = self.owner.control();
+        let control = &self.owner.control;
         let state = control
             .accounting
             .lock()
@@ -490,8 +489,9 @@ impl NodeAdmission {
             return Err(NodeResourceError::RegistryAlreadyIssued);
         }
         let used = control
-            .control_mapped_bytes
-            .checked_add(control.admission_arc_requested_bytes)
+            .layout
+            .mapped_bytes
+            .checked_add(control.layout.bootstrap_region.page_bytes)
             .and_then(|bytes| bytes.checked_add(state.native_constant_bytes))
             .ok_or(NodeResourceError::LayoutOverflow)?;
         Ok((
@@ -504,16 +504,31 @@ impl NodeAdmission {
         ))
     }
     pub(crate) fn metrics(&self) -> serde_json::Value {
-        let control = self.owner.control();
+        let control = &self.owner.control;
+        let layout = control.layout;
         let state = control.accounting.lock().ok();
         serde_json::json!({
-            "construction": "ADMISSION_ONLY_NATIVE_SOURCE_AND_CANCELLATION_HOLD",
-            "configuredUserMemoryBytes": self.configured_user_bytes,
+            "construction": "MAPPED_ADMISSION_ONLY_SOURCE_CANCELLATION_STARTUP_HOLD",
+            "configuredUserMemoryBytes": control.config.memory[0],
             "baselineReservedBytes": NODE_BASELINE_BYTES,
-            "remainingUserMemoryBytes": self.remaining_user_bytes,
-            "perJobReservationBytes": self.per_job,
-            "controlMappedBytes": control.control_mapped_bytes,
-            "admissionArcRequestedBytes": control.admission_arc_requested_bytes,
+            "remainingUserMemoryBytes": control.config.memory[0] - NODE_BASELINE_BYTES,
+            "perJobReservationBytes": control.config.per_job,
+            "admissionPoolBytes": layout.pool_layout.size(),
+            "admissionPoolAlign": layout.pool_layout.align(),
+            "controlBytes": layout.control_layout.size(),
+            "controlAlign": layout.control_layout.align(),
+            "ownedMappingBytes": layout.mapped_bytes,
+            "ownedMappingAddress": std::ptr::from_ref(self.owner).addr(),
+            "globalStaticAddress": layout.bootstrap_region.address,
+            "globalStaticBytes": layout.bootstrap_region.layout.size(),
+            "globalStaticAlign": layout.bootstrap_region.layout.align(),
+            "globalStaticPageStart": layout.bootstrap_region.page_start,
+            "globalStaticPageEnd": layout.bootstrap_region.page_end,
+            "globalStaticPageBytes": layout.bootstrap_region.page_bytes,
+            "callerNodeHandleBytes": layout.node_handle_layout.size(),
+            "callerAdmissionHandleBytes": layout.admission_handle_layout.size(),
+            "callerStrongInputBytes": layout.strong_input_layout.size(),
+            "sourceInlineLeaseBytes": layout.associated_lease_layout.size(),
             "nativeConstantReservedBytes": state.as_ref().map(|state| state.native_constant_bytes),
             "registryMappedReservedBytes": state.as_ref().filter(|state| state.registry_ever_issued).map(|state| state.registry_bytes),
             "registryReservedCells": state.as_ref().filter(|state| state.registry_ever_issued).map(|state| state.registry_cells),
@@ -521,18 +536,18 @@ impl NodeAdmission {
             "registryCellCeiling": control.limits.registry_cells,
             "cancellationSlotCeiling": control.limits.cancel_slots,
             "cancellationStaticPageBytes": Option::<usize>::None,
-            "allocatorBacking": "HOLD"
+            "poolOwnership": "PROCESS_LIFETIME_ACTUAL_MMAP",
+            "nativePhysicalAggregate": "HOLD"
         })
     }
 }
 
-/// Strong prepaid baseline ownership, including the REAL shared admission pool.
-/// No Weak, per-lease Box/Arc allocation, capacity reset, or independent pool.
-/// It is intentionally non-cloneable: source stores ONE lease inline in its ONE
-/// mapped PoolControl; the source primitive controls all pointer handle clones.
+/// Strong actual permanent Pool + ledger ownership. No heap allocation or Weak;
+/// source places ONE non-cloneable lease inline in its REAL mapped control.
+/// NO refund on Drop: cleanup/unmap uncertainty never produces fake credit.
 pub(crate) struct BaselineLease {
-    admission: Arc<Pool>,
-    owner: StrongOwner,
+    admission: Owner,
+    owner: &'static NativeMapping,
     bytes: usize,
     cells: usize,
     registry: bool,
@@ -544,23 +559,14 @@ impl BaselineLease {
     pub(crate) fn reserved_cells(&self) -> usize {
         self.cells
     }
-}
-impl Drop for BaselineLease {
-    fn drop(&mut self) {
-        // Native memory cleanup must already have happened in the owning
-        // component. On poison leave accounting charged; never invent credits.
-        if let Ok(mut state) = self.owner.control().accounting.lock() {
-            if self.registry {
-                state.registry_bytes -= self.bytes;
-                state.registry_cells -= self.cells;
-                // registry_ever_issued stays true: no second mapping/new cap.
-            } else {
-                state.native_constant_bytes -= self.bytes;
-            }
-        }
-        // Strong Pool/ledger fields drop only after this typed ticket's Drop.
-        // The immutable USER carve is NEVER returned while a Pool exists.
-        let _ = &self.admission;
+    pub(crate) fn is_registry_mapping(&self) -> bool {
+        self.registry
+    }
+    pub(crate) fn admission(&self) -> Owner {
+        self.admission.clone()
+    }
+    pub(crate) fn allocation_layout(&self) -> AllocationLayout {
+        self.owner.control.layout
     }
 }
 

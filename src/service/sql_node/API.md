@@ -1,51 +1,64 @@
-# SQL node resources — admission component and integration HOLD
+# SQL mapped node admission — owned ABI, startup integration HOLD
 
-Owner: subagent `2lgji7vdotadzmy6`; parent `t4ovpycxalx27zea`. New files only: `src/service/sql_node.rs`, `sql_node/tests.rs`, this note. No main/service/admission/tuning/partition, Store/Consensus, source primitive, Cargo, SDK or runtime activation edits.
+Owner adaptation: child `k7ypukoo2jiyhinp` of foundation `t4ovpycxalx27zea`, October 4, 2026. Published input base: `21ab176ae1bd3c9164b12eeaa68e2de3ff3eac99`.
 
-## Source-owner contact / constructor blocker
+## What changed; what did not
 
-Subagents here have no `send_to_session` tool, and the sandbox has no `ultimator` CLI. The attempted CLI sends to source and parent both failed with command-not-found. **Contact has NOT occurred.** Parent must relay to `wax7bxo4iag6tgwo` before coupling and supply/import the frozen actual RegistryAdmission/RegistryPool plus mandatory shared-owner Store/Consensus APIs. No trait or Store constructor has been invented.
+The earlier **400-byte requested Arc allocation was NOT backing proof**. It is removed from the new native path, rather than accompanied by allocator margins or a general mimalloc claim. One startup attempt constructs the real `admission::Pool` **by value** alongside the native ledger inside one explicitly page-rounded, pre-touched anonymous mmap. `GLOBAL` permanently retains that exact mapping. No native Arc/Box pool allocation, reference-counted last-drop unmap, deallocation, reset, second pool, per-Store/per-router factory or retry that mints capacity exists.
 
-No `NodeResources` ready constructor or `router_with_resources` is exposed. Existing serving startup/router code is unchanged and therefore NOT repaired by this component alone. Do not activate SQL or claim global native construction success.
+This is still **not `NativeReady`**. Actual source adapter/bootstrap, cancellation/current-token/history ownership, before-any-Store construction, main/all-route/global router use and serving activation belong to the parent and remain **HOLD**. Merely registering this module for root-library typechecking is not startup wiring. No unsafe numeric readiness verifier is provided.
 
-## Implemented real component
+The fixed **16,777,216-byte USER carve** is unchanged. Actual existing per-job reservation remains **432 MiB (452,984,832 bytes)**; minimum configured USER memory remains **448 MiB (469,762,048 bytes)**. CONTROL/DEPLOYMENT budgets, worker counts, queued-input bytes, FIFO partition/lane rotation, scheduler cancellation/delivery semantics and ordinary watches are preserved. Operators may only lower **16 MiB / 256 source cells / 128 cancellation slots** at startup. No deployment/default/resource configuration is edited or automatically raised.
 
-- `AdmissionConfig::configured()` copies current workers/memory/queued-input budgets and the real existing `evaluation_memory_bytes`, including its SQL blanket reservation. `NodeAdmission::prepare(config, limits)` checks everything before native mmap or Pool allocation, then creates exactly ONE real `admission::Pool` and one pre-touched mapped ledger.
-- Fixed conservative **16,777,216-byte** baseline permanently carved from USER preparation memory. It is never added to the configured budget or credited back to the immutable Pool. At current 432 MiB/job, exact minimum USER configuration is **448 MiB (469,762,048 bytes)**; the 432 MiB one-worker default is explicitly refused. No defaults/worker counts/per-job allocation/fairness changes. CONTROL/DEPLOYMENT memory, workers and queues remain intact.
-- `NodeLimits` is copied immutably into the ledger; hard ceilings 16 MiB / 256 source registry cells / 128 native cancellation slots. Optional startup-only proposed names: `FLOWER_SQL_REGISTRY_BYTES`, `FLOWER_SQL_REGISTRY_CELLS`, `FLOWER_SQL_CANCELLATION_SLOTS`. Values must be positive and may only lower the ceilings. Reduced source byte ceilings still use the conservative full 16 MiB USER carve, not extra capacity.
-- `NodeAdmission::try_clone()` shares the SAME ledger and SAME actual Pool, with no allocation. `admission()` is service-visible only. No Weak baseline owner.
-- `reserve_native_constant(actual_bytes)` and `reserve_registry_mapping(actual_page_rounded_bytes, actual_cells)` return non-cloneable `BaselineLease`: strong mapped ledger + strong actual Pool ownership, no new Arc allocation. Caller must put it in the real retained allocation owner BEFORE allocation/unsafe initializer and drop it AFTER final native cleanup/unmap. Only one source mapping ticket can ever be issued; its issued flag never resets, even after final ticket Drop. Failure rolls back strong ownership before returning.
-- `remaining_registry_limits()` subtracts actual booked other constants, mapped ledger pages and exact requested Pool Arc layout before source layout calculation. It is a budget seam, NOT a RegistryAdmission impl, source layout proof, or native readiness proof. Cancellation must be actually reserved first by the full constructor.
-- Metrics expose configured/reserved/remaining/per-job/control/capacity terms without source identities or private data. Missing source/cancellation layout and poisoned counters are null, not fabricated zero. Construction explicitly says `ADMISSION_ONLY_NATIVE_SOURCE_AND_CANCELLATION_HOLD`; allocator backing is HOLD.
+## Actual owner / writer seam
 
-## Exact native measurements already executed
+- `pub(crate) mod admission;`
+- `admission::Owner`: `Shared(Arc<Pool>)` preserves legacy/test/watch ownership; `NativeStatic(&'static Pool)` retains the **actual mapped Pool** for process life. `Clone`, `Deref<Target = Pool>` and `ptr_eq(&self, &Owner)` are available. Native clones allocate nothing.
+- Internal `WeakOwner` preserves weak lifetime for `Shared`; the native case retains the permanent actual Pool reference, never a weak separately allocated object.
+- `Pool::configured/new/with_deployment/watches` return `Owner`. `retain`, `acquire`, `schedule` move to `Owner`; the real algorithm and accounting are unchanged. `Pool::value(...) -> Pool` is the by-value constructor used by the native mmap.
+- `Input` is `pub(crate)` with private fields.
+- Opaque `pub(crate) struct StrongInput { _input: Input, _pool: Owner }`. **Input is declared FIRST and drops FIRST**, while the actual strong owner is alive. `Owner::retain_strong(&self, class: Class, bytes: usize) -> Result<StrongInput, ApiError>` retains input then clones that owner.
+- Writer should keep its existing `Mutex<Option<StrongInput>>` attachment-before-evaluation and queued `Arc<Basis>` lifetime. No writer file is edited here. Parent resolves the frozen writer's old `Arc<Pool>` seam against this `Owner` ABI.
 
-Linux x86-64, native page 4096:
+## Native bootstrap and reservation seam
 
-| Allocation | Exact measured/requested layout |
-| --- | ---: |
-| Ledger `Control` | 96 bytes, align 8 |
-| Pre-touched ledger mapping | 4096 bytes |
-| Actual `Arc<admission::Pool>` allocator request | 400 bytes, align 8, ONE real Rust allocation |
-| Associated inline `BaselineLease` | **40 bytes, align 8**, Send + Sync + 'static |
-| Source budget before any other native constants | 16,772,720 bytes |
+```rust
+NodeAdmission::prepare(config: AdmissionConfig, limits: NodeLimits)
+    -> Result<&'static NodeAdmission, NodeResourceError>;
+NodeAdmission::global()
+    -> Result<&'static NodeAdmission, NodeResourceError>;
+NodeAdmission::try_clone(&self) -> Result<NodeAdmission, NodeResourceError>;
+NodeAdmission::admission(&self) -> admission::Owner;
+NodeAdmission::allocation_layout(&self) -> AllocationLayout;
+NodeAdmission::reserve_native_constant(&self, bytes: usize)
+    -> Result<BaselineLease, NodeResourceError>;
+NodeAdmission::reserve_registry_mapping(&self, bytes: usize, cells: usize)
+    -> Result<BaselineLease, NodeResourceError>;
+NodeAdmission::remaining_registry_limits(&self)
+    -> Result<(usize, usize), NodeResourceError>;
+```
 
-The source owner must run its REAL `reservation_layout::<NodeAdapter>(limits)` with the actual 40-byte associated lease, not the earlier 128-byte fixture. No final source mapped size/cell capacity is asserted here.
+`prepare` is process-global and immutable. Same config/limits borrows the published object. Different config/limits refuses. Any first validation/mmap failure is permanently latched. `OnceLock` is accompanied by a one-attempt flag so an initializer unwind cannot permit another mapping attempt. `global` never initializes lazily; missing/bad initialization is HOLD. Parent must call the startup attempt **before ANY Store**; that actual order is not claimed by this unwired component.
 
-The Arc layout is a pinned-toolchain requested-layout description, checked against the actual native allocation probe. It does NOT account/prove malloc/mimalloc arenas, resident backing or kernel storage. Exact requested layout vs actual resident backing must not be conflated; whole physical construction remains HOLD.
+`BaselineLease` is non-cloneable and retains both the actual `Owner` and the permanent native mapping. Its real `Layout` is queried, never assumed to remain the old 40 bytes. Accessors: `reserved_bytes`, `reserved_cells`, `is_registry_mapping`, `admission`, `allocation_layout`. Source must recompute `reservation_layout::<ActualAdapter>()` using the real associated lease and place it inline in its actual owned mapping.
 
-## Cancellation and other HOLDs
+All baseline reservations are conservative **permanent charges**. A dropped ticket is not proof of native cleanup, so it returns no credit. Source mapping issuance remains one-shot even if a caller drops its ticket or initialization/cleanup fails. No reset/replacement witness creates a new cap.
 
-The actual cancellation API exposes a 38,944-byte static mutex/registry and hard 128 slots, but does not expose its actual static address/page extent or an owner-linked baseline ticket. Depending on real page offset its page span is 40,960 or 45,056 bytes. A sizeof-only number is not proof. No `NativeRegistry::from_prepaid_node_budget` call was made. Its handle, existing token Arc/control owners, scope lifetime, process-lifetime static ownership and cleanup must be reconciled with strong baseline ownership, with exact Layout or explicit HOLD; no guessed 8 KiB margin.
+## Exact accounting / page union obligation
 
-Frozen source API/Store constructors, actual source pool mapping/last-owner callback order, cancellation owner initialization/current token/source UID/history, required before-all-Stores/bind/liveness main wiring, real two-physical-replica/partition/router/HTTP tests, allocator/kernel/native stacks/backing, whole-node/global-singleton lifecycle, full default+SQL native checks and serving are HOLD. Ingress and its per-job overlapping reservations are untouched. Private-capsule/helper/resource profiles are untouched.
+`AllocationLayout::native()` and `allocation_layout()` report actual:
 
-## Checks
+- `Layout::new::<Pool>()`, `Layout::new::<Control>()`, `Layout::new::<NativeMapping>()` and real page-rounded `mapped_bytes`;
+- caller-inline `Layout::new::<NodeAdmission>()`, `Layout::new::<Owner>()`, `Layout::new::<StrongInput>()` and source-associated `Layout::new::<BaselineLease>()`;
+- `bootstrap_region`: the **actual address of GLOBAL**, `Layout::new::<Bootstrap>()`, actual starting page and actual span including that address's page offset;
+- native page size.
 
-Final coherent isolated native run: **26/26 PASS** (13 new node tests + 13 existing admission/ordinary ingress/tuning/allocator-probe tests), zero ignored; strict isolated Clippy **PASS** with `--locked --all-targets --offline -- -D warnings`, plus owned rustfmt/diff checks **PASS**. Hashes of all node and imported production modules matched before/after the final run. Tests imported the actual node module, actual tuning/ingress/probe, and an exact copy of admission with only an explicit ingress path attribute. Evaluator production config is copied unchanged excluding its unrelated full-Wasm test module. Application/telemetry glue is unconnected and fails if native Consensus methods are called: this is deliberately NOT a mocked positive Store/router/HTTP/native-SQL fixture.
+The mmap bytes **plus actual GLOBAL page span** are already reserved within the **same 16 MiB** before source reservation. The original `NodeAdmission` is physically inline inside GLOBAL's actual reported region. Native caller-inline handles are not hidden heap allocations: their actual embedding owner/mapping/stack must be prepaid; source's page-rounded reservation must include the exact associated inline lease. Parent must reserve any other actual caller/control regions within the same baseline and **union overlapping source-bootstrap/cancellation static pages with GLOBAL**, not add a fictitious `sizeof`-aligned span, margins, RSS, or new resource allowance. Address/page spans must be queried in the actual combined process; ASLR/build-dependent example addresses are not constants.
 
-The native tests measured real Arc request bytes, zero heap allocations for handle/ticket operations and pre-allocation refusals; real mmap + mincore pre-touch; strong ownership beyond NodeAdmission drop; actual native unmap before lease credit and final ledger drop; hard lower caps/overflow/poison; real shared cold/warm partition lanes and unchanged CONTROL/DEPLOYMENT positive capacity. They do not prove the unavailable source/cancellation integration.
+Reservations are bookkeeping, not a native initializer proof. No assertion about other mimalloc arenas, native stacks, pthread/kernel objects, process allowance, RSS/mlock, allocator backing or whole-controller physical aggregate is made.
 
-Source mapping reservations must be positive native-page multiples; unrounded values refuse rather than masquerading as actual mappings. The harness permits only dead-code warnings for the deliberately unactivated context, no Clippy lint allowances. Parent later owns coherent full default+SQL native checks. No repository Cargo/lock edits or commits/push/PR, board completion, live process, or serving activation.
+## Check boundaries
 
-Final checked node file SHA-256: `f4654134f4e6ecaa2ae817277ecf5685ca457a356ef60e44795f912652db06a5`; tests: `c6237d2621169a0b7c2ac307101c48301af21a1fd143abac44982c70a7a1bfad`. Target `/workspace/sql-node-2lgji7vdotadzmy6-target` belongs only to this child and is removed after the completed checks; the reproducible small harness remains at `/workspace/sql-node-2lgji7vdotadzmy6-harness`. Shared native targets/cache are untouched.
+Native tests use isolated OS children: ONE actual singleton/mapping per child, no global reset. They exercise actual mmap pre-touch/residency/process lifetime, zero Rust allocation in cold native construction and handles/lease retention, actual Pool FIFO/control/deployment/shared-handle behavior, immutable matching/mismatching startup, missing/failure HOLD and strong input charge retention. Ordinary Shared tests remain independent and explicitly are **not native-positive**. The legacy strong-input test observes retained bytes in the actual final `Pool::drop`, proving input-first cleanup at the last strong owner.
+
+A small harness references frozen actual modules; its unused Consensus context methods are unreachable and are **never a positive fixture**. Actual full root-library checks must accompany it. The owner's root artifact is built from published whole-source HEAD plus only owned changes (and non-activating module registration); mutable unowned WIP is excluded. Native Store/Consensus/source, two physical replicas, router/all-route HTTP, current token and full SQL serving remain HOLD.

@@ -1,4 +1,4 @@
-mod admission;
+pub(crate) mod admission;
 pub(crate) mod cancellation;
 mod clock;
 mod forwarding;
@@ -42,7 +42,7 @@ struct App {
     writer_queue: mpsc::Sender<writer::Pending>,
     evaluations: Arc<Semaphore>,
     query_evaluations: Arc<Semaphore>,
-    admission: Arc<admission::Pool>,
+    admission: admission::Owner,
     query_cache: query_cache::QueryCache,
     authorizations: authorization::memo::Memo,
     watch_hubs: watch::hubs::Registry,
@@ -136,7 +136,7 @@ fn make_app(
     consensus: Consensus,
     admin_token: String,
     query_evaluations: Arc<Semaphore>,
-    admission: Arc<admission::Pool>,
+    admission: admission::Owner,
     partition_gate: Option<Arc<partitions::router::Gate>>,
 ) -> Arc<App> {
     let (writer_queue, receiver) = mpsc::channel(

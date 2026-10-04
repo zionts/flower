@@ -193,7 +193,7 @@ struct Registry {
     routes: Arc<Routes>,
     apps: Mutex<BTreeMap<String, (u64, Arc<App>)>>,
     queries: Arc<Semaphore>,
-    admission: Arc<service::admission::Pool>,
+    admission: service::admission::Owner,
     client: reqwest::Client,
     next_read: AtomicUsize,
 }
@@ -254,7 +254,7 @@ pub(in crate::service) fn router(
     consensus: Consensus,
     token: String,
     queries: Arc<Semaphore>,
-    admission: Arc<service::admission::Pool>,
+    admission: service::admission::Owner,
 ) -> Router {
     let Some(runtime) = Runtime::new(consensus, token, admission.clone())
         .expect("validated partition configuration")
