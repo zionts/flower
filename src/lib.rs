@@ -7,8 +7,8 @@ pub(crate) mod sql_commit;
 pub mod telemetry;
 pub mod transport;
 
-#[cfg(all(test, feature = "sql"))]
+#[cfg(test)]
 pub(crate) mod allocation_probe;
-#[cfg(all(test, feature = "sql"))]
+#[cfg(test)]
 #[global_allocator]
-static SQL_TEST_ALLOCATOR: allocation_probe::Allocator = allocation_probe::Allocator;
+static TEST_ALLOCATOR: allocation_probe::Allocator = allocation_probe::Allocator;

@@ -269,6 +269,33 @@ pub(super) fn execute_prepared_encoded(
         ),
         "SQL_KIND_INVALID: encoded execution requires a SQL callback kind"
     );
+    execute_encoded_callback(prepared, name, args, kind_number(kind)?, host, shared)
+}
+
+/// Closed native target for the SDK's initial/fresh authorization hook. It does
+/// NOT admit an arbitrary query target or public alias. The controller must
+/// validate the exact captured authorization declaration and phase before
+/// entry, and enforce read-only, certificate-covered host/crypto capabilities.
+/// This transport alone grants no system-read or managed-key authority.
+#[cfg(feature = "sql")]
+pub(super) fn execute_sql_authorization(
+    prepared: &Prepared,
+    args: &[u8],
+    host: &mut dyn EncodedHost,
+    shared: Arc<Limits>,
+) -> Result<()> {
+    execute_encoded_callback(prepared, "$flower.authorize", args, 0, host, shared)
+}
+
+#[cfg(feature = "sql")]
+fn execute_encoded_callback(
+    prepared: &Prepared,
+    name: &str,
+    args: &[u8],
+    kind_number: i32,
+    host: &mut dyn EncodedHost,
+    shared: Arc<Limits>,
+) -> Result<()> {
     ensure!(
         name.len()
             .checked_add(args.len())
@@ -276,7 +303,6 @@ pub(super) fn execute_prepared_encoded(
         "SQL_WIRE_CAPACITY: invocation input exceeds the admitted wire limit"
     );
     let _depth = shared.enter()?;
-    let kind_number = kind_number(kind)?;
     let runtime = cache::runtime()?;
     shared.check()?;
     // SAFETY: only this stack frame owns `bridge`. The token is a synchronous

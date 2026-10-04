@@ -114,6 +114,129 @@ fn detached_native_real_wasm_captured_write_is_uncatchable() {
     assert!(host.finished().is_none());
 }
 #[test]
+fn detached_native_real_wasm_known_commit_fence_17_is_fatal_in_all_sql_phases() {
+    // This is the REAL known mutation attenuation import, not an unknown-op
+    // test. A missing writer ABI cannot satisfy the typed HostError assertion.
+    // Unsafe native points/registered permits remain COMPONENT fixtures only.
+    for static_init in [false, true] {
+        for (phase, kind) in [
+            (NativePhase::InitialAuth, "queryMethod"),
+            (NativePhase::FreshAuth, "queryMethod"),
+            (NativePhase::Authority, "sqlAuthority"),
+            (NativePhase::Provider, "sqlProvider"),
+            (NativePhase::ReadlessPlan, "sqlPlan"),
+            (NativePhase::ReadlessFinalizer, "sqlFinalizer"),
+        ] {
+            let compute = "()=>{try{__flowerContexts[1].requireCommitBefore(2000)}catch(_){return 'caught'}return 'fence'}";
+            let code = if matches!(phase, NativePhase::InitialAuth | NativePhase::FreshAuth) {
+                format!(
+                    "{}var __flowerBundle={{default:{{definitions:{{'$flower.authorize':{{name:'$flower.authorize',kind:'queryMethod',compute:{compute}}}}},http:{{}}}}}};",
+                    wasm::STATIC_INIT_MARKER
+                )
+            } else {
+                native_source(kind, compute)
+            };
+            let code = if static_init {
+                code.as_str()
+            } else {
+                code.strip_prefix(wasm::STATIC_INIT_MARKER).unwrap()
+            };
+            let prepared = wasm::prepare(code, native_limits()).unwrap();
+            let mut f = Fixture::new("null");
+            let relations = [];
+            let mut admitted = admission(&f, &relations, MAX_HOST_WORK);
+            let budget = PolicyBudget::new(MAX_HOST_WORK).unwrap();
+            if phase == NativePhase::ReadlessFinalizer {
+                // Use an ACTUAL healthy completed permission callback and stamp;
+                // no unqualified generic finalizer stand-in may pass this test.
+                let point = native_point(&f.job, NativePhase::InitialAuth, f.binding);
+                let mut permission = SqlHost::new(
+                    NativePhase::InitialAuth,
+                    &mut admitted,
+                    &f.frame,
+                    &relations,
+                    f.binding,
+                    None,
+                    &budget,
+                    point,
+                    &mut f.job,
+                )
+                .unwrap();
+                permission
+                    .finish_checked_at(&[wire::SUCCESS, wire::NULL], f.binding.clock)
+                    .unwrap();
+            }
+            let execution = invocation_limits(&f);
+            let point = native_point(&f.job, phase, f.binding);
+            let mut host = if phase == NativePhase::Authority {
+                registered_authority_host(
+                    &mut admitted,
+                    &f.frame,
+                    &relations,
+                    f.binding,
+                    &budget,
+                    point,
+                    &mut f.job,
+                    f.authority_catalog,
+                )
+            } else if phase == NativePhase::ReadlessFinalizer {
+                let stamp = admitted
+                    .permission_stamp(&mut f.job, f.binding.clock)
+                    .unwrap();
+                SqlHost::new_qualified_finalizer(
+                    &mut admitted,
+                    &f.frame,
+                    f.binding,
+                    &budget,
+                    stamp,
+                    point,
+                    &mut f.job,
+                )
+            } else {
+                SqlHost::new(
+                    phase,
+                    &mut admitted,
+                    &f.frame,
+                    &relations,
+                    f.binding,
+                    if phase == NativePhase::Provider {
+                        Some(CapturedSupport::from_owned_capture(&[], &[]).unwrap())
+                    } else {
+                        None
+                    },
+                    &budget,
+                    point,
+                    &mut f.job,
+                )
+            }
+            .unwrap();
+            let error = if matches!(phase, NativePhase::InitialAuth | NativePhase::FreshAuth) {
+                wasm::execute_sql_authorization(&prepared, &[wire::NULL], &mut host, execution)
+            } else {
+                wasm::execute_prepared_encoded(
+                    &prepared,
+                    "test",
+                    &[wire::NULL],
+                    kind,
+                    &mut host,
+                    execution,
+                )
+            }
+            .unwrap_err();
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<HostError>() == Some(&HostError::Forbidden)),
+                "known fence 17 must reach the real typed host denial: phase={phase:?} static={static_init}: {error:#}"
+            );
+            assert_eq!(host.failure(), Some(HostError::Forbidden));
+            assert!(host.finished().is_none());
+            assert_eq!(host.finish_permission(), Err(HostError::Forbidden));
+        }
+    }
+}
+
+#[test]
 fn detached_native_real_wasm_need_capture_type_survives_anyhow_wasmtime() {
     let code = native_source(
         "sqlAuthority",

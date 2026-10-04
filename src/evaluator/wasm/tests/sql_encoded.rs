@@ -94,6 +94,97 @@ fn source(kind: &str, compute: &str, static_init: bool) -> String {
     ) + "}},http:{}}};"
 }
 
+fn authorization_source(compute: &str) -> String {
+    format!(
+        "{STATIC_INIT_MARKER}var __flowerBundle={{default:{{definitions:{{'$flower.authorize':{{name:'$flower.authorize',kind:'queryMethod',compute:{compute}}},other:{{name:'other',kind:'queryMethod',compute:()=>{{throw new Error('WRONG_NATIVE_TARGET')}}}}}},http:{{}}}}}};"
+    )
+}
+
+#[test]
+fn native_encoded_closed_authorization_target_uses_bounded_readonly_transport() {
+    warmup().unwrap();
+    let prepared = prepare(
+        &authorization_source(
+            "(ctx,args)=>({principal:{subject:ctx.get({kind:'collection',name:'guards'},'k')},readArgs:false})",
+        ),
+        tests::limits(),
+    )
+    .unwrap();
+    let mut call = |operation: &str, _: &[u8], input: &WireArena, root, output: &mut WireArena| {
+        assert_eq!(operation, "get");
+        let arguments = input.value(root)?;
+        assert_eq!(arguments.len(), Some(2));
+        assert_eq!(
+            arguments.index(0).unwrap().member("name").unwrap().as_str(),
+            Some("guards")
+        );
+        assert_eq!(arguments.index(1).unwrap().as_str(), Some("k"));
+        Ok(WireOutcome::Success(output.text("native-verified")?))
+    };
+    let mut host = BoundedHost::new(&mut call);
+    execute_sql_authorization(&prepared, &[wire::NULL], &mut host, tests::limits()).unwrap();
+    assert_eq!(host.calls, 1);
+    assert_eq!(host.finishes, 1);
+    assert_eq!(
+        host.success_json(),
+        br#"{"principal":{"subject":"native-verified"},"readArgs":false}"#
+    );
+    // The general route still cannot turn query/mutation kinds into arbitrary
+    // privileged native authorization targets.
+    let error = execute_prepared_encoded(
+        &prepared,
+        "other",
+        &[wire::NULL],
+        "query",
+        &mut host,
+        tests::limits(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().starts_with("SQL_KIND_INVALID:"));
+    assert_eq!(host.finishes, 1);
+}
+
+#[test]
+fn native_encoded_closed_authorization_never_falls_back_to_another_query() {
+    warmup().unwrap();
+    let prepared = prepare(&source("queryMethod", "()=>1", true), tests::limits()).unwrap();
+    let mut no_call = |_: &str, _: &[u8], _: &WireArena, _, _: &mut WireArena| {
+        panic!("missing closed target must not invoke a host")
+    };
+    let mut host = BoundedHost::new(&mut no_call);
+    execute_sql_authorization(&prepared, &[wire::NULL], &mut host, tests::limits()).unwrap();
+    assert_eq!(host.calls, 0);
+    assert_eq!(host.failure_code(), "DEFINITION_MISSING");
+}
+
+#[test]
+fn native_encoded_closed_authorization_preserves_fatal_write_and_crypto_denial() {
+    warmup().unwrap();
+    for crypto in [false, true] {
+        let compute = if crypto {
+            "()=>{try{__flowerCrypto(101,0,'invalid','key','{}')}catch(_){return 'caught'}return 'crypto'}"
+        } else {
+            "()=>{try{__flowerContexts[1].set({kind:'collection',name:'guards'},'k',1)}catch(_){return 'caught'}return 'write'}"
+        };
+        let prepared = prepare(&authorization_source(compute), tests::limits()).unwrap();
+        let mut denied = |operation: &str, _: &[u8], _: &WireArena, _, _: &mut WireArena| {
+            assert_eq!(operation, "set");
+            anyhow::bail!("SQL_AUTH_WRITE_FORBIDDEN: native read-only phase")
+        };
+        let mut host = BoundedHost::new(&mut denied);
+        let error = execute_sql_authorization(&prepared, &[wire::NULL], &mut host, tests::limits())
+            .unwrap_err();
+        let expected = if crypto {
+            "SQL_CRYPTO_FORBIDDEN"
+        } else {
+            "SQL_AUTH_WRITE_FORBIDDEN"
+        };
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(host.calls, usize::from(!crypto));
+        assert_eq!(host.finishes, 0);
+    }
+}
+
 #[test]
 fn native_encoded_plans_and_finalizers_have_readless_principal_surfaces() {
     for kind in ["sqlPlan", "sqlFinalizer"] {

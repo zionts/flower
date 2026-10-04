@@ -5,6 +5,13 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Rust's test harness omits the crate segment. Derive the remaining real
+/// ancestry so the SAME fixture runs in Root and standalone component crates.
+fn current_test_filter(function: &str) -> String {
+    let (_, module) = module_path!().split_once("::").unwrap();
+    format!("{module}::{function}")
+}
+
 #[derive(Clone, Copy)]
 struct CloseState {
     active: bool,
@@ -652,16 +659,29 @@ fn native_partial_mapping_failure_cleans_real_maps_and_fds_before_ticket_refund(
     use std::process::Command;
     const CHILD: &str = "SQL_FRAME_PARTIAL_MMAP_CHILD";
     if std::env::var_os(CHILD).is_none() {
+        let filter = current_test_filter(
+            "native_partial_mapping_failure_cleans_real_maps_and_fds_before_ticket_refund",
+        );
         let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "sql_frame::transport::tests::native_partial_mapping_failure_cleans_real_maps_and_fds_before_ticket_refund", "--nocapture"])
-            .env(CHILD, "1").output().unwrap();
+            .args(["--exact", &filter, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            output
+                .stderr
+                .windows(b"ACTUAL-PARTIAL-MAP-CHILD".len())
+                .any(|bytes| bytes == b"ACTUAL-PARTIAL-MAP-CHILD"),
+            "a zero-test child is not a native partial-map cleanup witness"
+        );
         return;
     }
+    eprintln!("ACTUAL-PARTIAL-MAP-CHILD");
     let cancelled = AtomicBool::new(false);
     let control = control(&cancelled);
     let exported = fixture(&control).seal(&control).unwrap();
@@ -707,6 +727,7 @@ fn native_close_uncertainty_and_hidden_writer_failstop_without_credit_refund() {
     use std::process::Command;
     const CHILD: &str = "SQL_FRAME_FATAL_CHILD";
     if let Some(case) = std::env::var_os(CHILD) {
+        eprintln!("ACTUAL-CLOSE-UNCERTAINTY-CHILD");
         let core = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -746,10 +767,23 @@ fn native_close_uncertainty_and_hidden_writer_failstop_without_credit_refund() {
         panic!("cleanup uncertainty returned instead of retaining until reap");
     }
     for case in ["close", "writer"] {
+        let filter = current_test_filter(
+            "native_close_uncertainty_and_hidden_writer_failstop_without_credit_refund",
+        );
         let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "sql_frame::transport::tests::native_close_uncertainty_and_hidden_writer_failstop_without_credit_refund", "--nocapture"])
-            .env(CHILD, case).env("SQL_FRAME_EXPECT_NO_REFUND", "1").output().unwrap();
+            .args(["--exact", &filter, "--nocapture"])
+            .env(CHILD, case)
+            .env("SQL_FRAME_EXPECT_NO_REFUND", "1")
+            .output()
+            .unwrap();
         assert_eq!(output.status.signal(), Some(libc::SIGABRT));
+        assert!(
+            output
+                .stderr
+                .windows(b"ACTUAL-CLOSE-UNCERTAINTY-CHILD".len())
+                .any(|bytes| bytes == b"ACTUAL-CLOSE-UNCERTAINTY-CHILD"),
+            "a zero-test child is not an actual native fail-stop witness"
+        );
         assert!(
             !output
                 .stdout

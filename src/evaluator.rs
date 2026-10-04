@@ -17,6 +17,10 @@ pub(crate) mod sql_bridge;
 pub(crate) mod sql_control;
 #[cfg(feature = "sql")]
 pub(crate) mod sql_frame;
+#[cfg(feature = "sql")]
+pub(crate) mod sql_host;
+#[cfg(feature = "sql")]
+pub(crate) mod sql_policy;
 pub(crate) mod sql_registry;
 #[cfg(feature = "sql")]
 pub(crate) mod sqlite;
