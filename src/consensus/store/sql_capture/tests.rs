@@ -11,6 +11,7 @@ fn entry(index: u64, revision: u64, key: &str, value: Value) -> Entry<TypeConfig
         log_id: log(index),
         payload: EntryPayload::Normal(
             Commit {
+                sql_commit_before: None,
                 internal: true,
                 request_id: String::new(),
                 fingerprint: String::new(),

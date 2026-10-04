@@ -355,6 +355,14 @@ export interface DeleteOptions {
   readonly permanent?: boolean;
 }
 export interface MutationContext extends QueryContext {
+  /**
+   * Narrow this mutation's native ordered-proposal authorization deadline.
+   * The trusted application must verify its proof/lease/policy first and supply
+   * their earliest absolute safe-integer millisecond expiry. Repeated calls only
+   * narrow; no query/provider/finalizer obtains this capability. A missing native
+   * guard fails closed. This does not promise quorum/fsync completes before expiry.
+   */
+  requireCommitBefore(absoluteMs: number): void;
   set<T, K extends Json>(collection: Collection<T, K, any>, key: K, value: T, options?: SetOptions<NoInfer<T>>): void;
   delete<T, K extends Json>(collection: Collection<T, K, any>, key: K, options?: DeleteOptions): void;
   materialize<V>(derived: Derived<null, V>): void;

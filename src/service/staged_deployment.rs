@@ -238,6 +238,7 @@ fn command(
     let mut puts = puts;
     puts.insert(staging::JOB.into(), json!(job));
     Commit {
+        sql_commit_before: None,
         internal: !terminal,
         request_id: if terminal {
             job.request_id.clone()

@@ -147,6 +147,7 @@ async fn build_application(
     .unwrap();
     consensus
         .commit(Commit {
+            sql_commit_before: None,
             internal: false,
             request_id: "seed".into(),
             fingerprint: "seed".into(),
@@ -224,6 +225,7 @@ async fn maintenance_sleeps_until_the_declared_due_time() {
     let due = app.clock.sample(&state).unwrap() + 700;
     app.consensus
         .commit(Commit {
+            sql_commit_before: None,
             internal: true,
             request_id: "due".into(),
             fingerprint: String::new(),
@@ -257,6 +259,7 @@ async fn put_record(app: &App, key: &str, value: Value) {
     let state = app.consensus.read().await.unwrap();
     app.consensus
         .commit(Commit {
+            sql_commit_before: None,
             internal: true,
             request_id: format!("put-{key}-{}", state.revision),
             fingerprint: String::new(),

@@ -773,6 +773,7 @@ fn entry(index: u64, revision: u64, version: u64) -> Entry<TypeConfig> {
         log_id: LogId::new(CommittedLeaderId::new(3, 1), index),
         payload: EntryPayload::Normal(
             Commit {
+                sql_commit_before: None,
                 internal: true,
                 request_id: String::new(),
                 fingerprint: String::new(),

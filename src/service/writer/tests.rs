@@ -75,6 +75,7 @@ impl Fixture {
         .unwrap();
         consensus
             .commit(Commit {
+                sql_commit_before: None,
                 internal: false,
                 request_id: "seed".into(),
                 fingerprint: "seed".into(),
@@ -299,6 +300,7 @@ fn staging_policy() -> crate::consensus::retention::State {
 
 fn staging_command(request_id: String, value: Value) -> Commit {
     Commit {
+        sql_commit_before: None,
         internal: false,
         request_id,
         fingerprint: "fingerprint".into(),
@@ -882,6 +884,87 @@ async fn ordered_queue_stages_sources_derived_values_receipts_and_cas_without_er
     );
     assert!(fixture.app.consensus.metrics().last_applied.unwrap().index - before <= 2);
     fixture.close().await;
+}
+
+async fn sql_commit_reserved_basis_ignores_saturated_user_budget(staged: bool) {
+    let mut fixture = Fixture::new(16, false).await;
+    Arc::get_mut(&mut fixture.app).unwrap().admission = admission::Pool::new(
+        [1, 1],
+        [usize::MAX, usize::MAX],
+        [1024, 64 * 1024 * 1024],
+        1,
+    );
+    let pending = PendingInput::from(deployment("reserved-basis", false));
+    if staged {
+        assert!(
+            deployment::stage(&fixture.app, &pending)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let class = if staged {
+        admission::Class::Control
+    } else {
+        admission::Class::Deployment
+    };
+    assert_eq!(admission_class(&pending, true), class);
+    let saturated = fixture
+        .app
+        .admission
+        .retain(admission::Class::User, 1024)
+        .unwrap();
+    assert!(
+        fixture
+            .app
+            .admission
+            .retain(admission::Class::User, 1)
+            .is_err()
+    );
+    let (reply, receive) = oneshot::channel();
+    fixture
+        .app
+        .writer_queue
+        .try_send(Pending {
+            input: pending,
+            deployment: true,
+            enqueued: Instant::now(),
+            reply,
+        })
+        .unwrap_or_else(|_| panic!("test queue has capacity"));
+    let mut deferred = VecDeque::new();
+    pipeline(
+        &fixture.app,
+        fixture.receiver.as_mut().unwrap(),
+        &mut deferred,
+        None,
+    )
+    .await;
+    let response = receive.await.unwrap().unwrap();
+    assert_eq!(response["revision"], 2);
+    let state = fixture.app.consensus.read().await.unwrap();
+    assert_eq!(state.revision, 2);
+    assert!(state.requests.contains_key("reserved-basis"));
+    assert_eq!(
+        fixture.app.admission.metrics()["classes"][0]["retainedInputBytes"],
+        1024
+    );
+    drop(saturated);
+    assert_eq!(
+        fixture.app.admission.metrics()["classes"][0]["retainedInputBytes"],
+        0
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sql_commit_native_deployment_basis_preserves_reserved_input_class() {
+    sql_commit_reserved_basis_ignores_saturated_user_budget(false).await;
+}
+
+#[tokio::test]
+async fn sql_commit_native_control_basis_preserves_reserved_input_class() {
+    sql_commit_reserved_basis_ignores_saturated_user_budget(true).await;
 }
 
 #[tokio::test]
@@ -2091,6 +2174,7 @@ async fn serial_worker_matches_dispatch_for_fifo_cas_receipts_errors_and_isolati
         &fixture.app,
         std::mem::take(&mut group.commands),
         &group.results,
+        None,
     )
     .await
     .unwrap();
@@ -2348,6 +2432,7 @@ async fn serial_preparation_pass_reuses_one_slot_and_releases_it_before_commit()
             &fixture.app,
             std::mem::take(&mut group.commands),
             &group.results,
+            None,
         )
         .await
         .unwrap();
@@ -2499,6 +2584,7 @@ async fn stage_writer_graph(app: &App, phase: &str, with_plan: bool) {
     }
     app.consensus
         .commit(Commit {
+            sql_commit_before: None,
             internal: false,
             request_id: "stage-writer-build".into(),
             fingerprint: "stage-writer-build".into(),
@@ -2556,6 +2642,7 @@ async fn graph_maintenance_skips_all_speculation_and_keeps_serial_batch_group_co
             &fixture.app,
             std::mem::take(&mut group.commands),
             &group.results,
+            None,
         )
         .await
         .unwrap();
@@ -2983,4 +3070,647 @@ async fn candidates_a_group_does_not_reach_carry_into_the_next() {
         "the successor follows its predecessor's writes"
     );
     app.consensus.shutdown().await.unwrap();
+}
+
+// Ordinary mutations preserve their existing serialization semantics. These
+// native baseline controls reproduce the stronger temporal requirement that
+// opt-in SQL completion guards below enforce, not a general linearizability bug.
+fn audit_temporal_bundle(declared_clock: bool, timed_access: bool) -> String {
+    let body_time = if declared_clock {
+        "ctx.clock()"
+    } else {
+        "ctx.now()"
+    };
+    let body_flip = if declared_clock {
+        "ctx.changesAt(deadline);"
+    } else {
+        ""
+    };
+    let authorization = if timed_access {
+        r#"
+      authorize:{name:'authorize',kind:'queryMethod',compute:(ctx,req)=>{
+        const c=req.credentials,now=ctx.clock();
+        if(!c||c.expires<=now)return null;
+        ctx.changesAt(c.expires);return {subject:c.subject};
+      }},
+    "#
+    } else {
+        ""
+    };
+    let declaration = if timed_access {
+        "authorize:{name:'authorize'},"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+      const records={{kind:'collection',name:'records'}};
+      var __flowerBundle={{default:{{definitions:{{
+        {authorization}
+        doubled:{{name:'doubled',kind:'derived',compute:ctx=>2*(ctx.get(records,'value')||0)}},
+        increment:{{name:'increment',kind:'mutationMethod',compute:(ctx,args)=>{{
+          const deadline=ctx.get(records,'expiry'),now={body_time};
+          if(now>=deadline)throw new Error('AUDIT_EXPIRY_REFUSED');
+          {body_flip}
+          const completion={{status:'accepted',acceptedAt:now,expiresAt:deadline,payload:args.payload}};
+          ctx.set(records,'completion',completion);
+          ctx.set(records,'log',{{kind:'tool_result',payload:args.payload}});
+          return completion;
+        }}}}
+      }},{declaration}http:{{'counter.add':{{name:'increment',kind:'mutation'}}}}}}}};
+    "#
+    )
+}
+
+async fn audit_temporal_fixture(declared_clock: bool, timed_access: bool) -> (Fixture, u64) {
+    temporal_fixture_with_guard(declared_clock, timed_access, false).await
+}
+async fn temporal_fixture_with_guard(
+    declared_clock: bool,
+    timed_access: bool,
+    guarded: bool,
+) -> (Fixture, u64) {
+    let fixture = Fixture::new(8, false).await;
+    let state = fixture.app.consensus.read_for_writer().await.unwrap();
+    let mut javascript = audit_temporal_bundle(declared_clock, timed_access);
+    if guarded {
+        // Trusted deployed body after actual expiry checks. A later declaration
+        // is not allowed to renew the original verified deadline.
+        javascript=javascript.replace("const completion=", "ctx.requireCommitBefore(deadline);ctx.requireCommitBefore(deadline+60000);const completion=");
+    }
+    let evaluation=evaluator::evaluate_at(state.data,json!({
+      "requestId":"audit-deploy","bundle":{"hash":evaluator::hash(javascript.as_bytes()),"javascript":javascript}
+    }),fixture.app.clock.sample_after(0).unwrap()).unwrap();
+    fixture
+        .app
+        .consensus
+        .commit(Commit {
+            sql_commit_before: None,
+            internal: false,
+            request_id: "audit-deploy".into(),
+            fingerprint: "audit-deploy".into(),
+            expected_revision: state.revision,
+            puts: evaluation.puts,
+            deletes: evaluation.deletes,
+            result: evaluation.value,
+        })
+        .await
+        .unwrap();
+    // The module is now genuinely prepared, before this real-clock lease begins.
+    // This is fixture initialization, not a row edit between compute and commit.
+    let state = fixture.app.consensus.read_for_writer().await.unwrap();
+    let now = fixture.app.clock.sample(&state).unwrap();
+    let expires = now + 1_500;
+    let evaluation = evaluator::evaluate_at(
+        state.data,
+        json!({
+          "requestId":"audit-seed","writes":[
+            {"collection":"records","key":"expiry","value":expires},
+            {"collection":"records","key":"completion","value":{"status":"pending"}}
+          ]
+        }),
+        now,
+    )
+    .unwrap();
+    fixture
+        .app
+        .consensus
+        .commit(Commit {
+            sql_commit_before: None,
+            internal: false,
+            request_id: "audit-seed".into(),
+            fingerprint: "audit-seed".into(),
+            expected_revision: state.revision,
+            puts: evaluation.puts,
+            deletes: evaluation.deletes,
+            result: evaluation.value,
+        })
+        .await
+        .unwrap();
+    (fixture, expires)
+}
+
+async fn audit_wait_past_expiry(app: &App, expires: u64) -> u64 {
+    let now = app.clock.sample_after(0).unwrap();
+    // One finite blocking timer, not a polling loop or fake service clock.
+    tokio::time::sleep(Duration::from_millis(expires.saturating_sub(now) + 30)).await;
+    let now = app.clock.sample_after(0).unwrap();
+    assert!(
+        now > expires,
+        "actual native clock must have crossed expiry"
+    );
+    now
+}
+
+async fn audit_delayed_native_writer(declared_clock: bool, timed_access: bool, guarded: bool) {
+    let (mut fixture, expires) =
+        temporal_fixture_with_guard(declared_clock, timed_access, guarded).await;
+    let baseline = fixture.app.consensus.read_for_writer().await.unwrap();
+    let input = json!({"requestId":"audit-complete","name":"counter.add",
+      "args":{"payload":"SQL_PRIVATE_RESULT_SENTINEL"},
+      "credentials":{"subject":"audit-user","expires":expires}});
+    let mut replies = ordered(&fixture.app, vec![(input.clone(), false)]).await;
+    let mut receiver = fixture.receiver.take().unwrap();
+    let (events, mut events_rx) = mpsc::unbounded_channel();
+    let app = fixture.app.clone();
+    let task = tokio::spawn(async move {
+        let hooks = Hooks { events };
+        let mut deferred = VecDeque::new();
+        pipeline(&app, &mut receiver, &mut deferred, Some(&hooks)).await;
+        (receiver, deferred)
+    });
+    let Event::Prepared { requests, proceed } = next_event(&mut events_rx).await else {
+        panic!("prepared gate missing")
+    };
+    assert_eq!(requests, 1);
+    proceed.send(()).unwrap();
+    let Event::Committing { proceed } = next_event(&mut events_rx).await else {
+        panic!("commit gate missing")
+    };
+    let before = fixture.app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(before.revision, baseline.revision);
+    assert_eq!(
+        before
+            .data
+            .get("source:[\"records\",\"completion\"]")
+            .unwrap()["status"],
+        "pending"
+    );
+    assert!(before.data.get("source:[\"records\",\"log\"]").is_none());
+    assert!(!before.requests.contains_key("audit-complete"));
+    assert!(
+        fixture.app.clock.sample(&before).unwrap() < expires,
+        "gate reached before real expiry"
+    );
+    let logs_before = fixture.app.consensus.test_log_entries().await;
+    let after_clock = audit_wait_past_expiry(&fixture.app, expires).await;
+    let unchanged = fixture.app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(
+        unchanged.revision, before.revision,
+        "no write or maintenance ran across expiry"
+    );
+    assert!(
+        before
+            .data
+            .version("source:[\"records\",\"expiry\"]")
+            .is_some()
+    );
+    assert_eq!(
+        unchanged.data.version("source:[\"records\",\"expiry\"]"),
+        before.data.version("source:[\"records\",\"expiry\"]")
+    );
+    assert_eq!(unchanged.data.get("clock"), before.data.get("clock"));
+    proceed.send(Decision::Apply).ok().unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), replies.remove(0))
+        .await
+        .unwrap()
+        .unwrap();
+    let (receiver, deferred) = task.await.unwrap();
+    drop(receiver);
+    drop(deferred);
+    drop(events_rx);
+    let current = fixture.app.consensus.read_for_writer().await.unwrap();
+    if guarded {
+        let error = response.unwrap_err();
+        assert_eq!(error.code, "SQL_COMMIT_EXPIRED");
+        assert_eq!(error.message, crate::sql_commit::EXPIRED_MESSAGE);
+        assert_eq!(
+            current, baseline,
+            "no rows, stored clock, revision or receipt may change"
+        );
+        assert_eq!(
+            fixture.app.consensus.test_log_entries().await,
+            logs_before,
+            "no sensitive Raft entry exists"
+        );
+        fixture.close().await;
+        return;
+    }
+    let response = response.unwrap();
+    assert_eq!(response["value"]["status"], "accepted");
+    assert_eq!(current.revision, baseline.revision + 1);
+    assert_eq!(
+        current
+            .data
+            .get("source:[\"records\",\"completion\"]")
+            .unwrap()["status"],
+        "accepted"
+    );
+    assert_eq!(
+        current.data.get("source:[\"records\",\"log\"]").unwrap()["payload"],
+        "SQL_PRIVATE_RESULT_SENTINEL"
+    );
+    assert!(
+        current.requests.contains_key("audit-complete"),
+        "real consensus stored the stale receipt"
+    );
+    let computed_at = response["value"]["acceptedAt"].as_u64().unwrap();
+    assert!(computed_at < expires);
+    assert_eq!(
+        current.data.get("clock").unwrap().as_u64(),
+        Some(computed_at)
+    );
+    eprintln!(
+        "AUDIT native writer: declared_clock={declared_clock} timed_access={timed_access} computed_at={computed_at} expires_at={expires} released_at={after_clock} revision={} persisted_status=accepted persisted_log=SQL_PRIVATE_RESULT_SENTINEL persisted_receipt=true",
+        current.revision
+    );
+    // Fresh computation sees real expiry; only the queued successful completion leaked through.
+    let mut fresh: PendingInput = input.into();
+    let body = fresh.begin().unwrap();
+    let mut value = body.value.clone();
+    drop(body);
+    value["requestId"] = json!("audit-fresh-after-expiry");
+    fresh = value.into();
+    let error = prepare_candidate(&fixture.app, &current, &fresh, false, None)
+        .await
+        .err()
+        .expect("fresh expired call must refuse");
+    assert!(
+        error.message.contains("AUDIT_EXPIRY_REFUSED") || error.code == "FORBIDDEN",
+        "{} {}",
+        error.code,
+        error.message
+    );
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_native_now_completion_persists_after_actual_expiry() {
+    audit_delayed_native_writer(false, false, false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_native_declared_clock_completion_persists_after_actual_expiry() {
+    audit_delayed_native_writer(true, false, false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_native_authorization_and_completion_persist_after_actual_expiry() {
+    audit_delayed_native_writer(true, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_native_speculative_body_certificate_survives_real_expiry() {
+    let (fixture, expires) = audit_temporal_fixture(true, false).await;
+    let state = fixture.app.consensus.read_for_writer().await.unwrap();
+    let now = fixture.app.clock.sample(&state).unwrap();
+    let pending:PendingInput=json!({"requestId":"audit-speculative","name":"counter.add","args":{"payload":"SQL_PRIVATE_RESULT_SENTINEL"}}).into();
+    let mut candidate = prepare_candidate(&fixture.app, &state, &pending, false, Some(now))
+        .await
+        .unwrap();
+    assert!(candidate.certificate.is_some());
+    let released = audit_wait_past_expiry(&fixture.app, expires).await;
+    let state = fixture.app.consensus.read_for_writer().await.unwrap();
+    assert!(candidate.certificate.as_ref().unwrap().valid(&state.data));
+    assert!(
+        candidate
+            .validate(&fixture.app, &state, &pending)
+            .await
+            .unwrap(),
+        "body expiry absent from real candidate validity"
+    );
+    // Normal writer command submission; a real consensus, not a certificate-only fixture.
+    let response = candidate.prepared.response.clone();
+    commit_group(
+        &fixture.app,
+        vec![candidate.prepared.command.take().unwrap()],
+    )
+    .await
+    .unwrap();
+    let current = fixture.app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(
+        current
+            .data
+            .get("source:[\"records\",\"completion\"]")
+            .unwrap()["status"],
+        "accepted"
+    );
+    assert_eq!(
+        current.data.get("source:[\"records\",\"log\"]").unwrap()["payload"],
+        "SQL_PRIVATE_RESULT_SENTINEL"
+    );
+    assert!(current.requests.contains_key("audit-speculative"));
+    eprintln!(
+        "AUDIT native speculation: computed_at={} expires_at={expires} validated_after={released} candidate_valid=true persisted_status=accepted persisted_receipt=true",
+        response["value"]["acceptedAt"]
+    );
+    drop(candidate);
+    fixture.close().await;
+}
+
+// Further audit-only tests, appended after the first isolated native run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_native_timed_access_rejects_expired_speculative_validation() {
+    let (fixture, expires) = audit_temporal_fixture(true, true).await;
+    let state = fixture.app.consensus.read_for_writer().await.unwrap();
+    let now = fixture.app.clock.sample(&state).unwrap();
+    let pending: PendingInput = json!({"requestId":"audit-spec-access","name":"counter.add",
+      "args":{"payload":"SQL_PRIVATE_RESULT_SENTINEL"},
+      "credentials":{"subject":"audit-user","expires":expires}})
+    .into();
+    let mut candidate = prepare_candidate(&fixture.app, &state, &pending, false, Some(now))
+        .await
+        .unwrap();
+    let access = candidate.access.as_ref().unwrap();
+    assert!(access.holds(&fixture.app, &state));
+    let released = audit_wait_past_expiry(&fixture.app, expires).await;
+    let current = fixture.app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(state.revision, current.revision);
+    assert!(
+        candidate.certificate.as_ref().unwrap().valid(&current.data),
+        "body certificate still validates"
+    );
+    assert!(
+        !candidate
+            .access
+            .as_ref()
+            .unwrap()
+            .holds(&fixture.app, &current),
+        "actual access expiry is recognized"
+    );
+    let error = candidate
+        .validate(&fixture.app, &current, &pending)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "FORBIDDEN");
+    assert_eq!(
+        current
+            .data
+            .get("source:[\"records\",\"completion\"]")
+            .unwrap()["status"],
+        "pending"
+    );
+    assert!(!current.requests.contains_key("audit-spec-access"));
+    eprintln!(
+        "AUDIT timed access control: expires_at={expires} validated_after={released} access_holds=false candidate_validation=FORBIDDEN revision_unchanged=true persisted_status=pending"
+    );
+    drop(candidate);
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_native_inline_serial_compact_batch_persists_after_actual_expiry() {
+    let (fixture, expires) = audit_temporal_fixture(true, false).await;
+    let baseline = fixture.app.consensus.read_for_writer().await.unwrap();
+    let mut receivers = Vec::new();
+    let pending = (0..2)
+        .map(|n| {
+            let (reply, receive) = oneshot::channel();
+            receivers.push(receive);
+            Pending {
+                input: json!({"requestId":format!("audit-batch-{n}"),"name":"counter.add",
+        "args":{"payload":format!("SQL_PRIVATE_RESULT_SENTINEL_{n}")}})
+                .into(),
+                deployment: false,
+                enqueued: Instant::now(),
+                reply,
+            }
+        })
+        .collect::<Vec<_>>();
+    let admitted = admit(&fixture.app, &pending[0].input, false).await.unwrap();
+    let mut state = baseline.clone();
+    let mut controller = Controller::new(tuning::settings().unwrap());
+    controller.fixed_for_test(2);
+    controller.speculation = speculation::Policy::new(1, 8);
+    let (group, rest) = tokio::time::timeout(
+        Duration::from_secs(10),
+        prepare_group(
+            &fixture.app,
+            &mut state,
+            pending,
+            Preparation {
+                read_us: 0,
+                decision: controller.decide(2),
+                admission: Some(admitted),
+            },
+            &mut controller.speculation,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(group.commands.len(), 2);
+    assert_eq!(group.serial_worker_jobs, 1);
+    assert_eq!(group.serial_worker_requests, 2);
+    assert!(
+        fixture.app.clock.sample_after(0).unwrap() < expires,
+        "real inline batch prepared before expiry"
+    );
+    let (events, mut events_rx) = mpsc::unbounded_channel();
+    let app = fixture.app.clone();
+    let committing = tokio::spawn(async move {
+        let hooks = Hooks { events };
+        group.commit_and_respond(&app, Some(&hooks)).await
+    });
+    let Event::Committing { proceed } = next_event(&mut events_rx).await else {
+        panic!("commit barrier missing")
+    };
+    let released = audit_wait_past_expiry(&fixture.app, expires).await;
+    let unchanged = fixture.app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(unchanged.revision, baseline.revision);
+    assert_eq!(unchanged.data.get("clock"), baseline.data.get("clock"));
+    assert!(
+        baseline
+            .data
+            .version("source:[\"records\",\"expiry\"]")
+            .is_some()
+    );
+    assert_eq!(
+        unchanged.data.version("source:[\"records\",\"expiry\"]"),
+        baseline.data.version("source:[\"records\",\"expiry\"]")
+    );
+    proceed.send(Decision::Apply).ok().unwrap();
+    committing.await.unwrap().result.unwrap();
+    let answers = responses(receivers).await;
+    assert!(
+        answers
+            .iter()
+            .all(|answer| answer.as_ref().unwrap()["value"]["status"] == "accepted")
+    );
+    let current = fixture.app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(current.revision, baseline.revision + 2);
+    for n in 0..2 {
+        assert!(current.requests.contains_key(&format!("audit-batch-{n}")));
+    }
+    assert_eq!(
+        current
+            .data
+            .get("source:[\"records\",\"completion\"]")
+            .unwrap()["status"],
+        "accepted"
+    );
+    assert_eq!(
+        current.data.get("source:[\"records\",\"log\"]").unwrap()["payload"],
+        "SQL_PRIVATE_RESULT_SENTINEL_1"
+    );
+    eprintln!(
+        "AUDIT native compact batch: inline_workers=1 requests=2 expires_at={expires} released_at={released} persisted_receipts=2 persisted_status=accepted persisted_log=SQL_PRIVATE_RESULT_SENTINEL_1 revision={}",
+        current.revision
+    );
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_commit_native_now_serial_expiry_discards_overlay_before_log() {
+    audit_delayed_native_writer(false, false, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_commit_native_clock_serial_expiry_discards_overlay_before_log() {
+    audit_delayed_native_writer(true, false, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_commit_native_auth_serial_expiry_discards_overlay_before_log() {
+    audit_delayed_native_writer(true, true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_commit_native_expiry_is_not_a_conflict_or_old_wave_clock_rerun() {
+    for declared in [false, true] {
+        let (fixture, expires) = temporal_fixture_with_guard(declared, false, true).await;
+        let state = fixture.app.consensus.read_for_writer().await.unwrap();
+        let logs = fixture.app.consensus.test_log_entries().await;
+        let now = fixture.app.clock.sample(&state).unwrap();
+        let pending:PendingInput=json!({"requestId":"sql-guard-spec","name":"counter.add","args":{"payload":"PRIVATE_SQL_SENTINEL"}}).into();
+        let mut candidate = prepare_candidate(&fixture.app, &state, &pending, false, Some(now))
+            .await
+            .unwrap();
+        assert_eq!(
+            candidate
+                .prepared
+                .command
+                .as_ref()
+                .unwrap()
+                .sql_commit_before,
+            Some(expires)
+        );
+        // The explicit deadline survives loss of optional certification too.
+        candidate.certificate = None;
+        audit_wait_past_expiry(&fixture.app, expires).await;
+        let current = fixture.app.consensus.read_for_writer().await.unwrap();
+        assert_eq!(
+            candidate
+                .validate(&fixture.app, &current, &pending)
+                .await
+                .unwrap_err()
+                .code,
+            "SQL_COMMIT_EXPIRED"
+        );
+        // Even a direct ordered conflict rerun with the old wave time is refused
+        // BEFORE evaluation. No result/proof can be revived by widening time.
+        let mut permit = None;
+        assert_eq!(
+            prepare_serial_input(
+                &fixture.app,
+                &current,
+                &pending,
+                false,
+                &mut permit,
+                Some(now),
+                serial::Execution::Dispatch
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+            "SQL_COMMIT_EXPIRED"
+        );
+        assert_eq!(
+            fixture.app.consensus.read_for_writer().await.unwrap(),
+            state
+        );
+        assert_eq!(fixture.app.consensus.test_log_entries().await, logs);
+        drop(candidate);
+        fixture.close().await;
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_commit_native_inline_compact_expiry_discards_whole_overlay_before_log() {
+    let (fixture, expires) = temporal_fixture_with_guard(true, false, true).await;
+    let baseline = fixture.app.consensus.read_for_writer().await.unwrap();
+    let logs = fixture.app.consensus.test_log_entries().await;
+    let mut receivers = Vec::new();
+    let pending = (0..2)
+        .map(|n| {
+            let (reply, receive) = oneshot::channel();
+            receivers.push(receive);
+            Pending {
+                input: json!({"requestId":format!("audit-batch-{n}"),"name":"counter.add",
+        "args":{"payload":format!("SQL_PRIVATE_RESULT_SENTINEL_{n}")}})
+                .into(),
+                deployment: false,
+                enqueued: Instant::now(),
+                reply,
+            }
+        })
+        .collect::<Vec<_>>();
+    let admitted = admit(&fixture.app, &pending[0].input, false).await.unwrap();
+    let mut state = baseline.clone();
+    let mut controller = Controller::new(tuning::settings().unwrap());
+    controller.fixed_for_test(2);
+    controller.speculation = speculation::Policy::new(1, 8);
+    let (group, rest) = tokio::time::timeout(
+        Duration::from_secs(10),
+        prepare_group(
+            &fixture.app,
+            &mut state,
+            pending,
+            Preparation {
+                read_us: 0,
+                decision: controller.decide(2),
+                admission: Some(admitted),
+            },
+            &mut controller.speculation,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(group.commands.len(), 2);
+    assert_eq!(group.serial_worker_jobs, 1);
+    assert_eq!(group.serial_worker_requests, 2);
+    assert!(
+        fixture.app.clock.sample_after(0).unwrap() < expires,
+        "real inline batch prepared before expiry"
+    );
+    let (events, mut events_rx) = mpsc::unbounded_channel();
+    let app = fixture.app.clone();
+    let committing = tokio::spawn(async move {
+        let hooks = Hooks { events };
+        group.commit_and_respond(&app, Some(&hooks)).await
+    });
+    let Event::Committing { proceed } = next_event(&mut events_rx).await else {
+        panic!("commit barrier missing")
+    };
+    let _released = audit_wait_past_expiry(&fixture.app, expires).await;
+    let unchanged = fixture.app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(unchanged.revision, baseline.revision);
+    assert_eq!(unchanged.data.get("clock"), baseline.data.get("clock"));
+    assert!(
+        baseline
+            .data
+            .version("source:[\"records\",\"expiry\"]")
+            .is_some()
+    );
+    assert_eq!(
+        unchanged.data.version("source:[\"records\",\"expiry\"]"),
+        baseline.data.version("source:[\"records\",\"expiry\"]")
+    );
+    proceed.send(Decision::Apply).ok().unwrap();
+    assert_eq!(
+        committing.await.unwrap().result.unwrap_err().code,
+        "SQL_COMMIT_EXPIRED"
+    );
+    let answers = responses(receivers).await;
+    assert_eq!(answers.len(), 2);
+    for answer in answers {
+        assert_eq!(answer.unwrap_err().code, "SQL_COMMIT_EXPIRED");
+    }
+    assert_eq!(
+        fixture.app.consensus.read_for_writer().await.unwrap(),
+        baseline
+    );
+    assert_eq!(fixture.app.consensus.test_log_entries().await, logs);
+    fixture.close().await;
 }

@@ -41,6 +41,7 @@ fn deploy_schema(
         data,
         Evaluation {
             sql_read: false,
+            sql_commit_before: None,
             puts: evaluation.puts.clone(),
             deletes: evaluation.deletes.clone(),
             evaluated: vec![],

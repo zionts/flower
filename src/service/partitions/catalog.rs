@@ -682,6 +682,7 @@ pub(super) async fn apply(runtime: &Runtime, request: CatalogRequest) -> anyhow:
             .consensus
             .commit_in_term(
                 Commit {
+                    sql_commit_before: None,
                     internal: true,
                     request_id: String::new(),
                     fingerprint: String::new(),

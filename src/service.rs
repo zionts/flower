@@ -1,6 +1,6 @@
 pub(crate) mod admission;
 pub(crate) mod cancellation;
-mod clock;
+pub(crate) mod clock;
 mod forwarding;
 mod keys;
 mod partitions;
@@ -1318,6 +1318,7 @@ async fn prepare_maintenance(
     Ok((
         Some((
             Commit {
+                sql_commit_before: None,
                 internal: true,
                 request_id,
                 fingerprint: String::new(),

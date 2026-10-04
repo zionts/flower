@@ -15,11 +15,14 @@ mod json;
 mod mapping_tests;
 #[path = "sql_frame/slab.rs"]
 mod slab;
+#[cfg(target_os = "linux")]
+#[path = "sql_frame/transport.rs"]
+pub(crate) mod transport;
 
 use super::sqlite::{self, Batch, ScanRequest, Source, SqlCell, SqlError, VirtualTable};
 use control::Budget;
 pub(crate) use control::FrameControl;
-use json::{CaptureArena, Document, JsonNode, KeyEntry, ObjectKey, ParsedCell, TextRef};
+use json::{CaptureArena, Document, JsonNode, KeyEntry, ObjectKey, ParsedCell};
 use slab::{Slab, exact_string, exact_vec, mapped_bytes};
 
 pub(crate) const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
@@ -33,8 +36,11 @@ const MAX_COLUMNS: usize = 64;
 const MAX_ROWS: usize = 20_000;
 const MAX_CELLS: usize = MAX_ROWS * MAX_COLUMNS;
 const MAX_PROVENANCE: usize = 256 * 1024;
-// Explicit stack/small local arrays and both owning control structs have no
-// dynamic allocation. Reserve this finite control allowance in arena admission.
+// Explicit stack/small arrays and owning controls allocate no dynamic memory.
+// This is a finite NUMERIC allowance, NOT proof of physically backed native
+// control/stack/cold-global/kernel resources. A real precharged driver must own
+// those in the original USER reservation; the transport component supplies no
+// production issuer and leaves whole native admission HOLD.
 const CONTROL_BYTES: usize = 64 * 1024;
 const NONE: u32 = u32::MAX;
 
@@ -179,39 +185,127 @@ pub(crate) enum FrameCell<'a> {
     Real(f64),
     Text(&'a str),
 }
+// Typed descriptors are POD, not Rust enums/bools/pointers. Every bit pattern
+// is safe to inspect before hostile transport bytes have been validated.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-enum OwnedCell {
-    #[default]
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(TextRef),
+struct TypedRef {
+    start: u32,
+    len: u32,
 }
+impl TypedRef {
+    fn new(start: usize, len: usize) -> Self {
+        Self {
+            start: start as u32,
+            len: len as u32,
+        }
+    }
+    fn range(self) -> std::ops::Range<usize> {
+        self.start as usize..self.start as usize + self.len as usize
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct OwnedCell {
+    tag: u64,
+    payload: u64,
+}
+impl OwnedCell {
+    const NULL: Self = Self { tag: 0, payload: 0 };
+    fn integer(value: i64) -> Self {
+        Self {
+            tag: 1,
+            payload: value as u64,
+        }
+    }
+    fn real(value: f64) -> Self {
+        Self {
+            tag: 2,
+            payload: value.to_bits(),
+        }
+    }
+    fn text(value: TypedRef) -> Self {
+        Self {
+            tag: 3,
+            payload: u64::from(value.start) | (u64::from(value.len) << 32),
+        }
+    }
+    fn text_ref(self) -> Option<TypedRef> {
+        (self.tag == 3).then_some(TypedRef {
+            start: self.payload as u32,
+            len: (self.payload >> 32) as u32,
+        })
+    }
+    fn value(self, arena: &TypedArena) -> FrameCell<'_> {
+        match self.tag {
+            0 => FrameCell::Null,
+            1 => FrameCell::Integer(self.payload as i64),
+            2 => FrameCell::Real(f64::from_bits(self.payload)),
+            3 => FrameCell::Text(arena.text(self.text_ref().expect("validated text tag"))),
+            _ => unreachable!("only internal or fully validated cells are usable"),
+        }
+    }
+}
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct OwnedColumn {
-    name: TextRef,
-    kind: ColumnKind,
-    nullable: bool,
-    logical_type: TextRef,
-    has_logical_type: bool,
-    unit: TextRef,
-    has_unit: bool,
-    equality: bool,
+    name: TypedRef,
+    logical_type: TypedRef,
+    unit: TypedRef,
+    kind: u8,
+    flags: u8,
+    reserved: [u8; 6],
 }
+impl OwnedColumn {
+    fn kind(self) -> ColumnKind {
+        match self.kind {
+            0 => ColumnKind::Integer,
+            1 => ColumnKind::Real,
+            2 => ColumnKind::Text,
+            _ => unreachable!("only validated column kinds are usable"),
+        }
+    }
+    fn nullable(self) -> bool {
+        self.flags & 1 != 0
+    }
+    fn has_logical_type(self) -> bool {
+        self.flags & 2 != 0
+    }
+    fn has_unit(self) -> bool {
+        self.flags & 4 != 0
+    }
+    fn equality(self) -> bool {
+        self.flags & 8 != 0
+    }
+}
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct OwnedTable {
-    name: TextRef,
+    name: TypedRef,
     column_start: u32,
     column_count: u16,
+    reserved: u16,
     row_start: u32,
     row_count: u32,
 }
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct OwnedRow {
-    table: u16,
     start: u32,
+    table: u16,
     count: u16,
 }
+// Audited byte-layout assertions: no Rust discriminants/bools or implicit
+// padding can be materialized by arbitrary external descriptor bytes.
+const _: () = assert!(size_of::<TypedRef>() == 8);
+const _: () = assert!(size_of::<OwnedTable>() == 24);
+const _: () = assert!(size_of::<OwnedColumn>() == 32);
+const _: () = assert!(size_of::<OwnedRow>() == 8);
+const _: () = assert!(size_of::<OwnedCell>() == 16);
+unsafe impl slab::MappedPod for OwnedTable {}
+unsafe impl slab::MappedPod for OwnedColumn {}
+unsafe impl slab::MappedPod for OwnedRow {}
+unsafe impl slab::MappedPod for OwnedCell {}
 struct TypedArena {
     text: Slab<u8>,
     tables: Slab<OwnedTable>,
@@ -229,12 +323,12 @@ struct TypedArena {
     provenance_len: usize,
 }
 impl TypedArena {
-    fn text(&self, value: TextRef) -> &str {
+    fn text(&self, value: TypedRef) -> &str {
         // All text enters from validated &str and refs are created internally.
         unsafe { std::str::from_utf8_unchecked(&self.text[value.range()]) }
     }
-    fn copy_text(&mut self, text: &str) -> TextRef {
-        let reference = TextRef::new(self.text_len, text.len());
+    fn copy_text(&mut self, text: &str) -> TypedRef {
+        let reference = TypedRef::new(self.text_len, text.len());
         self.text[reference.range()].copy_from_slice(text.as_bytes());
         self.text_len += text.len();
         reference
@@ -244,8 +338,8 @@ impl TypedArena {
         text: &str,
         budget: &Budget,
         control: &FrameControl<'_>,
-    ) -> Result<TextRef, FrameError> {
-        let reference = TextRef::new(self.text_len, text.len());
+    ) -> Result<TypedRef, FrameError> {
+        let reference = TypedRef::new(self.text_len, text.len());
         let mut offset = self.text_len;
         for chunk in text.as_bytes().chunks(MAX_CAPTURE_SLICE) {
             budget.debit(chunk.len(), control)?;
@@ -283,6 +377,13 @@ pub(crate) struct FrameBuilder {
 }
 impl FrameBuilder {
     pub(crate) fn new(limits: FrameLimits, control: &FrameControl<'_>) -> Result<Self, FrameError> {
+        Self::new_backing(limits, control, false)
+    }
+    fn new_backing(
+        limits: FrameLimits,
+        control: &FrameControl<'_>,
+        transport: bool,
+    ) -> Result<Self, FrameError> {
         control.check()?;
         if !limits.valid() {
             return Err(FrameError::Capacity);
@@ -321,12 +422,12 @@ impl FrameBuilder {
         Ok(Self {
             capture: CaptureArena::new(limits, index_slots, control)?,
             typed: TypedArena {
-                text: Slab::new(limits.text_bytes, control)?,
-                tables: Slab::new(limits.tables, control)?,
-                columns: Slab::new(limits.columns, control)?,
-                rows: Slab::new(limits.rows, control)?,
-                cells: Slab::new(limits.cells, control)?,
-                row_order: Slab::new(limits.rows, control)?,
+                text: Slab::new_typed(limits.text_bytes, control, transport)?,
+                tables: Slab::new_typed(limits.tables, control, transport)?,
+                columns: Slab::new_typed(limits.columns, control, transport)?,
+                rows: Slab::new_typed(limits.rows, control, transport)?,
+                cells: Slab::new_typed(limits.cells, control, transport)?,
+                row_order: Slab::new_typed(limits.rows, control, transport)?,
                 provenance: Slab::new(limits.provenance_bytes, control)?,
                 text_len: 0,
                 table_len: 0,
@@ -471,13 +572,18 @@ impl FrameBuilder {
             let unit = self.typed.copy_text(column.unit.unwrap_or(""));
             self.typed.columns[self.typed.column_len] = OwnedColumn {
                 name,
-                kind: column.kind,
-                nullable: column.nullable,
+                kind: match column.kind {
+                    ColumnKind::Integer => 0,
+                    ColumnKind::Real => 1,
+                    ColumnKind::Text => 2,
+                },
+                flags: u8::from(column.nullable)
+                    | (u8::from(column.logical_type.is_some()) << 1)
+                    | (u8::from(column.unit.is_some()) << 2)
+                    | (u8::from(column.equality) << 3),
                 logical_type,
-                has_logical_type: column.logical_type.is_some(),
                 unit,
-                has_unit: column.unit.is_some(),
-                equality: column.equality,
+                reserved: [0; 6],
             };
             self.typed.column_len += 1;
         }
@@ -485,6 +591,7 @@ impl FrameBuilder {
             name: table_name,
             column_start: column_start as u32,
             column_count: columns.len() as u16,
+            reserved: 0,
             row_start: 0,
             row_count: 0,
         };
@@ -525,10 +632,10 @@ impl FrameBuilder {
         for cell in cells {
             self.capture.budget.debit(1, control)?;
             let owned = match *cell {
-                FrameCell::Null => OwnedCell::Null,
-                FrameCell::Integer(value) => OwnedCell::Integer(value),
-                FrameCell::Real(value) => OwnedCell::Real(value),
-                FrameCell::Text(text) => OwnedCell::Text(self.typed.copy_text_checked(
+                FrameCell::Null => OwnedCell::NULL,
+                FrameCell::Integer(value) => OwnedCell::integer(value),
+                FrameCell::Real(value) => OwnedCell::real(value),
+                FrameCell::Text(text) => OwnedCell::text(self.typed.copy_text_checked(
                     text,
                     &self.capture.budget,
                     control,
@@ -573,7 +680,7 @@ impl FrameBuilder {
                 SourceColumn::Field(field) => match source.get(field)? {
                     None => FrameCell::Null,
                     Some(value) if value.is_null() => FrameCell::Null,
-                    Some(value) => match column.kind {
+                    Some(value) => match column.kind() {
                         ColumnKind::Integer => FrameCell::Integer(
                             value.source_integer()?.ok_or(FrameError::Unsupported)?,
                         ),
@@ -599,10 +706,10 @@ impl FrameBuilder {
         for cell in &cells[..projection.len()] {
             self.capture.budget.debit(1, control)?;
             self.typed.cells[self.typed.cell_len] = match *cell {
-                FrameCell::Null => OwnedCell::Null,
-                FrameCell::Integer(value) => OwnedCell::Integer(value),
-                FrameCell::Real(value) => OwnedCell::Real(value),
-                FrameCell::Text(text) => OwnedCell::Text(self.typed.copy_text_checked(
+                FrameCell::Null => OwnedCell::NULL,
+                FrameCell::Integer(value) => OwnedCell::integer(value),
+                FrameCell::Real(value) => OwnedCell::real(value),
+                FrameCell::Text(text) => OwnedCell::text(self.typed.copy_text_checked(
                     text,
                     &self.capture.budget,
                     control,
@@ -710,10 +817,10 @@ impl FrameBuilder {
         let start = self.typed.cell_len;
         for cell in &converted[..count] {
             self.typed.cells[self.typed.cell_len] = match *cell {
-                ParsedCell::Null => OwnedCell::Null,
-                ParsedCell::Integer(value) => OwnedCell::Integer(value),
-                ParsedCell::Real(value) => OwnedCell::Real(value),
-                ParsedCell::Text(text) => OwnedCell::Text(self.typed.copy_text_checked(
+                ParsedCell::Null => OwnedCell::NULL,
+                ParsedCell::Integer(value) => OwnedCell::integer(value),
+                ParsedCell::Real(value) => OwnedCell::real(value),
+                ParsedCell::Text(text) => OwnedCell::text(self.typed.copy_text_checked(
                     self.capture.text(text),
                     &self.capture.budget,
                     control,
@@ -753,11 +860,14 @@ impl FrameBuilder {
             filled[table] += 1;
         }
         capture.budget.check(control)?;
-        drop(capture);
+        // Move (do not replenish) the original cumulative budget. The other
+        // capture fields are dropped before this consuming call returns.
+        let budget = capture.budget;
         let allocation_bytes = typed.bytes() + CONTROL_BYTES;
         Ok(SealedSqlFrame {
             typed,
             allocation_bytes,
+            budget,
         })
     }
 }
@@ -778,10 +888,10 @@ fn mul(left: usize, right: usize) -> Result<usize, FrameError> {
 }
 fn validate_cell(column: OwnedColumn, cell: FrameCell<'_>) -> Result<(), FrameError> {
     match cell {
-        FrameCell::Null if column.nullable => Ok(()),
-        FrameCell::Integer(_) if column.kind == ColumnKind::Integer => Ok(()),
-        FrameCell::Real(value) if column.kind == ColumnKind::Real && value.is_finite() => Ok(()),
-        FrameCell::Text(text) if column.kind == ColumnKind::Text => {
+        FrameCell::Null if column.nullable() => Ok(()),
+        FrameCell::Integer(_) if column.kind() == ColumnKind::Integer => Ok(()),
+        FrameCell::Real(value) if column.kind() == ColumnKind::Real && value.is_finite() => Ok(()),
+        FrameCell::Text(text) if column.kind() == ColumnKind::Text => {
             if text.len() > sqlite::MAX_CELL_BYTES {
                 Err(FrameError::Capacity)
             } else {
@@ -797,6 +907,7 @@ fn validate_cell(column: OwnedColumn, cell: FrameCell<'_>) -> Result<(), FrameEr
 pub(crate) struct SealedSqlFrame {
     typed: TypedArena,
     allocation_bytes: usize,
+    budget: Budget,
 }
 pub(crate) struct TableView<'a> {
     pub name: &'a str,
@@ -833,12 +944,12 @@ impl SealedSqlFrame {
         let column = self.typed.column(table, index);
         Some(ColumnView {
             name: self.typed.text(column.name),
-            kind: column.kind,
-            nullable: column.nullable,
+            kind: column.kind(),
+            nullable: column.nullable(),
             logical_type: column
-                .has_logical_type
+                .has_logical_type()
                 .then(|| self.typed.text(column.logical_type)),
-            unit: column.has_unit.then(|| self.typed.text(column.unit)),
+            unit: column.has_unit().then(|| self.typed.text(column.unit)),
         })
     }
     /// Internal trusted channel only. Never exposed as a SQL relation/column.
@@ -858,7 +969,7 @@ impl SealedSqlFrame {
             for index in 0..table.column_count as usize {
                 let column = self.typed.column(*table, index);
                 bytes = add(bytes, column.name.len as usize)?;
-                if column.equality {
+                if column.equality() {
                     bytes = add(bytes, size_of::<usize>())?;
                 }
             }
@@ -870,13 +981,13 @@ impl SealedSqlFrame {
         for table in &self.typed.tables[..self.typed.table_len] {
             let mut columns = exact_vec(table.column_count as usize)?;
             let equality_count = (0..table.column_count as usize)
-                .filter(|index| self.typed.column(*table, *index).equality)
+                .filter(|index| self.typed.column(*table, *index).equality())
                 .count();
             let mut equality_columns = exact_vec(equality_count)?;
             for index in 0..table.column_count as usize {
                 let column = self.typed.column(*table, index);
                 columns.push(exact_string(self.typed.text(column.name))?);
-                if column.equality {
+                if column.equality() {
                     equality_columns.push(index);
                 }
             }
@@ -924,7 +1035,7 @@ impl SealedSqlFrame {
                 mul(row.len(), size_of::<SqlCell>())?,
             )?;
             for cell in row {
-                if let OwnedCell::Text(text) = cell {
+                if let Some(text) = cell.text_ref() {
                     row_bytes = add(row_bytes, text.len as usize)?;
                 }
             }
@@ -956,11 +1067,11 @@ impl SealedSqlFrame {
             let stored = self.typed.row(ordinal, table);
             let mut row = exact_vec(stored.len())?;
             for cell in stored {
-                row.push(match *cell {
-                    OwnedCell::Null => SqlCell::Null,
-                    OwnedCell::Integer(value) => SqlCell::Integer(value),
-                    OwnedCell::Real(value) => SqlCell::Real(value),
-                    OwnedCell::Text(text) => SqlCell::Text(exact_string(self.typed.text(text))?),
+                row.push(match cell.value(&self.typed) {
+                    FrameCell::Null => SqlCell::Null,
+                    FrameCell::Integer(value) => SqlCell::Integer(value),
+                    FrameCell::Real(value) => SqlCell::Real(value),
+                    FrameCell::Text(text) => SqlCell::Text(exact_string(text)?),
                 });
             }
             rows.push(row);

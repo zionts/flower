@@ -1277,6 +1277,9 @@ impl Engine<'_> {
     fn settle_clock(&mut self, clock: &Clock) -> EngineResult<()> {
         let (read, flip) = clock.take();
         if read {
+            if flip.is_none() {
+                self.sql_commit_unknown_policy_time = true;
+            }
             self.query_cacheable = false;
             // Native SQL can certify a temporal rule only when its next flip
             // is known. Ordinary watches/cache semantics remain unchanged.

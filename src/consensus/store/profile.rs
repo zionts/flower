@@ -300,7 +300,9 @@ impl StorageTrace {
                     return 0;
                 };
                 let mut command = command;
-                while let RaftCommand::Scoped { command: inner, .. } = command {
+                while let RaftCommand::Scoped { command: inner, .. }
+                | RaftCommand::Sql { command: inner, .. } = command
+                {
                     command = inner;
                 }
                 match command {
@@ -497,6 +499,7 @@ mod tests {
             deletes: Vec::new(),
             items: (0..3)
                 .map(|index| crate::consensus::BatchItem {
+                    sql_commit_before: None,
                     internal: false,
                     request_id: index.to_string(),
                     fingerprint: "not exported".into(),

@@ -464,8 +464,9 @@ pub(super) fn apply_scoped(
     writes: &mut BTreeMap<String, PartitionWrite>,
     binding: PartitionBinding,
     command: RaftCommand,
-    leader: openraft::CommittedLeaderId<u64>,
+    log_id: openraft::LogId<u64>,
 ) -> ApplyResult {
+    let leader = log_id.leader_id;
     let current = writes
         .get(&binding.partition)
         .map(|write| &write.state)
@@ -478,12 +479,28 @@ pub(super) fn apply_scoped(
     let current = current.expect("validated partition exists").clone();
     let mut delta = ApplicationDelta::new(current.snapshot.revision);
     let result = match command {
-        RaftCommand::Single(commit) => apply_commit(&current.snapshot, &mut delta, commit),
-        RaftCommand::Batch { batch } => apply_batch(&current.snapshot, &mut delta, batch),
+        RaftCommand::Sql {
+            sql_admission,
+            command,
+        } => apply_sql(
+            &current.snapshot,
+            &mut delta,
+            sql_admission,
+            *command,
+            log_id,
+        ),
+        RaftCommand::Single(commit) if commit.sql_commit_before.is_none() => {
+            apply_commit(&current.snapshot, &mut delta, commit)
+        }
+        RaftCommand::Batch { batch } if crate::sql_commit::batch_deadline(&batch).is_none() => {
+            apply_batch(&current.snapshot, &mut delta, batch)
+        }
         RaftCommand::Retention { retention } => {
             apply_retention(&current.snapshot, &mut delta, retention)
         }
-        RaftCommand::Fenced { leader_id, commit } if leader_id == leader => {
+        RaftCommand::Fenced { leader_id, commit }
+            if leader_id == leader && commit.sql_commit_before.is_none() =>
+        {
             apply_commit(&current.snapshot, &mut delta, commit)
         }
         RaftCommand::Fenced { .. } => ApplyResult::Rejected(

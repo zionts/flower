@@ -202,6 +202,7 @@ fn check_catalog_transition(placement: &Placement, budget: usize) -> anyhow::Res
         &RaftCommand::Fenced {
             leader_id: CommittedLeaderId::new(u64::MAX, u64::MAX),
             commit: Commit {
+                sql_commit_before: None,
                 internal: true,
                 request_id: String::new(),
                 fingerprint: String::new(),

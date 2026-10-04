@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct SharedCommit {
+    pub(super) sql_commit_before: Option<u64>,
     internal: bool,
     request_id: String,
     fingerprint: String,
@@ -23,6 +24,7 @@ impl SharedCommit {
         // runs before changing either records or receipts.
         let plan = plan_stage(state, &command)?;
         let command = Self {
+            sql_commit_before: command.sql_commit_before,
             internal: command.internal,
             request_id: command.request_id,
             fingerprint: command.fingerprint,
@@ -47,6 +49,7 @@ impl SharedCommit {
 
     pub(super) fn into_commit(self) -> Commit {
         Commit {
+            sql_commit_before: self.sql_commit_before,
             internal: self.internal,
             request_id: self.request_id,
             fingerprint: self.fingerprint,
@@ -96,6 +99,7 @@ impl SharedCommit {
                 }
             };
             items.push(BatchItem {
+                sql_commit_before: command.sql_commit_before,
                 internal: command.internal,
                 request_id: identity(command.request_id),
                 fingerprint: identity(command.fingerprint),
@@ -122,6 +126,7 @@ mod tests {
 
     fn command(index: u64, puts: &[(&str, Value)], deletes: &[&str]) -> Commit {
         Commit {
+            sql_commit_before: None,
             internal: false,
             request_id: format!("request-{index}"),
             fingerprint: format!("fingerprint-{index}"),

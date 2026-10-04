@@ -46,6 +46,7 @@ async fn application() -> (tempfile::TempDir, Arc<App>) {
     .unwrap();
     consensus
         .commit(Commit {
+            sql_commit_before: None,
             internal: false,
             request_id: "deploy".into(),
             fingerprint: "deploy".into(),

@@ -15,6 +15,7 @@ use profile::{StoragePhase, StorageTrace};
 mod lazy_flush;
 mod persistence;
 mod shared;
+mod write_basis;
 pub use shared::SharedDatabase;
 #[cfg(feature = "sql")]
 mod sql_capture;
@@ -22,6 +23,7 @@ mod sql_capture;
 mod sql_registry_meta;
 #[cfg(feature = "sql")]
 mod sql_source;
+pub(crate) use write_basis::NativeWriteBasis;
 
 mod partition_storage;
 use partition_storage::*;
@@ -307,6 +309,7 @@ struct SnapshotCapture {
 /// a later apply is committing, without waiting on its state lock.
 #[derive(Clone)]
 struct Published {
+    installation: u64,
     partitions: Partitions,
     last_applied: Option<LogId<u64>>,
     revision: u64,
@@ -317,6 +320,7 @@ struct Published {
 impl From<&StoredState> for Published {
     fn from(state: &StoredState) -> Self {
         Self {
+            installation: 0,
             partitions: state.partitions.clone(),
             last_applied: state.last_applied,
             revision: state.application.revision,
@@ -327,8 +331,12 @@ impl From<&StoredState> for Published {
 }
 
 fn publish(lock: &PublishedLock<Published>, state: &StoredState) {
-    let next = Published::from(state);
-    let previous = std::mem::replace(&mut *lock.write().expect("published state lock"), next);
+    let mut next = Published::from(state);
+    let previous = {
+        let mut guard = lock.write().expect("published state lock");
+        next.installation = guard.installation;
+        std::mem::replace(&mut *guard, next)
+    };
     // A snapshot installation can replace the entire tree. Free its old nodes
     // outside the publication lock rather than making new readers wait.
     drop(previous);
@@ -1897,7 +1905,7 @@ impl RaftStateMachine<TypeConfig> for Store {
                         ApplyResult::Internal
                     }
                     EntryPayload::Normal(RaftCommand::Scoped { partition, epoch, command }) => {
-                        apply_scoped(&guard.partitions, &mut partition_writes, PartitionBinding { partition, epoch }, *command, entry.log_id.leader_id)
+                        apply_scoped(&guard.partitions, &mut partition_writes, PartitionBinding { partition, epoch }, *command, entry.log_id)
                     }
                     EntryPayload::Normal(RaftCommand::PartitionControl { partition_control, leader_id }) => {
                         if leader_id.is_some_and(|leader| leader != entry.log_id.leader_id) {
@@ -1906,14 +1914,20 @@ impl RaftStateMachine<TypeConfig> for Store {
                             apply_partition_control(&guard.partitions, &mut partition_writes, partition_control)
                         }
                     }
+                    EntryPayload::Normal(RaftCommand::Sql { sql_admission, command }) => {
+                        apply_sql(&guard.application, &mut delta, sql_admission, *command, entry.log_id)
+                    }
                     EntryPayload::Normal(RaftCommand::Single(commit)) => {
-                        apply_commit(&guard.application, &mut delta, commit)
+                        if commit.sql_commit_before.is_some() { ApplyResult::Rejected("SQL commit requires native ordered admission".into()) }
+                        else { apply_commit(&guard.application, &mut delta, commit) }
                     }
                     EntryPayload::Normal(RaftCommand::Retention { retention }) => {
                         apply_retention(&guard.application, &mut delta, retention)
                     }
                     EntryPayload::Normal(RaftCommand::Fenced { leader_id, commit }) => {
-                        if entry.log_id.leader_id == leader_id {
+                        if commit.sql_commit_before.is_some() {
+                            ApplyResult::Rejected("SQL commit requires native ordered admission".into())
+                        } else if entry.log_id.leader_id == leader_id {
                             apply_commit(&guard.application, &mut delta, commit)
                         } else {
                             ApplyResult::Rejected(format!(
@@ -1923,7 +1937,8 @@ impl RaftStateMachine<TypeConfig> for Store {
                         }
                     }
                     EntryPayload::Normal(RaftCommand::Batch { batch }) => {
-                        apply_batch(&guard.application, &mut delta, batch)
+                        if crate::sql_commit::batch_deadline(&batch).is_some() { ApplyResult::Rejected("SQL commit requires native ordered admission".into()) }
+                        else { apply_batch(&guard.application, &mut delta, batch) }
                     }
                 });
             }
@@ -2164,16 +2179,25 @@ impl RaftStateMachine<TypeConfig> for Store {
                 .store(inner.persistence.persisted_count(), Ordering::Release);
             *guard = next;
             inner.lazy.update_membership(&guard.membership);
-            publish(&published, &guard);
+            // Data + native installation identity are one publication. A
+            // same-revision install must not expose new data with an old stamp.
+            let mut next_published = Published::from(&*guard);
+            next_published.installation = next_installation;
+            let previous = {
+                let mut publication = published.write().expect("published state lock");
+                let previous = std::mem::replace(&mut *publication, next_published);
+                inner
+                    .snapshot_installation
+                    .store(next_installation, Ordering::Release);
+                previous
+            };
+            drop(previous);
             let _ = inner.changes.send(Arc::new(super::changes::Changes {
                 scope: super::changes::Scope::All,
                 revision: 0,
                 keys: None,
             }));
             *inner.current_snapshot.write().expect("snapshot image lock") = Some(snapshot_meta);
-            inner
-                .snapshot_installation
-                .store(next_installation, Ordering::Release);
             inner
                 .snapshot_accounting
                 .installed(guard.last_applied.map(|id| id.index));
@@ -2342,3 +2366,21 @@ impl RaftSnapshotBuilder<TypeConfig> for Store {
 
 #[cfg(test)]
 mod tests;
+
+// This checks logged ordered-admission provenance, never a replica-local clock.
+fn apply_sql(
+    state: &Snapshot,
+    delta: &mut ApplicationDelta,
+    admission: crate::sql_commit::Admission,
+    command: RaftCommand,
+    log_id: openraft::LogId<u64>,
+) -> ApplyResult {
+    if !admission.valid(&command, log_id) {
+        return ApplyResult::Rejected("SQL commit admission is invalid".into());
+    }
+    match command {
+        RaftCommand::Single(commit) => apply_commit(state, delta, commit),
+        RaftCommand::Batch { batch } => apply_batch(state, delta, batch),
+        _ => ApplyResult::Rejected("SQL commit command is invalid".into()),
+    }
+}

@@ -119,6 +119,7 @@ fn operation(op: i32) -> Result<&'static str> {
         14 => "definer",
         15 => "sql",
         16 => "codeVersion",
+        17 => "requireCommitBefore",
         _ => bail!("unknown host operation {op}"),
     })
 }
@@ -204,7 +205,8 @@ mod tests {
         assert_eq!(super::operation(14).unwrap(), "definer");
         assert_eq!(super::operation(15).unwrap(), "sql");
         assert_eq!(super::operation(16).unwrap(), "codeVersion");
-        for op in [0, 17, -1, i32::MAX] {
+        assert_eq!(super::operation(17).unwrap(), "requireCommitBefore");
+        for op in [0, 18, -1, i32::MAX] {
             assert!(super::operation(op).is_err(), "{op}");
         }
     }

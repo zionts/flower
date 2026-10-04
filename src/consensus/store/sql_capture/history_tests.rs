@@ -278,6 +278,7 @@ impl Fixture {
         deletes: Vec<String>,
     ) -> RaftCommand {
         Commit {
+            sql_commit_before: None,
             internal: false,
             request_id: id.into(),
             fingerprint: "isolated-history-fixture".into(),
