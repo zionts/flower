@@ -40,6 +40,10 @@ const methods = {
   claimInline: mutation("claimInline", { args: v.object({ owner: id, waitMs: v.optional(v.int({ min: 0 })) }) }, (ctx, { owner, waitMs }) =>
     work.claimMany(ctx, owner, { max: 1, ...(waitMs === undefined ? {} : { waitMs }) }).map((claim) => ({ id: claim.id, token: claim.token }))),
   finishInline: mutation("finishInline", { args: v.object({ id, owner: id, token: v.int() }) }, (ctx, lease) => work.complete(ctx, lease, { words: 1 }).state),
+  discardInline: mutation("discardInline", { args: v.object({ id, owner: id, token: v.int() }) }, (ctx, lease) => {
+    work.finish(ctx, lease);
+    return work.scan(ctx).map((job) => job.id);
+  }),
   forge: mutation("forge", { args: v.object({ id, session: id }) }, (ctx, { id, session }) => {
     ctx.set(work.records, ["", id], { ...work.get(ctx, id)!, payload: { session, text: "forged" } });
     return null;
@@ -168,4 +172,23 @@ test("the queue's bookkeeping acts for the application even when the caller's ru
   assert.equal(db.query("job", "b1", bob), "completed");
   // Her own view of bob's jobs is still empty.
   assert.deepEqual(db.query("mine", null, alice), []);
+});
+
+test("finish uses lease authority even when the caller cannot read or cancel the job", async () => {
+  const db = await testDatabase(app);
+  db.mutate("start", "s2", bob);
+  for (const id of ["b1", "b2"]) db.mutate("ask", { session: "s2", id, text: id }, bob);
+  const [claim] = db.mutate("claimInline", { owner: "alice-inline" }, alice);
+  const lease = { ...claim, owner: "alice-inline" };
+  assert.equal(db.query("job", "b1", alice), null);
+  assert.equal(db.mutate("cancelMine", "b1", alice), false);
+  const before = db.data;
+  for (const wrong of [{ ...lease, token: lease.token + 1 }, { ...lease, owner: "other" }]) {
+    assert.equal(failure(() => db.mutate("discardInline", wrong, alice)), "LEASE_LOST");
+  }
+  assert.deepEqual(db.data, before);
+  assert.deepEqual(db.mutate("discardInline", lease, alice), [], "after finish, ordinary reads still run as the caller");
+  assert.equal(db.query("job", "b1", bob), null);
+  assert.equal(db.query("job", "b2", bob), "pending");
+  assert.equal(failure(() => db.mutate("discardInline", lease, alice)), "LEASE_LOST");
 });
