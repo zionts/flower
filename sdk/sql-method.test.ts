@@ -6,7 +6,7 @@ import { testDatabase } from "./testing.ts";
 const source=collection("terminal.source");
 const catalog=sqlCatalog({name:"terminal",version:"1",tables:[sqlTable({name:"notes",source,columns:[{name:"id",type:"text",sourceKey:true}],project:()=>({rows:[]})})],authorize:()=>null});
 const signer=key("terminal.signer",{algorithm:"HS256",usages:["sign"]});
-const binding:SqlFinishBinding={invoker:{subject:"caller"},principal:{subject:"effective"},clock:1000,history:{database:"database",incarnation:"incarnation"},codeVersion:"code",catalogVersion:"1",authorityContext:{verified:true},sourceRevision:10,partition:{name:"org",epoch:2}};
+const binding:SqlFinishBinding={invoker:{subject:"caller"},principal:{subject:"effective"},clock:1000,history:{database:"database",incarnation:"incarnation"},codeVersion:"code",catalogVersion:"1",authorityContext:{verified:true},sourceRevision:10,validUntil:2000,partition:{name:"org",epoch:2}};
 
 test("terminal SQL factory forces immutable metadata and preserves compiled access/argument policy",()=>{
  const run=sqlMethod("terminal.run",{catalog,operation:"query",args:v.object({sql:v.string()}),access:"authenticated",plan:(invoker,args)=>({input:args,purpose:{caller:invoker?.subject??null}}),signingKeys:[signer],finalize:(ctx,execution,meta)=>({result:execution.result,subject:ctx.principal().subject,request:meta.request.input})});
@@ -102,3 +102,20 @@ function closedCancellationTypes() {
  const query:SqlMethodSpec<null,"query">={catalog,operation:"query",cancelResult:"cancelled"};
  return [callback,signing,query];
 }
+
+
+test("terminal finalizer requires native exclusive permission expiry before application code",()=>{
+ let called=0;
+ const method=sqlMethod("terminal.closedBound",{catalog,operation:"query",signingKeys:[signer],finalize:(_ctx,_execution,metadata)=>{called++;return metadata.validUntil}});
+ const compute=sqlMethodInfo(method)!.finalizer.compute;
+ const input={request:{input:null,purpose:null},result:{columns:[],rows:[],resultTruncated:false,warnings:[],catalogVersion:"1"},provenance:[],binding};
+ for(const bad of [undefined, false, "2000", -1, 0, 999, 1000, 1000.5, NaN, Infinity, Number.MAX_SAFE_INTEGER+1]) {
+  assert.throws(()=>compute(null,{...input,binding:{...binding,validUntil:bad}} as never),error=>(error as any)?.failure?.code==="SQL_NATIVE_BINDING_INVALID"||String(error).includes("SQL_NATIVE_BINDING_INVALID"));
+ }
+ const {validUntil:_removed,...missing}=binding;
+ assert.throws(()=>compute(null,{...input,binding:missing} as never),/SQL_NATIVE_BINDING_INVALID/);
+ assert.equal(called,0);
+ assert.equal(compute(null,input),2000);
+ assert.equal(compute(null,{...input,binding:{...binding,validUntil:null}}),null);
+ assert.equal(called,2);
+});

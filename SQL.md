@@ -98,7 +98,7 @@ finalize(ctx, execution, metadata)
 
 - `ctx: SqlFinishContext` exposes **only** `principal()`, `clock()`, `history()`, `codeVersion()`, and readonly `binding`. There is no source getter, recursive SQL, write/definer operation, ambient `now()`, or secret handle. The SDK adapter freezes the context using a trusted finish binding rather than binding a database host.
 - `execution: SqlOperationResult<O>` is `{result,provenance}` (`SqlExecution`) for `query`. For `explain` and `catalog` it is respectively `SqlExplain` and `SqlCatalogInfo`, not that wrapper. Cancellation never invokes a guest finalizer; native output is a boolean or the exact `{cancelled:boolean}` shape declared below. Human query finalizers return `execution.result` only. Without a custom finalizer, the generated callback returns the public operation result and never query provenance.
-- `metadata: SqlFinishMetadata` is the trusted `SqlFinishBinding` plus `request`. The binding contains `invoker`, effective `principal`, `clock`, `history: HistoryIdentity | null`, `codeVersion`, `catalogVersion`, validated `authorityContext`, `sourceRevision`, and `partition:{name,epoch}|null`. These values must come from native fresh-finish validation, not client args or result fields.
+- `metadata: SqlFinishMetadata` is the trusted `SqlFinishBinding` plus `request`. The binding contains `invoker`, effective `principal`, `clock`, `history: HistoryIdentity | null`, `codeVersion`, `catalogVersion`, validated `authorityContext`, original-capture `sourceRevision`, REQUIRED exclusive `validUntil: number | null`, and `partition:{name,epoch}|null`. These values must come from native fresh-finish validation, not client args or result fields.
 
 `SqlFinishInput<O>` is internal trusted callback transport `{request,result,provenance,binding}`. The SDK adapts it to the three application arguments. Neither that adapter nor directly unit-testing it proves the native host has produced a valid binding.
 
@@ -172,3 +172,21 @@ The Node `testDatabase` **does not execute SQL**. It refuses native SQL with `SQ
 Native evaluator tests and the server-backed `bench/sql-conformance.mjs` exercise the foundation rather than a mock parser. The server harness must currently confirm hard-gate refusal, not claim positive end-to-end terminal/provider conformance. Run native foundation tests with `cargo test -p flower --lib --features sql`, not only `npm test`; allocator/operator unit success is not launch success. API coverage, docs rendering/type examples and source-only packaging checks likewise do not prove Nix evaluation/build or native serving.
 
 Operational telemetry must never log SQL literals, parameters, results or raw provenance. Native errors are generic codes; hidden-row work counts belong only in privileged coarse telemetry.
+
+<!-- Native finish metadata safety contract -->
+
+### Native finish permission expiry
+
+`finalize(ctx, execution, metadata)` remains a three-argument, readless callback.
+The native `{request,result,provenance,binding}` input requires
+`binding.validUntil: number | null`, exposed as `metadata.validUntil`. A number
+is the actual exclusive earliest permission expiry from the original job’s
+healthy cumulative temporal ledger, rechecked before finalizer and publication.
+`null` means a completed evaluated permission is native Independent or
+ClockInvariant; missing, unknown, pending, denied or refused proof is never null.
+The SDK refuses missing/malformed/expired bounds before application finalizer
+code. It invents no default and does not verify JWT, source or runtime proofs.
+`metadata.sourceRevision` is the original captured `Rseal`, even when fresh
+permission validation uses a later revision. Neither a job deadline nor
+`clock + 120000` is a permission proof or a substitute for `validUntil`.
+Cancellation keeps closed native formatting (`SQL_CANCEL_NATIVE_ONLY`).
