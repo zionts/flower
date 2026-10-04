@@ -138,14 +138,76 @@ fn native_plan_bound_covers_policy_operands_references_and_added_indexes() {
     job.schema = job.base_schema.clone();
     job.added = job.schema.indexes.clone();
     let base = json!(job.base_schema);
-    let bound =
-        plan_construction_bytes(Some(&base), &job.schema, job.bundle.as_ref().unwrap()).unwrap();
+    let bound = plan_construction_bytes(
+        Some(&base),
+        &job.schema,
+        job.bundle.as_ref().unwrap(),
+        progress_bytes(&job),
+    )
+    .unwrap();
     let native = staging::schema_bytes(&job.base_schema) + staging::schema_bytes(&job.schema);
     let plan = take_plan(&mut job);
     assert!(native + admission::input_bytes(&plan) < bound);
     assert!(bound < evaluator::config::Settings::default().rust_memory_bytes);
     let error = ensure_construction_bytes(usize::MAX).unwrap_err();
     assert_eq!(error.code, "EVALUATION_BUDGET");
+}
+
+#[test]
+fn progress_and_construction_account_for_unbounded_legacy_request_metadata() {
+    let mut job = plan_job(bundle(true, false, "return ctx.query(query).length;"));
+    job.request_id = "legacy".repeat(180_000);
+    job.cursor = Some("cursor".repeat(100));
+    let bytes = progress_bytes(&job);
+    assert!(bytes >= job.request_id.capacity() + job.cursor.as_ref().unwrap().capacity());
+    let without =
+        plan_construction_bytes(None, &job.schema, job.bundle.as_ref().unwrap(), 0).unwrap();
+    let with =
+        plan_construction_bytes(None, &job.schema, job.bundle.as_ref().unwrap(), bytes).unwrap();
+    assert_eq!(with - without, bytes * 16);
+    assert_eq!(progress_bytes(&job), bytes);
+    take_plan(&mut job);
+    assert_eq!(
+        progress_bytes(&job),
+        bytes,
+        "native progress survives plan consumption"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_stage_keeps_long_legacy_progress_metadata_covered_through_commit() {
+    let code = bundle(false, false, "return ctx.query(query).length;");
+    let (_directory, app) = super::super::tests::application(code.clone()).await;
+    // Before retention initialization, legacy IDs deliberately have no fixed
+    // length bound. Exercise the actual root forwarding clone, not just start.
+    let id = "x".repeat(1024 * 1024);
+    let response = forwarding::commit_deployments(app.clone(), stage_input(&id, code))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(answer["value"]["requestId"].as_str() == Some(id.as_str()));
+    assert!(matches!(
+        answer["value"]["phase"].as_str(),
+        Some("backfill" | "rebuilding")
+    ));
+    // Root caller input, serialized command metadata and surviving native
+    // progress each own a distinct MiB string. The old handoff charged only two.
+    let peak = app.admission.peak_retained(admission::Class::Control);
+    assert!(
+        peak >= 3 * id.len(),
+        "all three request-ID allocations remain covered: {peak}"
+    );
+    assert!(peak < 16 * 1024 * 1024);
+    assert_eq!(
+        app.admission.metrics()["classes"][1]["retainedInputBytes"],
+        0
+    );
+    assert_eq!(app.admission.metrics()["classes"][1]["active"], 0);
+    app.consensus.shutdown().await.unwrap();
 }
 
 #[test]
@@ -739,7 +801,8 @@ async fn external_full_bundle_root_http_default_budget_lifecycle_and_peak() {
     let schema = staging::schema(base.data.get("schema")).unwrap();
     assert!(schema.indexes.len() >= 300);
     assert!(schema.policies.len() >= 190);
-    let construction = plan_construction_bytes(base.data.get("schema"), &schema, &target).unwrap();
+    let construction =
+        plan_construction_bytes(base.data.get("schema"), &schema, &target, 1024).unwrap();
     let actual = admission::input_bytes(
         &json!({"bundle":target,"baseSchema":schema,"schema":schema,"added":[],"cleanup":[]}),
     );

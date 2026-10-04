@@ -68,6 +68,27 @@ struct Held<T> {
     value: T,
     retained: admission::Input,
 }
+// The heavy fields are consumed by take_plan; these strings remain live in
+// the progress job during commit, independently of its serialized command copy.
+fn progress_bytes(job: &Job) -> usize {
+    [
+        Some(&job.request_id),
+        Some(&job.fingerprint),
+        job.base_bundle_hash.as_ref(),
+        Some(&job.bundle_hash),
+        job.cursor.as_ref(),
+        job.cleanup_cursor.as_ref(),
+        job.generation.as_ref(),
+        job.base_generation.as_ref(),
+        job.graph_cursor.as_ref(),
+        job.error.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(512usize, |bytes, value| {
+        bytes.saturating_add(value.capacity())
+    })
+}
 const PLAN: &str = "deployment:plan";
 fn ensure_construction_bytes(bytes: usize) -> Result<(), ApiError> {
     if bytes
@@ -87,6 +108,7 @@ fn plan_construction_bytes(
     base: Option<&Value>,
     schema: &Schema,
     bundle: &Value,
+    metadata_bytes: usize,
 ) -> Result<usize, ApiError> {
     let base = base.unwrap_or(&Value::Null);
     // For this serde_json serializer, each new JSON string has its serialized
@@ -109,7 +131,11 @@ fn plan_construction_bytes(
         .saturating_add(admission::input_bytes(bundle))
         .saturating_add(staging::schema_bytes(schema))
         .saturating_add(admission::input_bytes(base).saturating_mul(2))
-        .saturating_add(encoded.saturating_mul(128)))
+        .saturating_add(encoded.saturating_mul(128))
+        // Legacy request IDs have no fixed length limit. Include native and
+        // serialized progress copies plus the escaped generation hash buffer;
+        // Vec growth can double its up-to-six-bytes-per-input-byte encoding.
+        .saturating_add(metadata_bytes.saturating_mul(16)))
 }
 fn take_plan(job: &mut Job) -> Value {
     // Consume the heavy fields before the plan is retained across commit. In
@@ -508,10 +534,24 @@ async fn start(app: &App, request_id: String, bundle: Value) -> Result<Value, Ap
         }
     }
     transactions::ensure_request_id_available(&state, &request_id)?;
+    let metadata_bytes = 512usize
+        .saturating_add(request_id.capacity())
+        .saturating_add(fingerprint.capacity())
+        .saturating_add(bundle.value["hash"].as_str().unwrap().len())
+        .saturating_add(
+            state
+                .data
+                .get("bundle")
+                .and_then(|bundle| bundle["hash"].as_str())
+                .map_or(0, str::len),
+        )
+        .saturating_add(state.data.active_graph().map_or(0, str::len))
+        .saturating_add(64); // The new generation is a SHA-256 hex digest.
     ensure_construction_bytes(plan_construction_bytes(
         state.data.get("schema"),
         &schema.value,
         &bundle.value,
+        metadata_bytes,
     )?)?;
     let base_schema = staging::schema(state.data.get("schema")).map_err(evaluation_error)?;
     let added: Vec<_> = schema
@@ -594,8 +634,19 @@ async fn start(app: &App, request_id: String, bundle: Value) -> Result<Value, Ap
     // moved into the command. Grow its exclusive lease to the whole output.
     // Root-caller and ingress leases remain unchanged throughout the attempt.
     drop(schema_output);
+    // The command owns its serialized job metadata, but the native progress
+    // strings survive until the reply is built. Retain them separately before
+    // reusing the bundle/map lease for command coverage; neither caller input
+    // nor the command's copy can cover this independent holder.
+    let retained = app
+        .admission
+        .retain(admission::Class::Control, progress_bytes(&job))?;
+    let job = Held {
+        value: job,
+        retained,
+    };
     let committed = persist_retained(app, &state, command, Some(bundle_output)).await?;
-    Ok(json!({"revision":committed["revision"],"value":status(&job)}))
+    Ok(json!({"revision":committed["revision"],"value":status(&job.value)}))
 }
 
 async fn advance(app: &App, id: String, requested: Option<usize>) -> Result<Value, ApiError> {
