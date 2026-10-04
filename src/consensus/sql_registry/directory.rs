@@ -6,7 +6,7 @@
 //! This is NOT source validation, a native node admission owner, persistence,
 //! routing or SQL authority. Parent must admit ONE actual combined mapping.
 use super::pool::{RegistryCell, RegistryPool};
-use super::{RegistryError, RegistryIdentity};
+use super::{RegistryError, RegistryIdentity, SourceStamp};
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
@@ -73,11 +73,11 @@ impl<'a> NativeOrigin<'a> {
 pub(in crate::consensus) struct NativeCode {
     pub(in crate::consensus) registry: u64,
     pub(in crate::consensus) bundle: u64,
-    pub(in crate::consensus) schema: u64,
+    pub(in crate::consensus) schema: SourceStamp,
 }
 impl NativeCode {
     fn valid(self) -> bool {
-        self.registry != 0 && self.bundle != 0 && self.schema != 0
+        self.registry != 0 && self.bundle != 0
     }
 }
 
@@ -212,7 +212,7 @@ impl Head {
             && self.epoch == identity.namespace.epoch
             && self.registry == identity.registry
             && self.bundle == identity.bundle
-            && self.schema == identity.schema
+            && SourceStamp::from_stored_word(self.schema) == identity.schema
     }
     fn metadata(self) -> HeadMetadata {
         HeadMetadata {
@@ -220,7 +220,7 @@ impl Head {
             code: NativeCode {
                 registry: self.registry,
                 bundle: self.bundle,
-                schema: self.schema,
+                schema: SourceStamp::from_stored_word(self.schema),
             },
         }
     }
@@ -384,7 +384,7 @@ impl<'region> Directory<'region> {
             uid,
             registry: code.registry,
             bundle: code.bundle,
-            schema: code.schema,
+            schema: code.schema.stored_word(),
             offset,
             len: origin.bytes().len(),
         };
@@ -434,7 +434,7 @@ impl<'region> Directory<'region> {
         let (index, mut head) = self.correlate(&guard, origin, Some(expected))?;
         head.registry = code.registry;
         head.bundle = code.bundle;
-        head.schema = code.schema;
+        head.schema = code.schema.stored_word();
         self.write_head(&guard, index, head);
         // Conservative even for equal code: an explicit validated attachment
         // is required again. No old witness can become current by aliasing.

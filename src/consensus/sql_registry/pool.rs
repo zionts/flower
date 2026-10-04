@@ -6,7 +6,7 @@
 //! released only AFTER munmap on the last pool-or-cell owner. Ordinary source
 //! Snapshots, Records, Backings and transactions never enter this module.
 use super::directory::{Directory, DirectoryError, DirectoryLayout};
-use super::{MAX_REGISTRY_BYTES, RegistryError, RegistryIdentity, RegistryNamespace};
+use super::{MAX_REGISTRY_BYTES, RegistryError, RegistryIdentity, RegistryNamespace, SourceStamp};
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
@@ -197,7 +197,7 @@ impl From<RegistryIdentity> for StoredIdentity {
             installation: value.installation,
             registry: value.registry,
             bundle: value.bundle,
-            schema: value.schema,
+            schema: value.schema.stored_word(),
             namespace_uid: value.namespace.uid,
             namespace_epoch: value.namespace.epoch,
         }
@@ -210,7 +210,7 @@ impl From<StoredIdentity> for RegistryIdentity {
             installation: value.installation,
             registry: value.registry,
             bundle: value.bundle,
-            schema: value.schema,
+            schema: SourceStamp::from_stored_word(value.schema),
             namespace: RegistryNamespace {
                 uid: value.namespace_uid,
                 epoch: value.namespace_epoch,
