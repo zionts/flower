@@ -66,6 +66,8 @@ struct Queue {
     ready: VecDeque<String>,
     active: usize,
     input: usize,
+    #[cfg(test)]
+    peak_input: usize,
     queued: usize,
 }
 struct Waiter {
@@ -227,6 +229,10 @@ impl Pool {
             return Err(overloaded(self.exhausted));
         };
         queue.input = total;
+        #[cfg(test)]
+        {
+            queue.peak_input = queue.peak_input.max(total);
+        }
         Ok(Input {
             pool: Arc::downgrade(self),
             class,
@@ -334,6 +340,10 @@ impl Pool {
             }
         }
     }
+    #[cfg(test)]
+    pub(in crate::service) fn peak_retained(&self, class: Class) -> usize {
+        self.state.lock().expect("admission mutex").classes[class.index()].peak_input
+    }
     pub(super) fn metrics(&self) -> Value {
         let state = self.state.lock().expect("admission mutex");
         let classes:Vec<_> = [Class::User, Class::Control, Class::Deployment].into_iter().map(|class| {
@@ -357,6 +367,23 @@ impl Drop for Input {
 }
 
 impl Input {
+    /// Carry exclusive coverage to a replacement allocation after the caller
+    /// has freed the old one. Never shrink or move a charge between pools or
+    /// classes; failed growth leaves the original reservation intact. Shared
+    /// Arc<Input> holders cannot call this without exclusive access.
+    pub(super) fn retain_at_least(
+        &mut self,
+        pool: &Arc<Pool>,
+        class: Class,
+        bytes: usize,
+    ) -> Result<(), ApiError> {
+        if self.class != class || !self.pool.ptr_eq(&Arc::downgrade(pool)) {
+            return Err(overloaded(
+                "retained input belongs to another admission pool or class",
+            ));
+        }
+        self.grow(bytes.saturating_sub(self.bytes))
+    }
     fn grow(&mut self, additional: usize) -> Result<(), ApiError> {
         let Some(pool) = self.pool.upgrade() else {
             return Err(overloaded("request admission stopped"));
@@ -410,6 +437,68 @@ mod tests {
     use std::task::Poll;
     fn pool() -> Arc<Pool> {
         Pool::new([1, 1], [10, 10], [4096, 4096], 10)
+    }
+
+    #[test]
+    fn exclusive_handoff_only_grows_and_preserves_other_holders() {
+        let pool = Pool::new([1, 1], [10, 10], [1024, 1024], 10);
+        let mut retained = pool.retain(Class::Control, 300).unwrap();
+        let mut shared = Arc::new(pool.retain(Class::Control, 100).unwrap());
+        let survivor = shared.clone();
+        assert!(Arc::get_mut(&mut shared).is_none());
+        retained
+            .retain_at_least(&pool, Class::Control, 700)
+            .unwrap();
+        assert_eq!(pool.metrics()["classes"][1]["retainedInputBytes"], 800);
+        retained
+            .retain_at_least(&pool, Class::Control, 200)
+            .unwrap();
+        assert_eq!(retained.bytes, 700, "no credit while coverage is retained");
+        assert!(
+            retained
+                .retain_at_least(&pool, Class::Control, 950)
+                .is_err()
+        );
+        assert_eq!(
+            retained.bytes, 700,
+            "failed growth keeps the original lease"
+        );
+        assert_eq!(pool.metrics()["classes"][1]["retainedInputBytes"], 800);
+        assert_eq!(pool.peak_retained(Class::Control), 800);
+        let other = Pool::new([1, 1], [10, 10], [1024, 1024], 10);
+        assert!(
+            retained
+                .retain_at_least(&other, Class::Control, 800)
+                .is_err()
+        );
+        assert!(retained.retain_at_least(&pool, Class::User, 800).is_err());
+        assert_eq!(other.metrics()["classes"][1]["retainedInputBytes"], 0);
+        assert_eq!(pool.metrics()["classes"][0]["retainedInputBytes"], 0);
+        drop(retained);
+        drop(shared);
+        assert_eq!(pool.metrics()["classes"][1]["retainedInputBytes"], 100);
+        drop(survivor);
+        assert_eq!(pool.metrics()["classes"][1]["retainedInputBytes"], 0);
+    }
+
+    #[tokio::test]
+    async fn canceled_handoff_future_releases_only_its_exclusive_coverage() {
+        let pool = pool();
+        let survivor = Arc::new(pool.retain(Class::Control, 100).unwrap());
+        let mut retained = pool.retain(Class::Control, 300).unwrap();
+        retained
+            .retain_at_least(&pool, Class::Control, 700)
+            .unwrap();
+        let mut pending = Box::pin(async move {
+            let _retained = retained;
+            std::future::pending::<()>().await;
+        });
+        assert!(matches!(futures_util::poll!(&mut pending), Poll::Pending));
+        assert_eq!(pool.metrics()["classes"][1]["retainedInputBytes"], 800);
+        drop(pending);
+        assert_eq!(pool.metrics()["classes"][1]["retainedInputBytes"], 100);
+        drop(survivor);
+        assert_eq!(pool.metrics()["classes"][1]["retainedInputBytes"], 0);
     }
 
     #[tokio::test]

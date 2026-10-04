@@ -78,6 +78,289 @@ async fn collect_all(app: &App, id: &str) {
     panic!("cleanup did not converge");
 }
 
+fn plan_job(code: String) -> Job {
+    let input = stage_input("ownership-build", code);
+    let schema =
+        staging::analyze(json!({"requestId":"ownership-build","bundle":input["bundle"]})).unwrap();
+    let mut job: Job = decode(&json!({
+        "requestId":"ownership-build", "fingerprint":"fingerprint", "phase":"backfill",
+        "baseRevision":1, "baseBundleHash":null, "bundleHash":input["bundle"]["hash"],
+        "position":0, "cursor":null, "cleanupPosition":0, "cleanupCursor":null,
+        "scannedRows":0, "builtEntries":0
+    }))
+    .unwrap();
+    job.bundle = Some(input["bundle"].clone());
+    job.base_schema = schema.clone();
+    job.schema = schema;
+    job.added = job.schema.indexes.clone();
+    job.cleanup = job.base_schema.indexes.clone();
+    job
+}
+
+#[test]
+fn consuming_plan_preserves_format_and_metadata_and_moves_bundle_allocation() {
+    let mut job = plan_job(bundle(true, false, "return ctx.query(query).length;"));
+    let pointer = job.bundle.as_ref().unwrap()["javascript"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    let expected = json!({"bundle":job.bundle,"baseSchema":job.base_schema,"schema":job.schema,"added":job.added,"cleanup":job.cleanup});
+    let metadata = json!(job);
+    let before = status(&job);
+    let plan = take_plan(&mut job);
+    assert_eq!(
+        plan, expected,
+        "durable plan shape and values are unchanged"
+    );
+    assert_eq!(
+        plan["bundle"]["javascript"].as_str().unwrap().as_ptr(),
+        pointer
+    );
+    assert!(job.bundle.is_none());
+    assert_eq!(job.base_schema, Schema::default());
+    assert_eq!(job.schema, Schema::default());
+    assert!(job.added.is_empty());
+    assert!(job.cleanup.is_empty());
+    assert_eq!(json!(job), metadata);
+    assert_eq!(status(&job), before);
+}
+
+#[test]
+fn native_plan_bound_covers_policy_operands_references_and_added_indexes() {
+    let mut job = plan_job(bundle(true, false, "return ctx.query(query).length;"));
+    let value = json!({
+        "indexes":[{"collection":"rows","fields":["owner"]}],
+        "policies":{"rows":{"read":{"eq":[{"ref":["row","owner"]},{"value":{"nested":[null,false,0,[],{},"escaped\ntext"]}}]},"fields":{"owner":{"read":{"const":true},"write":{"const":false}}}}},
+        "derived_access":{"root":{"all":[{"const":true},{"not":{"const":false}}]}},
+        "references":[{"collection":"rows","target":"owners","fields":["owner"]}]
+    });
+    job.base_schema = decode(&value).unwrap();
+    job.schema = job.base_schema.clone();
+    job.added = job.schema.indexes.clone();
+    let base = json!(job.base_schema);
+    let bound = plan_construction_bytes(
+        Some(&base),
+        &job.schema,
+        job.bundle.as_ref().unwrap(),
+        progress_bytes(&job),
+    )
+    .unwrap();
+    let native = staging::schema_bytes(&job.base_schema) + staging::schema_bytes(&job.schema);
+    let plan = take_plan(&mut job);
+    assert!(native + admission::input_bytes(&plan) < bound);
+    assert!(bound < evaluator::config::Settings::default().rust_memory_bytes);
+    let error = ensure_construction_bytes(usize::MAX).unwrap_err();
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error.code, "EVALUATION_FAILED");
+    assert_eq!(error.body()["error"]["code"], "EVALUATION_FAILED");
+    assert_eq!(
+        error.body()["error"]["failure"]["code"],
+        "EVALUATION_BUDGET"
+    );
+    assert_eq!(
+        error.body()["error"]["message"],
+        "EVALUATION_BUDGET: staged plan construction exceeds the Rust memory budget"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn construction_budget_failure_preserves_engine_envelope_before_commit() {
+    let code = bundle(false, false, "return ctx.query(query).length;");
+    let (_directory, app) = super::super::tests::application(code.clone()).await;
+    // A source-only oversized existing schema forces the native-builder
+    // preflight, without changing any process/global budget or customer data.
+    let indexes: Vec<_> = (0..10_000)
+        .map(|n| json!({"collection":format!("oversized-{n:05}-{}", "x".repeat(128)),"fields":["kind"]}))
+        .collect();
+    let initial = app.consensus.read_for_writer().await.unwrap();
+    app.consensus
+        .commit(Commit {
+            internal: true,
+            request_id: String::new(),
+            fingerprint: String::new(),
+            expected_revision: initial.revision,
+            puts: BTreeMap::from([("schema".into(), json!({"indexes":indexes,"aggregates":{}}))]),
+            deletes: vec![],
+            result: Value::Null,
+        })
+        .await
+        .unwrap();
+    let survivor = Arc::new(
+        app.admission
+            .retain(admission::Class::Control, 100)
+            .unwrap(),
+    );
+    let before = app.consensus.read_for_writer().await.unwrap();
+    let metrics = app.admission.metrics();
+    let error = administer(&app, stage_input("construction-budget", code))
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error.body()["error"]["code"], "EVALUATION_FAILED");
+    assert_eq!(
+        error.body()["error"]["failure"]["code"],
+        "EVALUATION_BUDGET"
+    );
+    assert_eq!(
+        error.body()["error"]["failure"]["message"],
+        "staged plan construction exceeds the Rust memory budget"
+    );
+    let after = app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(
+        after.revision, before.revision,
+        "budget refusal must not commit"
+    );
+    assert!(after.data["schema"] == before.data["schema"]);
+    assert!(after.data["bundle"] == before.data["bundle"]);
+    assert!(!after.data.contains_key(PLAN));
+    assert!(!after.data.contains_key(staging::JOB));
+    for index in 0..3 {
+        let current = app.admission.metrics();
+        assert_eq!(
+            current["classes"][index]["inputBudgetBytes"],
+            metrics["classes"][index]["inputBudgetBytes"]
+        );
+        assert_eq!(
+            current["classes"][index]["retainedInputBytes"],
+            metrics["classes"][index]["retainedInputBytes"]
+        );
+        assert_eq!(current["classes"][index]["active"], 0);
+        assert_eq!(current["classes"][index]["queued"], 0);
+    }
+    assert_eq!(metrics["classes"][1]["inputBudgetBytes"], 16 * 1024 * 1024);
+    drop(survivor);
+    assert_eq!(
+        app.admission.metrics()["classes"][1]["retainedInputBytes"],
+        0
+    );
+    app.consensus.shutdown().await.unwrap();
+}
+
+#[test]
+fn progress_and_construction_account_for_unbounded_legacy_request_metadata() {
+    let mut job = plan_job(bundle(true, false, "return ctx.query(query).length;"));
+    job.request_id = "legacy".repeat(180_000);
+    job.cursor = Some("cursor".repeat(100));
+    let bytes = progress_bytes(&job);
+    assert!(bytes >= job.request_id.capacity() + job.cursor.as_ref().unwrap().capacity());
+    let without =
+        plan_construction_bytes(None, &job.schema, job.bundle.as_ref().unwrap(), 0).unwrap();
+    let with =
+        plan_construction_bytes(None, &job.schema, job.bundle.as_ref().unwrap(), bytes).unwrap();
+    assert_eq!(with - without, bytes * 16);
+    assert_eq!(progress_bytes(&job), bytes);
+    take_plan(&mut job);
+    assert_eq!(
+        progress_bytes(&job),
+        bytes,
+        "native progress survives plan consumption"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_stage_keeps_long_legacy_progress_metadata_covered_through_commit() {
+    let code = bundle(false, false, "return ctx.query(query).length;");
+    let (_directory, app) = super::super::tests::application(code.clone()).await;
+    // Before retention initialization, legacy IDs deliberately have no fixed
+    // length bound. Exercise the actual root forwarding clone, not just start.
+    let id = "x".repeat(1024 * 1024);
+    let response = forwarding::commit_deployments(app.clone(), stage_input(&id, code))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(answer["value"]["requestId"].as_str() == Some(id.as_str()));
+    assert!(matches!(
+        answer["value"]["phase"].as_str(),
+        Some("backfill" | "rebuilding")
+    ));
+    // Root caller input, serialized command metadata and surviving native
+    // progress each own a distinct MiB string. The old handoff charged only two.
+    let peak = app.admission.peak_retained(admission::Class::Control);
+    assert!(
+        peak >= 3 * id.len(),
+        "all three request-ID allocations remain covered: {peak}"
+    );
+    assert!(peak < 16 * 1024 * 1024);
+    assert_eq!(
+        app.admission.metrics()["classes"][1]["retainedInputBytes"],
+        0
+    );
+    assert_eq!(app.admission.metrics()["classes"][1]["active"], 0);
+    app.consensus.shutdown().await.unwrap();
+}
+
+#[test]
+fn retained_values_drop_before_their_coverage() {
+    struct ObserveDrop(Arc<admission::Pool>);
+    impl Drop for ObserveDrop {
+        fn drop(&mut self) {
+            assert_eq!(self.0.metrics()["classes"][1]["retainedInputBytes"], 100);
+        }
+    }
+    let pool = admission::Pool::new([1, 1], [10, 10], [1024, 1024], 10);
+    let held = Held {
+        value: ObserveDrop(pool.clone()),
+        retained: pool.retain(admission::Class::Control, 100).unwrap(),
+    };
+    drop(held);
+    assert_eq!(pool.metrics()["classes"][1]["retainedInputBytes"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_at_writer_wait_preserves_other_retained_inputs() {
+    let code = bundle(false, false, "return ctx.query(query).length;");
+    let (_directory, app) = super::super::tests::application(code.clone()).await;
+    let held_writer = app.writer.lock().await;
+    let survivor = Arc::new(
+        app.admission
+            .retain(admission::Class::Control, 100)
+            .unwrap(),
+    );
+    let input = stage_input("canceled-wait", code);
+    let expected = admission::input_bytes(&input)
+        + admission::input_bytes(&json!({"requestId":"canceled-wait","bundle":input["bundle"]}))
+        + staging::schema_bytes(
+            &staging::analyze(json!({"requestId":"canceled-wait","bundle":input["bundle"]}))
+                .unwrap(),
+        )
+        + 100;
+    let running = app.clone();
+    let pending = tokio::spawn(async move { administer(&running, input).await });
+    // One bounded settling pause, not a resource/status polling loop. This
+    // leaves the completed analyzer waiting on the intentionally held writer.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(app.admission.metrics()["classes"][2]["active"], 0);
+    assert_eq!(
+        app.admission.metrics()["classes"][1]["retainedInputBytes"],
+        expected
+    );
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        app.admission.metrics()["classes"][1]["retainedInputBytes"],
+        100
+    );
+    assert!(
+        !app.consensus
+            .read_query()
+            .await
+            .unwrap()
+            .data
+            .contains_key(PLAN)
+    );
+    drop(held_writer);
+    drop(survivor);
+    assert_eq!(
+        app.admission.metrics()["classes"][1]["retainedInputBytes"],
+        0
+    );
+    app.consensus.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_backfill_dual_maintenance_and_atomic_policy_cutover() {
     let code = bundle(false, false, "return ctx.query(query).length;");
@@ -559,5 +842,163 @@ async fn staged_cancel_after_retired_session_collection_uses_permanent_epoch_fen
         !snapshot.requests.contains_key(&id),
         "retired cancellation needs no new retry receipt"
     );
+    app.consensus.shutdown().await.unwrap();
+}
+
+/// The production application remains in its own private repository. Supply a
+/// source-built bundle externally; never copy that payload into Flower's tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires FLOWER_STAGED_INPUT_FIXTURE pointing to an external full application bundle"]
+async fn external_full_bundle_root_http_default_budget_lifecycle_and_peak() {
+    let path = std::env::var("FLOWER_STAGED_INPUT_FIXTURE")
+        .expect("explicit external full-bundle fixture is required");
+    let target: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(target["javascript"].as_str().unwrap().len() > 3_000_000);
+    let (_directory, app) =
+        super::super::tests::application(bundle(false, false, "return ctx.query(query).length;"))
+            .await;
+    let initial = app.consensus.read_for_writer().await.unwrap();
+    // Remove the tiny helper's roots before the real full application's first
+    // ordinary deployment. No application or customer rows are needed here.
+    app.consensus
+        .commit(Commit {
+            internal: true,
+            request_id: String::new(),
+            fingerprint: String::new(),
+            expected_revision: initial.revision,
+            puts: BTreeMap::new(),
+            deletes: initial.data.keys().collect(),
+            result: Value::Null,
+        })
+        .await
+        .unwrap();
+    writer::submit(
+        &app,
+        json!({"requestId":"full-base","bundle":target,"preparation":"blocking"}),
+        true,
+    )
+    .await
+    .unwrap();
+    let base = app.consensus.read_query().await.unwrap();
+    assert_eq!(base.data["bundle"], target);
+    let schema = staging::schema(base.data.get("schema")).unwrap();
+    assert!(schema.indexes.len() >= 300);
+    assert!(schema.policies.len() >= 190);
+    let construction =
+        plan_construction_bytes(base.data.get("schema"), &schema, &target, 1024).unwrap();
+    let actual = admission::input_bytes(
+        &json!({"bundle":target,"baseSchema":schema,"schema":schema,"added":[],"cleanup":[]}),
+    );
+    assert!(actual + 2 * staging::schema_bytes(&schema) < construction);
+    ensure_construction_bytes(construction).unwrap();
+    for (index, expected) in [
+        (0, 64 * 1024 * 1024),
+        (1, 16 * 1024 * 1024),
+        (2, 16 * 1024 * 1024),
+    ] {
+        assert_eq!(
+            app.admission.metrics()["classes"][index]["inputBudgetBytes"],
+            expected
+        );
+        assert_eq!(
+            app.admission.metrics()["classes"][index]["retainedInputBytes"],
+            0
+        );
+    }
+    let ingress = admission::ingress::Budget::new(&app);
+    let router = axum::Router::new()
+        .route(
+            "/admin/deployments",
+            axum::routing::post(super::super::deployment_control),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+        .with_state(app.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            ingress,
+            admission::ingress::handle,
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/admin/deployments",
+        listener.local_addr().unwrap()
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let send = |input: Value| {
+        let request = client
+            .post(&url)
+            .bearer_auth("test-only-secret")
+            .json(&input);
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let answer: Value = response.json().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            answer
+        }
+    };
+    let started =
+        send(json!({"operation":"stage","requestId":"full-root-build","bundle":target})).await;
+    assert!(matches!(
+        started["value"]["phase"].as_str(),
+        Some("backfill" | "rebuilding")
+    ));
+    let peak = app.admission.peak_retained(admission::Class::Control);
+    assert!(peak <= 16 * 1024 * 1024);
+    assert!(
+        peak > 15_000_000,
+        "the test exercises the full root ingress/plan peak"
+    );
+    let mut ready = false;
+    for _ in 0..100 {
+        let page =
+            send(json!({"operation":"advance","requestId":"full-root-build","maxBytes":65536}))
+                .await;
+        if page["value"]["phase"] == "ready" {
+            ready = true;
+            break;
+        }
+        assert_ne!(page["value"]["phase"], "failed");
+    }
+    assert!(ready);
+    let activated = send(json!({"operation":"activate","requestId":"full-root-build"})).await;
+    assert_eq!(activated["value"]["phase"], "active");
+    let mut collected = false;
+    for _ in 0..100 {
+        let page =
+            send(json!({"operation":"collect","requestId":"full-root-build","maxBytes":65536}))
+                .await;
+        if page["value"]["phase"] == "collected" {
+            collected = true;
+            break;
+        }
+    }
+    assert!(collected);
+    let current = app.consensus.read_query().await.unwrap();
+    assert_eq!(current.data["bundle"], target);
+    assert_eq!(current.data["schema"], base.data["schema"]);
+    assert!(!current.data.contains_key(PLAN));
+    for index in 0..3 {
+        assert_eq!(
+            app.admission.metrics()["classes"][index]["retainedInputBytes"],
+            0
+        );
+        assert_eq!(app.admission.metrics()["classes"][index]["active"], 0);
+        assert_eq!(app.admission.metrics()["classes"][index]["queued"], 0);
+    }
+    println!(
+        "{}",
+        json!({"bundleHash":target["hash"],"controlPeakRetainedBytes":peak,"controlBudgetBytes":16*1024*1024,"constructionBoundBytes":construction,"constructionRustBudgetBytes":128*1024*1024,"indexes":schema.indexes.len(),"policies":schema.policies.len(),"phase":"collected"})
+    );
+    stop.send(()).unwrap();
+    server.await.unwrap();
     app.consensus.shutdown().await.unwrap();
 }

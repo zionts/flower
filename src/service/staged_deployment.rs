@@ -62,9 +62,106 @@ struct Job {
 fn initial_graph_page_roots() -> usize {
     1
 }
+// Values/futures are declared before their leases so cancellation destroys
+// their allocations before releasing coverage, including an in-flight commit.
+struct Held<T> {
+    value: T,
+    retained: admission::Input,
+}
+// The heavy fields are consumed by take_plan; these strings remain live in
+// the progress job during commit, independently of its serialized command copy.
+fn progress_bytes(job: &Job) -> usize {
+    [
+        Some(&job.request_id),
+        Some(&job.fingerprint),
+        job.base_bundle_hash.as_ref(),
+        Some(&job.bundle_hash),
+        job.cursor.as_ref(),
+        job.cleanup_cursor.as_ref(),
+        job.generation.as_ref(),
+        job.base_generation.as_ref(),
+        job.graph_cursor.as_ref(),
+        job.error.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(512usize, |bytes, value| {
+        bytes.saturating_add(value.capacity())
+    })
+}
 const PLAN: &str = "deployment:plan";
-fn plan(job: &Job) -> Value {
-    json!({"bundle":job.bundle,"baseSchema":job.base_schema,"schema":job.schema,"added":job.added,"cleanup":job.cleanup})
+fn ensure_construction_bytes(bytes: usize) -> Result<(), ApiError> {
+    if bytes
+        > evaluator::config::settings()
+            .map_err(unavailable)?
+            .rust_memory_bytes
+    {
+        return Err(evaluation_error(
+            evaluator::rust_engine::EngineError::new(
+                "EVALUATION_BUDGET",
+                "staged plan construction exceeds the Rust memory budget",
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+fn plan_construction_bytes(
+    base: Option<&Value>,
+    schema: &Schema,
+    bundle: &Value,
+    metadata_bytes: usize,
+) -> Result<usize, ApiError> {
+    let base = base.unwrap_or(&Value::Null);
+    // For this serde_json serializer, each new JSON string has its serialized
+    // length's capacity, each array slot is one Value, and object entries have
+    // the input_bytes 128-byte allowance. Even a one-byte scalar occupies a
+    // wire token, so 128 * wire bytes bounds the new JSON tree, including
+    // embedded rule operands. Count only new schema/index JSON, NOT JavaScript:
+    // that allocation moves. Include native base parsing and both added-index
+    // representations while the Control worker holds its Rust reservation.
+    let encoded = crate::consensus::encoded_json_len(base)
+        .and_then(|base| {
+            crate::consensus::encoded_json_len(schema).map(|target| base.saturating_add(target))
+        })
+        .and_then(|schemas| {
+            crate::consensus::encoded_json_len(&schema.indexes)
+                .map(|indexes| schemas.saturating_add(indexes.saturating_mul(2)))
+        })
+        .map_err(|error| invalid(error.into()))?;
+    Ok(8192usize
+        .saturating_add(admission::input_bytes(bundle))
+        .saturating_add(staging::schema_bytes(schema))
+        .saturating_add(admission::input_bytes(base).saturating_mul(2))
+        .saturating_add(encoded.saturating_mul(128))
+        // Legacy request IDs have no fixed length limit. Include native and
+        // serialized progress copies plus the escaped generation hash buffer;
+        // Vec growth can double its up-to-six-bytes-per-input-byte encoding.
+        .saturating_add(metadata_bytes.saturating_mul(16)))
+}
+fn take_plan(job: &mut Job) -> Value {
+    // Consume the heavy fields before the plan is retained across commit. In
+    // particular, serialization must finish dropping the native schemas before
+    // their exclusive reservation can cover the resulting JSON instead.
+    Value::Object(serde_json::Map::from_iter([
+        ("bundle".into(), job.bundle.take().unwrap_or(Value::Null)),
+        (
+            "baseSchema".into(),
+            serde_json::to_value(std::mem::take(&mut job.base_schema)).expect("schema encodes"),
+        ),
+        (
+            "schema".into(),
+            serde_json::to_value(std::mem::take(&mut job.schema)).expect("schema encodes"),
+        ),
+        (
+            "added".into(),
+            serde_json::to_value(std::mem::take(&mut job.added)).expect("indexes encode"),
+        ),
+        (
+            "cleanup".into(),
+            serde_json::to_value(std::mem::take(&mut job.cleanup)).expect("indexes encode"),
+        ),
+    ]))
 }
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
@@ -260,6 +357,14 @@ fn fits(app: &App, command: &Commit) -> bool {
         .is_ok_and(|bytes| bytes <= app.consensus.command_payload_limit())
 }
 async fn persist(app: &App, state: &Snapshot, command: Commit) -> Result<Value, ApiError> {
+    persist_retained(app, state, command, None).await
+}
+async fn persist_retained(
+    app: &App,
+    state: &Snapshot,
+    command: Commit,
+    retained: Option<admission::Input>,
+) -> Result<Value, ApiError> {
     transactions::ensure_write_capacity(state)?;
     if !fits(app, &command) {
         return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE,"TRANSACTION_TOO_LARGE","staged deployment page exceeds FLOWER_TRANSACTION_MAX_BYTES; lower maxBytes or increase the configured transaction budget".into()));
@@ -276,8 +381,18 @@ async fn persist(app: &App, state: &Snapshot, command: Commit) -> Result<Value, 
         .saturating_add(command.deletes.iter().fold(0usize, |bytes, key| {
             bytes.saturating_add(key.capacity()).saturating_add(32)
         }));
-    let _output = app.admission.retain(admission::Class::Control, bytes)?;
-    let result = app.consensus.commit(command).await.map_err(unavailable)?;
+    let output = match retained {
+        Some(mut retained) => {
+            retained.retain_at_least(&app.admission, admission::Class::Control, bytes)?;
+            retained
+        }
+        None => app.admission.retain(admission::Class::Control, bytes)?,
+    };
+    let mut held = Held {
+        value: Box::pin(app.consensus.commit(command)),
+        retained: output,
+    };
+    let result = held.value.as_mut().await.map_err(unavailable)?;
     Ok(json!({"revision":result.revision,"value":result.result,"duplicate":result.duplicate}))
 }
 fn budget(app: &App, requested: Option<usize>) -> Result<usize, ApiError> {
@@ -322,24 +437,61 @@ pub(super) fn validate_admin(input: &Value) -> Result<(), ApiError> {
 }
 
 async fn start(app: &App, request_id: String, bundle: Value) -> Result<Value, ApiError> {
-    let input = json!({"requestId":request_id,"bundle":bundle});
-    let fingerprint = authorization::fingerprint(&input, true, &Value::Null);
+    // json! serializes by reference, including an already-owned Value. Move
+    // the bundle instead of keeping a second callee copy across writer waits.
+    // This is separate from administer's root-caller coverage. The local
+    // bundle also lives through admission/writer waits and needs its own lease.
+    let value = Value::Object(serde_json::Map::from_iter([
+        ("requestId".into(), Value::String(request_id)),
+        ("bundle".into(), bundle),
+    ]));
+    let retained = app
+        .admission
+        .retain(admission::Class::Control, admission::input_bytes(&value))?;
+    let mut input = Held { value, retained };
+    let fingerprint = authorization::fingerprint(&input.value, true, &Value::Null);
     // Analyze without pinning a live database or holding its writer. Drop the
     // worker permit before waiting for the writer, preserving admission order.
     // Deployment work takes its own class: control slots are what maintenance
     // waits for while it holds a writer.
     let permit = admission::acquire_retained(app, admission::Class::Deployment).await?;
-    let analyze = input.clone();
+    let analyze = input.value.clone();
     let (schema, permit) = tokio::task::spawn_blocking(move || {
         staging::analyze(analyze).map(|schema| (schema, permit))
     })
     .await
     .map_err(|error| unavailable(error.into()))?
     .map_err(evaluation_error)?;
-    let _schema_output = app
+    let retained = app
         .admission
         .retain(admission::Class::Control, staging::schema_bytes(&schema))?;
+    let schema = Held {
+        value: schema,
+        retained,
+    };
     drop(permit);
+    let bundle = input
+        .value
+        .as_object_mut()
+        .unwrap()
+        .remove("bundle")
+        .unwrap();
+    let request_id = match input
+        .value
+        .as_object_mut()
+        .unwrap()
+        .remove("requestId")
+        .unwrap()
+    {
+        Value::String(request_id) => request_id,
+        _ => unreachable!("owned stage request ID is a string"),
+    };
+    let Held { value, retained } = input;
+    drop(value);
+    let bundle = Held {
+        value: bundle,
+        retained,
+    };
     let _writer = app.writer.lock().await;
     let _permit = admission::acquire_retained(app, admission::Class::Control).await?;
     let state = app.consensus.read_for_writer().await.map_err(unavailable)?;
@@ -361,6 +513,15 @@ async fn start(app: &App, request_id: String, bundle: Value) -> Result<Value, Ap
         }
         return Ok(json!({"revision":receipt.revision,"value":receipt.result,"duplicate":true}));
     }
+    // Existing staged metadata is decoded only under the Control worker, with
+    // the same conservative JSON-plus-native bound used by schema loading.
+    if let Some(plan) = state.data.get(PLAN) {
+        let bytes = ["baseSchema", "schema", "added"]
+            .into_iter()
+            .map(|key| admission::input_bytes(&plan[key]).saturating_mul(2))
+            .fold(0usize, usize::saturating_add);
+        ensure_construction_bytes(bytes)?;
+    }
     if let Some(job) = load(&state)? {
         if job.request_id == request_id {
             if job.fingerprint != fingerprint {
@@ -375,8 +536,28 @@ async fn start(app: &App, request_id: String, bundle: Value) -> Result<Value, Ap
         }
     }
     transactions::ensure_request_id_available(&state, &request_id)?;
+    let metadata_bytes = 512usize
+        .saturating_add(request_id.capacity())
+        .saturating_add(fingerprint.capacity())
+        .saturating_add(bundle.value["hash"].as_str().unwrap().len())
+        .saturating_add(
+            state
+                .data
+                .get("bundle")
+                .and_then(|bundle| bundle["hash"].as_str())
+                .map_or(0, str::len),
+        )
+        .saturating_add(state.data.active_graph().map_or(0, str::len))
+        .saturating_add(64); // The new generation is a SHA-256 hex digest.
+    ensure_construction_bytes(plan_construction_bytes(
+        state.data.get("schema"),
+        &schema.value,
+        &bundle.value,
+        metadata_bytes,
+    )?)?;
     let base_schema = staging::schema(state.data.get("schema")).map_err(evaluation_error)?;
     let added: Vec<_> = schema
+        .value
         .indexes
         .iter()
         .filter(|index| !base_schema.indexes.contains(index))
@@ -387,7 +568,15 @@ async fn start(app: &App, request_id: String, bundle: Value) -> Result<Value, Ap
             .map_err(|error| invalid(error.into()))?
             .as_bytes(),
     );
-    let job = Job {
+    let Held {
+        value: bundle,
+        retained: bundle_output,
+    } = bundle;
+    let Held {
+        value: schema,
+        retained: schema_output,
+    } = schema;
+    let mut job = Job {
         request_id,
         fingerprint,
         phase: if added.is_empty() {
@@ -429,18 +618,37 @@ async fn start(app: &App, request_id: String, bundle: Value) -> Result<Value, Ap
         derived_access: BTreeMap::new(),
         references: Vec::new(),
     };
+    let plan = take_plan(&mut job);
     let command = command(
         &state,
         &job,
         BTreeMap::from([
-            (staging::INDEXES.into(), json!(indexes)),
-            (PLAN.into(), plan(&job)),
+            (
+                staging::INDEXES.into(),
+                serde_json::to_value(indexes).expect("indexes encode"),
+            ),
+            (PLAN.into(), plan),
         ]),
         vec![],
         false,
     );
-    let committed = persist(app, &state, command).await?;
-    Ok(json!({"revision":committed["revision"],"value":status(&job)}))
+    // The native target schema is now actually destroyed; only the bundle
+    // moved into the command. Grow its exclusive lease to the whole output.
+    // Root-caller and ingress leases remain unchanged throughout the attempt.
+    drop(schema_output);
+    // The command owns its serialized job metadata, but the native progress
+    // strings survive until the reply is built. Retain them separately before
+    // reusing the bundle/map lease for command coverage; neither caller input
+    // nor the command's copy can cover this independent holder.
+    let retained = app
+        .admission
+        .retain(admission::Class::Control, progress_bytes(&job))?;
+    let job = Held {
+        value: job,
+        retained,
+    };
+    let committed = persist_retained(app, &state, command, Some(bundle_output)).await?;
+    Ok(json!({"revision":committed["revision"],"value":status(&job.value)}))
 }
 
 async fn advance(app: &App, id: String, requested: Option<usize>) -> Result<Value, ApiError> {
@@ -790,7 +998,10 @@ pub(super) async fn administer(app: &App, input: Value) -> Result<Value, ApiErro
     let _input = app
         .admission
         .retain(admission::Class::Control, admission::input_bytes(&input))?;
-    match decode(&input)? {
+    // Keep this lease until the entire operation completes: the root router
+    // retains its input clone for leader-change forwarding. Consuming our copy
+    // must not credit that other holder's allocation.
+    match serde_json::from_value(input).map_err(|error| invalid(error.into()))? {
         Operation::Stage { request_id, bundle } => start(app, request_id, bundle).await,
         Operation::Status => {
             let _permit = admission::acquire_retained(app, admission::Class::Control).await?;
