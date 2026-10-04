@@ -255,7 +255,10 @@ test("huge raw JSON refuses before any detached snapshot or callback, and leaves
   assert.deepEqual(db.query("bookkeeping"), bookkeeping);
 });
 
-test("shared snapshot work does not reset between candidates and a whole failed call rolls back earlier cancellations", async () => {
+// expectedSourceDelta: parent approved bounded-prefix semantics on October 4,
+// 2026. The former all-quota rollback assertion is retained verbatim in the
+// handoff's historical-allquota.test.txt, NOT waived as a passing current test.
+test("shared snapshot work does not reset: a fully reserved prefix commits and the next untouched candidate waits", async () => {
   let calls = 0;
   const db = await fixture(() => { ++calls; return false; });
   for (const id of ["a", "b"]) {
@@ -263,9 +266,13 @@ test("shared snapshot work does not reset between candidates and a whole failed 
   }
   const before = db.query("all");
   const bookkeeping = db.query("bookkeeping");
-  budgetFailure(() => db.mutate("take"));
+  assert.deepEqual(db.mutate("take"), []);
   assert.equal(calls, 1);
-  assert.deepEqual(db.query("all"), before);
+  assert.deepEqual(db.query("all"), before.filter((row) => row.key[1] === "b"));
+  assert.deepEqual(db.query("bookkeeping"), bookkeeping);
+  assert.deepEqual(db.mutate("take"), []);
+  assert.equal(calls, 2);
+  assert.deepEqual(db.query("all"), []);
   assert.deepEqual(db.query("bookkeeping"), bookkeeping);
 });
 
@@ -376,7 +383,7 @@ test("64 refused candidates yield bounded progress and a subsequent call takes l
   assert.equal(claim.attempt, 1);
 });
 
-test("64 callback quarantines preserve exact originals and subsequent eligible work without lease writes", async () => {
+test("64 callback quarantines are an upper bound: completed prefixes preserve exact originals without lease writes", async () => {
   const originals = new Map<string, Job<Payload, Result>>();
   const db = await fixture((ctx, work, claim, previous) => {
     if (claim.id === "eligible") return true;
@@ -394,8 +401,17 @@ test("64 callback quarantines preserve exact originals and subsequent eligible w
   }
   db.mutate("work.enqueue", { id: "eligible", payload: payload() });
   const counters = db.query("bookkeeping");
-  assert.deepEqual(db.mutate("take"), []);
-  assert.deepEqual(db.query("bookkeeping"), counters);
+  const eligible = db.query("stored", "eligible");
+  while ([...originals.keys()].some((id) => db.query("stored", id)!.state === "pending")) {
+    const pendingBefore = [...originals.keys()].filter((id) => db.query("stored", id)!.state === "pending");
+    const claims = db.mutate("take");
+    // The last prefix may reach eligible after all 64 originals are completed.
+    if (claims.length > 0) {
+      assert.equal(claims[0].id, "eligible");
+      assert.equal(claims[0].token, 1);
+    } else assert.deepEqual(db.query("stored", "eligible"), eligible);
+    assert.ok(pendingBefore.some((id) => db.query("stored", id)!.state === "failed"));
+  }
   for (const [id, original] of originals) {
     const row = db.query("stored", id)!;
     assert.equal(row.state, "failed");
@@ -403,9 +419,13 @@ test("64 callback quarantines preserve exact originals and subsequent eligible w
     assert.equal(row.lease, null);
     assert.deepEqual((row.error as { original: Json }).original, original);
   }
-  const [claim] = db.mutate("take");
-  assert.equal(claim.id, "eligible");
-  assert.equal(claim.token, 1);
+  const held = db.query("stored", "eligible")!;
+  if (held.state !== "leased") {
+    assert.deepEqual(db.query("bookkeeping"), counters);
+    const [claim] = db.mutate("take");
+    assert.equal(claim.id, "eligible");
+    assert.equal(claim.token, 1);
+  } else assert.equal(held.lease!.token, 1);
 });
 
 test("ordinary direct no-admit calls retain their uncapped max contract", async () => {

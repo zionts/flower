@@ -225,7 +225,12 @@ export interface ClaimOptions<P = Json, R = Json> {
    * Both inputs are bounded JSON snapshots; the proposed claim is frozen too.
    * A refusal cancels an unchanged job and takes the next. A job the callback writes
    * or deletes is preserved, is not leased, and is not considered again in this call.
-   * At most 64 candidates are checked; all snapshots share one work/byte allowance.
+   * At most 64 candidates are checked; this is an upper bound, not a promise to
+   * examine all 64. One work/byte allowance reserves both snapshots and the full
+   * unchanged-row comparison before each callback. If the next candidate cannot
+   * fit after a completed prefix, that prefix commits and unconsidered jobs stay
+   * untouched. A first candidate that cannot fit, or any real host/guest failure,
+   * still aborts the whole mutation with EVALUATION_BUDGET (or its actual error).
    */
   readonly admit?: (claim: Claim<P>, previous: QueuePrevious<Job<P, R>>) => boolean;
 }
@@ -351,33 +356,56 @@ const MAX_COUNT_UP_TO = 10_000;
 const ADMIT_WORK = 100_000;
 const ADMIT_BYTES = 16 * 1024 * 1024;
 const ADMIT_DEPTH = 128;
-interface AdmissionBudget { work: number; bytes: number }
-function admissionCharge(budget: AdmissionBudget, work: number, bytes = 0): void {
+interface AdmissionBudget {
+  work: number;
+  bytes: number;
+  /** Already deducted from shared: current-side comparison credit, never refunded. */
+  readonly shared?: AdmissionBudget;
+}
+// Inaccessible identity, thrown ONLY by the prospective SDK guard. Neither a
+// callback error code nor a native/sticky resource failure can match this value.
+const admissionPrefixBoundary = Object.freeze({});
+function admissionFailure(): never {
+  return fail("EVALUATION_BUDGET", "Queue admission snapshot exceeds the guest work, byte or depth limit");
+}
+function admissionCharge(budget: AdmissionBudget, work: number, bytes = 0, prospective = false): void {
+  if (budget.shared !== undefined) {
+    // This credit is a partition of the original allowance, not fresh work. A
+    // larger callback replacement can spill only into that allowance's remainder.
+    const prepaid = Math.min(work, budget.work);
+    budget.work -= prepaid;
+    admissionCharge(budget.shared, work - prepaid, bytes, prospective);
+    return;
+  }
   if (work > budget.work || bytes > budget.bytes) {
-    fail("EVALUATION_BUDGET", "Queue admission snapshot exceeds the guest work or byte limit");
+    if (prospective) throw admissionPrefixBoundary;
+    admissionFailure();
   }
   budget.work -= work;
   budget.bytes -= bytes;
 }
 /** Preflight actual host JSON, without a key array, serializer, or copy tree. */
-function admissionPreflight(value: unknown, budget: AdmissionBudget, copy: boolean, depth = 0): void {
-  if (depth > ADMIT_DEPTH) fail("EVALUATION_BUDGET", "Queue admission JSON nesting exceeds 128");
+function admissionPreflight(value: unknown, budget: AdmissionBudget, copy: boolean, depth = 0, prospective = false): void {
+  if (depth > ADMIT_DEPTH) {
+    if (prospective) throw admissionPrefixBoundary;
+    admissionFailure();
+  }
   // Reserve traversal AND copying, or the current-row traversal/equality walk.
   // prepare() separately reserves the saved-side equality walk before copying.
   const work = 2;
-  admissionCharge(budget, work);
+  admissionCharge(budget, work, 0, prospective);
   if (value === null || typeof value === "boolean") {
-    admissionCharge(budget, 0, copy ? 5 : 0);
+    admissionCharge(budget, 0, copy ? 5 : 0, prospective);
     return;
   }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new TypeError("Queue admission requires finite JSON numbers");
-    admissionCharge(budget, 0, copy ? 24 : 0); // longest finite JSON number
+    admissionCharge(budget, 0, copy ? 24 : 0, prospective); // longest finite JSON number
     return;
   }
   if (typeof value === "string") {
     // UTF-16 length first: refuse huge strings before visiting their contents.
-    admissionCharge(budget, value.length * work, copy ? 2 : 0);
+    admissionCharge(budget, value.length * work, copy ? 2 : 0, prospective);
     if (!copy) return;
     for (let index = 0; index < value.length; ++index) {
       const unit = value.charCodeAt(index);
@@ -387,7 +415,7 @@ function admissionPreflight(value: unknown, budget: AdmissionBudget, copy: boole
         bytes = 4;
         ++index;
       } else if (unit >= 0xd800 && unit <= 0xdfff) bytes = 6;
-      admissionCharge(budget, 0, bytes);
+      admissionCharge(budget, 0, bytes, prospective);
     }
     return;
   }
@@ -397,15 +425,15 @@ function admissionPreflight(value: unknown, budget: AdmissionBudget, copy: boole
   if (array ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) {
     throw new TypeError("Queue admission requires plain native JSON");
   }
-  admissionCharge(budget, 0, copy ? 2 : 0);
+  admissionCharge(budget, 0, copy ? 2 : 0, prospective);
   if (array) {
     const length = Object.getOwnPropertyDescriptor(value, "length")!.value as number;
-    if (length > budget.work / work) admissionCharge(budget, length * work);
+    if (length > (budget.work + (budget.shared?.work ?? 0)) / work) admissionCharge(budget, length * work, 0, prospective);
     for (let index = 0; index < length; ++index) {
       const property = Object.getOwnPropertyDescriptor(value, String(index));
       if (!property?.enumerable || !("value" in property)) throw new TypeError("Queue admission requires dense native JSON arrays");
-      admissionCharge(budget, work, copy ? 1 : 0);
-      admissionPreflight(property.value, budget, copy, depth + 1);
+      admissionCharge(budget, work, copy ? 1 : 0, prospective);
+      admissionPreflight(property.value, budget, copy, depth + 1, prospective);
     }
   } else {
     // ctx.get returns native, validated JSON (no hidden/symbol properties or
@@ -414,9 +442,9 @@ function admissionPreflight(value: unknown, budget: AdmissionBudget, copy: boole
       const property = Object.getOwnPropertyDescriptor(value, key);
       if (property === undefined) continue;
       if (!property.enumerable || !("value" in property)) throw new TypeError("Queue admission requires JSON data properties");
-      admissionCharge(budget, work, copy ? 2 : 0);
-      admissionPreflight(key, budget, copy, depth + 1);
-      admissionPreflight(property.value, budget, copy, depth + 1);
+      admissionCharge(budget, work, copy ? 2 : 0, prospective);
+      admissionPreflight(key, budget, copy, depth + 1, prospective);
+      admissionPreflight(property.value, budget, copy, depth + 1, prospective);
     }
   }
 }
@@ -632,14 +660,17 @@ export function queue<P = Json, R = Json>(name: string, options: QueueOptions<P,
       // Reserve BOTH full traversals/copies before allocating the first detached
       // tree. No serializer, key-array allocation, Date, or context wrapper.
       const before = budget.work;
-      admissionPreflight(raw, budget, true);
-      // Even a callback that removes most fields must not make the saved-side
-      // comparison uncharged. Reserve its full walk NOW, before either copy.
-      admissionCharge(budget, (before - budget.work) / 2);
-      admissionPreflight(proposed, budget, true);
+      admissionPreflight(raw, budget, true, 0, true);
+      const rawWork = before - budget.work;
+      // Reserve BOTH sides of the worst-case unchanged-row comparison before
+      // either detached tree or callback. Saved-side equality is charged once;
+      // current-side traversal/equality is held as a private, nonrefundable credit.
+      admissionCharge(budget, rawWork / 2, 0, true);
+      admissionCharge(budget, rawWork, 0, true);
+      admissionPreflight(proposed, budget, true, 0, true);
       const previous = admissionCopy(raw);
       const claim = admissionCopy(proposed) as Claim<P>;
-      return { at, previous, claim };
+      return { at, previous, claim, comparison: { work: rawWork, bytes: 0, shared: budget } };
     }
     function grant(ctx: MutationContext, at: [string, string], raw: Job<P, R>, claim: Claim<P>, now: number): Claim<P> {
       const selected = effective(raw, now);
@@ -753,7 +784,16 @@ export function queue<P = Json, R = Json>(name: string, options: QueueOptions<P,
       const skipped: [string, string][] = [];
       let overtaken = false;
       while (claims.length < max && skipped.length < MAX_CLAIMS) {
-        const prepared = definer(ctx, () => prepare(ctx, owner, leaseMs, now, skipped, budget));
+        let prepared: ReturnType<typeof prepare>;
+        try {
+          prepared = definer(ctx, () => prepare(ctx, owner, leaseMs, now, skipped, budget));
+        } catch (error) {
+          // Catch outside definer's lift/run/finally-unlift, and by private
+          // identity ONLY. Real host/guest/callback errors always abort whole.
+          if (error !== admissionPrefixBoundary) throw error;
+          if (skipped.length === 0) admissionFailure();
+          break; // Completed prefix only; this candidate was never detached/admitted.
+        }
         if (prepared === null) break;
         skipped.push(prepared.at);
         // Critically OUTSIDE definer: applications cannot use admission to read
@@ -767,7 +807,7 @@ export function queue<P = Json, R = Json>(name: string, options: QueueOptions<P,
           // equality checks, never source/authentication authority.
           if (raw.state !== prepared.previous.state || raw.id !== prepared.previous.id ||
               raw.scope !== prepared.previous.scope || raw.attempts !== prepared.previous.attempts) return null;
-          admissionPreflight(raw, budget, false);
+          admissionPreflight(raw, prepared.comparison, false);
           if (!admissionEqual(raw, prepared.previous)) return null; // preserve replacement/quarantine
           if (!accepted) {
             ctx.delete(records, prepared.at); // ordinary unchanged refusal still cancels
