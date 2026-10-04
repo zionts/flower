@@ -43,7 +43,7 @@ impl Serialize for Registry<'_> {
 /// Serialization is counted through a fixed scalar writer BEFORE cloning any
 /// aliases, descriptors or signer data into a JSON tree. Tree shape is bounded
 /// by validated HttpMethod/TerminalMethod plus the method/encoded byte caps.
-pub(super) fn build(http: &BTreeMap<String, HttpMethod>) -> Result<Value> {
+pub(crate) fn build(http: &BTreeMap<String, HttpMethod>) -> Result<Value> {
     let mut count = 0;
     for (alias, method) in http.iter().filter(|(_, method)| method.terminal.is_some()) {
         count += 1;
