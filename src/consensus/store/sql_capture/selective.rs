@@ -79,7 +79,7 @@ impl Store {
         result
     }
 
-    fn sql_certificate_origin(
+    pub(super) fn sql_certificate_origin(
         &self,
         binding: Option<&PartitionBinding>,
         certificate: &SqlCaptureCertificate,

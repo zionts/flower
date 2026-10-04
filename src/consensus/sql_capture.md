@@ -496,3 +496,53 @@ coverage are a subsequent stage, not implicitly solved here. Atomic registry
 routing/startup warmth and real terminal authorization/execution/delivery also
 remain separate gates. Full Records snapshot admission stays None/default SQL
 stays disabled until the integrated gates actually pass.
+
+## Typed live-history followup — October 4
+
+`SqlCaptureDependency::HistoryIdentity` stamps only the existing O(1)
+`history:retention` identity generation, with Store/install/partition origin.
+It is a distinct private selector kind: it **does not cover ordinary Keys,
+KeyChunk, StringChunk or raw `$flower.retention` accounting**. A separately
+explicit physical point still has full physical-write-version semantics; do not
+substitute a semantic identity stamp for that raw value's coherence.
+
+`Consensus::sql_capture_history_identity(fence, certificate, buffer)` validates
+ALL dependencies at ONE publication and copies the COMPLETE bounded actual
+retention record into `SqlCapturedHistoryIdentity`. The output's buffer is
+private; only trusted crate-native decoder methods can inspect/consume it.
+Native decode/project happens after all source/TLS/exclusion references end and
+must retain only validated database/incarnation or explicitly checked native
+uninitialized absence. Raw temporary/accounting fields never enter callback
+lookup maps and must be discarded/unmapped after projection. There is no partial
+or chunk fallback; an expanding/corrupt/oversized body refuses the attempt.
+Production decoder/frame/stack/work/cancellation admission is not implemented
+by this storage-only callback interface.
+
+All **15 actual history tests passed**, including root and real scoped empty
+imports, receipt/accounting rewrites where the physical retention version
+changes while the identity generation remains stable, known absence then
+Initialize, Reincarnate invalidation and native HISTORY_REUSED rejection, actual
+Records remove/reinsert/identity ABA, all-support-dependency validation,
+wrong/retired bindings, cross-Store and real same-R snapshot install, dirty or
+partial buffer/actual oversized native GC cursor refusal, forbidden generic
+retention/archive coverage, and zero heap counters inside the real resident
+scope. These are native storage/coexistence results, not public SQL signing or
+terminal authorization acceptance.
+
+Prepared native range scratch now also records its exact partition bytes and
+refuses a mismatched actual backing before traversal. The actual A/B sentinel
+probe verifies no namespace B row or I/O/heap allocation can leak through A's
+backing with B's prepared bounds; correct A remains positive. An independent
+BTreeMap oracle verifies concatenated native/overlay slices' exact keys, order
+and JSON values for disk rows, overlay insertions/replacements, tombstones,
+empty/NUL/Unicode keys, small capacity, row/work budgets and continuation. Both
+followup regressions passed. Eager native cursor construction is separately
+bounded by the resident extent/depth allowance; `examined` charges entry/miss
+lookup steps, not an assertion that every B-tree page visit is an entry.
+
+An already COMPLETE point copied/decoded before physical rebase is safe at the
+same logical write version: ordinary `Records::rebase` moves identical logical
+values into a backing without changing their versions/generations. Raw encoding
+may change, so INCOMPLETE multi-chunk assembly must independently compare
+key/version/encoding/length/selected mode and contiguous offsets, and discard on
+mismatch; never splice merely because logical revision/version matches.

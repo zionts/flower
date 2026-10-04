@@ -757,3 +757,196 @@ fn sql_capture_full_row_slice_does_not_probe_a_cold_native_successor() {
     drop(records);
     reader.close().unwrap();
 }
+
+#[test]
+fn sql_capture_prepared_partition_mismatch_refuses_before_reading_another_namespace() {
+    let (db, _dir, reads, writes) = database(8 * 1024 * 1024);
+    let tx = db.begin_write().unwrap();
+    for (partition, value) in [("A", 1), ("B", 2)] {
+        tx.open_table(PAIR)
+            .unwrap()
+            .insert(
+                (partition.as_bytes(), b"sentinel".as_slice()),
+                super::super::super::backing::encode(
+                    value,
+                    format!("{{\"namespace\":{value}}}").as_bytes(),
+                )
+                .as_slice(),
+            )
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    let reader = db.begin_read().unwrap();
+    let table = Arc::new(reader.open_table(PAIR).unwrap());
+    for p in ["A", "B"] {
+        drop(table.get((p.as_bytes(), b"sentinel".as_slice())).unwrap());
+    }
+    let records = Records::backed(Arc::new(Backing::pair(table.clone(), "A".into())));
+    let request = SqlCaptureRequest {
+        selection: SqlCaptureSelection::Range {
+            lower: "",
+            upper: None,
+            after: None,
+        },
+        max_records: 32,
+        max_examined: 128,
+    };
+    let mut wrong = SqlCaptureScratch::for_partition(Some("B"), &request).unwrap();
+    let mut out = output();
+    let before = (
+        reads.load(Ordering::Relaxed),
+        writes.load(Ordering::Relaxed),
+    );
+    let (result, counts) = crate::consensus::sql_capture::allocation_probe::run(|| {
+        redb::with_resident_reads(32 * 1024 * 1024, || {
+            records.sql_capture_prepared(&request, &mut out, &mut wrong)
+        })
+    });
+    assert_eq!(result.unwrap_err(), SqlCaptureError::SnapshotChanged);
+    assert_eq!(counts, crate::allocation_probe::Counts::default());
+    assert_eq!(out.records().len(), 0);
+    assert_eq!(
+        before,
+        (
+            reads.load(Ordering::Relaxed),
+            writes.load(Ordering::Relaxed)
+        )
+    );
+    let mut right = SqlCaptureScratch::for_partition(Some("A"), &request).unwrap();
+    let mut out = output();
+    redb::with_resident_reads(32 * 1024 * 1024, || {
+        records.sql_capture_prepared(&request, &mut out, &mut right)
+    })
+    .unwrap();
+    let row = out.records().next().unwrap();
+    let json =
+        super::super::super::packed::unpack(&out.bytes()[row.body.clone().unwrap()]).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&json).unwrap()["namespace"],
+        1
+    );
+    drop(records);
+    drop(table);
+    reader.close().unwrap();
+}
+
+#[test]
+fn sql_capture_merged_pagination_matches_independent_oracle_with_replacements_and_tombstones() {
+    const PLAIN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("merge-oracle");
+    let (db, _dir, _reads, _writes) = database(8 * 1024 * 1024);
+    let tx = db.begin_write().unwrap();
+    let mut oracle = std::collections::BTreeMap::<String, Value>::new();
+    for n in 0..300 {
+        let key = format!("k{n:04}");
+        let value = serde_json::json!({"n":n,"source":"disk"});
+        tx.open_table(PLAIN)
+            .unwrap()
+            .insert(
+                key.as_bytes(),
+                super::super::super::backing::encode(
+                    n + 5000,
+                    serde_json::to_vec(&value).unwrap().as_slice(),
+                )
+                .as_slice(),
+            )
+            .unwrap();
+        oracle.insert(key, value);
+    }
+    for key in ["", "\u{0}", "k0001\u{0}", "東京🌸"] {
+        let value = serde_json::json!({"special":key});
+        tx.open_table(PLAIN)
+            .unwrap()
+            .insert(
+                key.as_bytes(),
+                super::super::super::backing::encode(
+                    9000,
+                    serde_json::to_vec(&value).unwrap().as_slice(),
+                )
+                .as_slice(),
+            )
+            .unwrap();
+        oracle.insert(key.into(), value);
+    }
+    tx.commit().unwrap();
+    let reader = db.begin_read().unwrap();
+    let table = reader.open_table(PLAIN).unwrap();
+    for row in table.range::<&[u8]>(..).unwrap() {
+        drop(row.unwrap());
+    }
+    let mut records = Records::backed(Arc::new(Backing::plain(table)));
+    for n in 0..300 {
+        let key = format!("k{n:04}");
+        if n % 3 == 0 {
+            records.remove(&key);
+            oracle.remove(&key);
+        } else if n % 5 == 0 {
+            let value = serde_json::json!({"n":n,"source":"overlay"});
+            records.insert(key.clone(), value.clone());
+            oracle.insert(key, value);
+        }
+    }
+    for n in 0..140 {
+        let key = format!("k{n:04}-overlay");
+        let value = serde_json::json!({"insert":n});
+        records.insert(key.clone(), value.clone());
+        oracle.insert(key, value);
+    }
+    let expected: Vec<_> = oracle.into_iter().collect();
+    for (max_records, max_examined, capacity) in [
+        (1, 4, SQL_CAPTURE_MAX_BYTES),
+        (7, 16, 512),
+        (32, 128, SQL_CAPTURE_MAX_BYTES),
+    ] {
+        let mut actual = Vec::new();
+        let mut after = None::<String>;
+        for slice in 0..2000 {
+            let request = SqlCaptureRequest {
+                selection: SqlCaptureSelection::Range {
+                    lower: "",
+                    upper: None,
+                    after: after.as_deref(),
+                },
+                max_records,
+                max_examined,
+            };
+            let mut scratch = SqlCaptureScratch::for_partition(None, &request).unwrap();
+            let mut out =
+                SqlCaptureBuffer::from_reserved(vec![0; capacity].into_boxed_slice()).unwrap();
+            redb::with_resident_reads(32 * 1024 * 1024, || {
+                records.sql_capture_prepared(&request, &mut out, &mut scratch)
+            })
+            .unwrap();
+            assert!(out.examined() <= max_examined);
+            assert!(out.records().len() <= max_records);
+            for row in out.records() {
+                let key = std::str::from_utf8(&out.bytes()[row.key.clone()])
+                    .unwrap()
+                    .to_owned();
+                let raw =
+                    super::super::super::packed::unpack(&out.bytes()[row.body.clone().unwrap()])
+                        .unwrap();
+                let value = serde_json::from_slice::<Value>(&raw).unwrap();
+                actual.push((key, value));
+            }
+            if out.complete() {
+                break;
+            }
+            let continuation = out
+                .continuation()
+                .expect("partial slice consumed a key")
+                .to_owned();
+            assert!(after.as_ref().is_none_or(|after| continuation > *after));
+            after = Some(continuation);
+            assert!(
+                slice < 1999,
+                "merged copier failed to make bounded progress"
+            );
+        }
+        assert_eq!(
+            actual, expected,
+            "rows={max_records},work={max_examined},capacity={capacity}"
+        );
+    }
+    drop(records);
+    reader.close().unwrap();
+}
