@@ -17,7 +17,11 @@ trait RegistryAdmission {
 
 RegistryPoolLimits { bytes, cells } // lower-only; HARD = 16 MiB / 256
 RegistryPool::reservation_layout::<A>(limits) -> RegistryPoolLayout
-RegistryPool::admit(&owner, limits, check) -> RegistryPool
+RegistryPool::admit(&owner, limits, check) -> RegistryPool // bare component only
+RegistryDirectoryLimits { heads, key_bytes } // explicit dimensions, heads <= 256
+RegistryPool::reservation_layout_with_directory::<A>(limits, directory) -> RegistryPoolLayout
+RegistryPool::admit_with_directory(&owner, limits, directory, check) -> RegistryPool
+pool.directory() -> lifetime-tied Directory // requires combined admission
 pool.try_clone() -> RegistryPool
 pool.capacity() -> usize
 pool.mapped_bytes() -> usize
@@ -31,14 +35,15 @@ The associated lease is concrete and stored **inline**, with its actual `Layout`
 
 One anonymous mapping contains:
 
-1. `PoolControl`, including intrusive owner count, checked namespace-UID counter, a nonwaiting atomic admission gate, fixed slot count, actual offsets/extent and concrete generic destruction callback.
+1. `PoolControl`, including distinct intrusive overall-owner and external-handle counts, checked namespace-UID counter, a nonwaiting atomic admission gate, fixed slot count, actual directory/lease/slot offsets/extent and concrete generic destruction callback.
 2. The native `A::Lease` value, at its real alignment.
 3. A fixed array of `RegistrySlot` objects.
-4. Checked system-page rounding of the complete combined `Layout`.
+4. When requested, the complete current-only `DirectoryLayout`: actual control, fixed scalar heads, explicitly initialized actual `Option<RegistryCell>` owners and exact variable UTF-8 key arena.
+5. Checked system-page rounding of the complete combined `Layout`. No component is independently page-rounded or separately admitted.
 
-`RegistryPoolLayout` reports `mapped_bytes`, effective `cells`, actual `control_bytes`, `lease_bytes`, `slot_bytes`, `slot_header_bytes`, `payload_bytes` and actual `page_bytes`. Lower byte limits reduce **effective** usable cells; a requested 256 is never reported unless it fits. If not even one cell fits, startup construction refuses before admission/mapping.
+`RegistryPoolLayout` reports `mapped_bytes`, effective `cells`, actual `control_bytes`, `lease_bytes`, `slot_bytes`, `slot_header_bytes`, `payload_bytes` and actual `page_bytes`, `directory_bytes`, `heads` and `key_bytes`. Lower byte limits reduce **effective** usable cells; a requested 256 is never reported unless it fits. If not even one cell fits, startup construction refuses before admission/mapping.
 
-All mapped bytes—including lease/control/header/padding—are explicitly written before publication. No source is accepted during construction. Cancellation/check failure drops the mapping **before** its external lease. On the last pool-or-cell owner, a monomorphized callback moves the inline lease to the caller's native stack, unmaps the original exact extent, then drops that lease. An unmap invariant failure aborts without falsely releasing a still-live allocation.
+All mapped bytes—including lease/control/header/padding—are explicitly written before publication. No source is accepted during construction. Cancellation/check failure drops the mapping **before** its external lease. A final construction check runs after directory initialization and before moving the inline lease. On the last pool-or-cell owner, a monomorphized callback moves the inline lease to the caller's native stack, unmaps the original exact extent, then drops that lease. An unmap invariant failure aborts without falsely releasing a still-live allocation.
 
 This is a mapped-byte/object-layout contract, **not a claim that these bytes alone equal all process RSS, native stack, loader/TLS, parser or kernel memory**.
 
@@ -59,7 +64,21 @@ Slot claims serialize through one in-map atomic try gate. Contention is `Busy`, 
 
 Slot lifecycle is encoded in the in-map refcount: `0` free, `usize::MAX` exclusively staging/reclaiming, otherwise a checked positive immutable-reader count. Last drop first transitions to exclusive reclaiming, decrements live-slot accounting, then publishes free. It never publishes reusable zero before its own accounting/destruction work finishes. Refcount increments fail closed rather than wrapping. No raw/weak handle can resurrect a free slot.
 
+The last **external pool handle** clears current directory cell owners while retaining its own independent overall mapping owner, then releases that owner. This breaks the directory/cell self-mapping reference cycle. Borrowed views are tied to external handles and their Drop is inert; detached cells/staging witnesses may retain the map after external handles reach zero but cannot access its directory. Failed external-handle increments roll back the preceding overall-owner increment.
+
 Pool/cell handles are pointer-only but their *containing* futures, native parser data, arrays, stacks, etc. require separate caller admission. The arena is held until the final owner even if every ordinary Store handle has gone. Nothing in this module owns a Store, Database, Snapshot, Records, Backing, source value, table or transaction.
+
+## Exactly located process-global bootstrap
+
+`bootstrap_required_layout() -> StaticRegion` returns the actual `SOURCE_REGISTRY` object address, size/alignment and checked start/end system-page coverage. It is **not sizeof-only**, and does not assume its pages are disjoint from cancellation/control/native-owner statics. The native constructor must charge the unique union of all actual static page spans within the SAME approved node baseline.
+
+`unsafe install_source_registry(pool, exact_charged_region)` installs exactly once into `OnceLock<RegistryPool>`. It verifies the exact current static region and initialized combined directory; bare component pools, wrong spans and duplicates refuse and return their actual rejected pool for explicit cleanup. Its unsafe caller contract requires real prepaid backing before **every production Store/Consensus opens**. The scalar attestation and admission trait are not verified backing evidence.
+
+`source_registry()` returns only this process-lifetime owner, with missing bootstrap `Unsupported`, never inferred empty. No reset/default/per-Store construction exists. The accepted strong pool stays until process exit; no early baseline credit is claimed. Isolated child-process tests cover separate startups without resetting global counters or the OnceLock.
+
+## Measured layouts, not portable allowance estimates
+
+On the tested x86_64 platform, `PoolControl` is **192 bytes**; each cell slot is **32,840 bytes** (72 actual header + 32,768 payload). With the test fixture's actual **128-byte inline lease**, 256 cells + 256 directory heads + 10,000 key bytes map **8,445,952 bytes** on 4,096-byte pages. The native NodeAdmission lease is a different concrete type: recompute `reservation_layout_with_directory::<ActualAdmission>`, never adopt the fixture's lease layout or allocator estimates. Directory component details are in `DIRECTORY.md`.
 
 ## Deliberately unresolved source coupling
 
@@ -68,7 +87,7 @@ Pool/cell handles are pointer-only but their *containing* futures, native parser
 - Current-only ownership stays outside Snapshot/Records/PartitionState/copy bases/queued historical StoredState. Native envelopes alone may retain charged old metadata cells.
 - Atomic classify-and-select must validate the actual Store/install/namespace/code triple under one continuous publication guard. An ordinary Snapshot is cloned only after dropping raw resident/source views and **before releasing that same guard**. Terminal selection returns no ordinary root.
 - Missing/uninstalled registry is distinct from committed format-1 `methods:{}`. No legacy/schema fallback, no permanent cold-only ordinary dispatch.
-- **Ordinary namespace length:** cells now retain only private source-issued namespace UID + epoch; no name or 4 KiB binding cap is imposed by this primitive. The checked UID counter is inside the admitted mapping. Source must still correlate the UID with the actual native Store/name/epoch under its current publication, using an exactly admitted current-only adjunct/directory. Issuing a UID alone does not prove that correlation. No caller hash, guessed pointer, zero UID or sentinel serves as namespace authority.
+- **Ordinary namespace length:** cells now retain only private source-issued namespace UID + epoch; no name or 4 KiB binding cap is imposed by this primitive. The checked UID counter is inside the admitted mapping. Source must still correlate the UID with the actual native Store/name/epoch under its current publication, using the combined exactly admitted current-only directory. Borrowed production views additionally reject cells from another pool using actual allocation/accounting identity; this is not Store/publication authority. Issuing a UID alone does not prove that correlation. No caller hash, guessed pointer, zero UID or sentinel serves as namespace authority.
 - **Post-quorum capacity:** local sidecar capacity failure while applying an already-committed Raft command must not manufacture a different locally rejected command result. Native preproposal staging and follower/replay behavior need an explicit consistent contract; storage fail-stop/replay is distinct from typed admission refusal before proposal.
 - Startup/crash/replay/install/import/freeze/retire/discard, late shared Store open, native global-owner/metrics/operator config, and every cache/hint/watch/fresh-fallback route still require source-grounded tests.
 
@@ -77,3 +96,7 @@ Pool/cell handles are pointer-only but their *containing* futures, native parser
 An isolated harness compiles these exact production module files and the single shared test allocator probe. It compiles the exact pool module without a binding shim; it does **not** prove Store/binding/publication/routing semantics. Unit-test fixture origin scalars are not source-issued registry-envelope authority. Native pool tests cover exact page/layout/lease accounting, lower effective slots, hard bounds, required shared owner, old/current/staging peaks, last-owner unmap-before-release, bounded payload/private UID, deterministic moving-vacancy refusal distinction, failed/cancelled staging, parallel producers/readers, checked refcount exhaustion, unwind and zero Rust heap operations for slot/copy/clone/refusal/release.
 
 Actual results and full Flower checks must be recorded separately; do not turn a unit/harness success into useful ordinary warm-start or SQL HTTP acceptance.
+
+Latest frozen-stage evidence: the exact-source standalone harness passed **44/44 debug and 44/44 release** tests, with strict all-target Clippy (`-D warnings`). Actual Flower post-bootstrap results are recorded in the stage handoff; do not substitute the earlier pre-bootstrap 41-test run. Tests cover constructor cancellation/unwind, zero-sized leases, refcount rollback/concurrency, foreign-pool rejection, process-global isolated startup and the owned directory positives. Rust heap-operation counters do not prove native allocator/TLS/kernel/physical backing or finite source-worker stacks.
+
+Post-bootstrap **actual Flower** checks (October 4): `cargo test --locked -p flower --features sql --lib sql_registry -- --test-threads=1 --nocapture`: **43 passed, zero failed/ignored** (the standalone allocator positive control is outside this filter); locked default library check, `cargo fmt --all --check` and `git diff --check` PASS. SQL library Clippy exited 0 with **95 Flower warnings**, largely inactive staged registry/directory/bootstrap APIs plus earlier source warnings; vendored im emitted 75 inherited warnings separately. This is not strict whole-library warning-clean status. No full workspace, JS suite, E2E or useful public SQL acceptance is newly claimed.
