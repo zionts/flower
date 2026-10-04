@@ -100,7 +100,7 @@ async fn record(node: &Node, points: &mut Vec<(u64, u64, Snapshot)>) {
     tokio::time::sleep(Duration::from_millis(15)).await;
     let time = now_ms();
     let index = node.raft().metrics().last_applied.unwrap().index;
-    points.push((time, index, node.raft().local_snapshot().await));
+    points.push((time, index, node.raft().local_snapshot().await.unwrap()));
     tokio::time::sleep(Duration::from_millis(15)).await;
 }
 
@@ -219,7 +219,7 @@ async fn backups_restore_the_state_at_any_point_in_time_or_index_and_survive_an_
         assert_eq!(through.state, *expected, "restore through index {index}");
     }
     let latest = restored(&config, RestorePoint::Latest).await;
-    assert_eq!(latest.state, node.raft().local_snapshot().await);
+    assert_eq!(latest.state, node.raft().local_snapshot().await.unwrap());
     let final_index = latest.summary["restored"]["index"].as_u64().unwrap();
     assert_eq!(
         Some(final_index),
@@ -293,7 +293,10 @@ async fn backups_restore_the_state_at_any_point_in_time_or_index_and_survive_an_
     };
     restored_node.start_with_listener(listener).await;
     leader(std::slice::from_ref(&restored_node)).await;
-    assert_eq!(restored_node.raft().local_snapshot().await, latest.state);
+    assert_eq!(
+        restored_node.raft().local_snapshot().await.unwrap(),
+        latest.state
+    );
     let term = restored_node.raft().metrics().current_term;
     assert!(term > 1 << 20, "term {term}");
     write(&restored_node, 99, 3, &mut revision).await;
@@ -326,7 +329,10 @@ async fn backups_restore_the_state_at_any_point_in_time_or_index_and_survive_an_
     // The newest generation restores the new cluster's writes; the old one,
     // named, its own history.
     let newest = restored(&config, RestorePoint::Latest).await;
-    assert_eq!(newest.state, restored_node.raft().local_snapshot().await);
+    assert_eq!(
+        newest.state,
+        restored_node.raft().local_snapshot().await.unwrap()
+    );
     let data = tempfile::tempdir().unwrap();
     let old = crate::consensus::restore_backup(RestoreOptions {
         config: config.clone(),
@@ -394,7 +400,10 @@ async fn a_new_leader_and_a_restarted_cluster_continue_the_generation() {
     assert_eq!(status["generation"], generation.as_str());
     assert_eq!(generations(&backups), vec![generation.clone()]);
     let latest = restored(&config, RestorePoint::Latest).await;
-    assert_eq!(latest.state, nodes[third].raft().local_snapshot().await);
+    assert_eq!(
+        latest.state,
+        nodes[third].raft().local_snapshot().await.unwrap()
+    );
 
     // A generation in another backup format (1: no `format`) isn't
     // continued: the next leader starts one of its own, and restores skip it.
@@ -430,7 +439,10 @@ async fn a_new_leader_and_a_restarted_cluster_continue_the_generation() {
     assert_eq!(listed[1]["reason"], "format");
     assert_eq!(listed[1]["previous"], generation.as_str());
     let latest = restored(&config, RestorePoint::Latest).await;
-    assert_eq!(latest.state, nodes[fourth].raft().local_snapshot().await);
+    assert_eq!(
+        latest.state,
+        nodes[fourth].raft().local_snapshot().await.unwrap()
+    );
     for node in &mut nodes {
         node.stop().await;
     }

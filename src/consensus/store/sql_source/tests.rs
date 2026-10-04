@@ -164,6 +164,19 @@ async fn sql_source_actual_publication_failure_marks_only_affected_store_before_
         SourceStatus::Fatal
     );
     assert!(failed.check_availability(None).is_err());
+    // Every concrete source-cloning/control accessor rejects under the SAME
+    // Pubread before looking up a row/receipt/partition or cloning either root.
+    assert!(failed.snapshot_for(None).await.is_err());
+    assert!(failed.snapshot_for(Some("receipt")).await.is_err());
+    assert!(failed.snapshot_for_many(&["receipt".into()]).await.is_err());
+    assert!(failed.snapshot_for_writer().await.is_err());
+    assert!(failed.partition_infos().is_err());
+    assert!(failed.partition_info("missing").is_err());
+    assert!(failed.partition_state("missing").is_err());
+    assert!(failed.read_fence().is_err());
+    assert!(healthy.snapshot_for(None).await.is_ok());
+    assert!(healthy.snapshot_for_writer().await.is_ok());
+    assert!(healthy.partition_infos().unwrap().is_empty());
     assert!(healthy.check_availability(None).is_ok());
     // A successful actual guarded publication can release without poisoning
     // the healthy Store; completion doesn't reset the failed Store.
@@ -203,4 +216,48 @@ async fn sql_source_actual_writer_basis_refuses_fatal_before_clone_and_before_fi
         !sampled.load(Ordering::Relaxed),
         "fatal source must not reach the final clock/authorization decision"
     );
+}
+
+#[tokio::test]
+async fn sql_source_real_apply_guard_completes_and_fatal_store_cannot_publish_another_entry() {
+    fixture::bootstrap().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(1, directory.path().into()).await.unwrap();
+    let entry = |index, revision| Entry {
+        log_id: LogId::new(openraft::CommittedLeaderId::new(3, 1), index),
+        payload: EntryPayload::Normal(RaftCommand::Single(Commit {
+            sql_commit_before: None,
+            internal: true,
+            request_id: format!("source-guard-{index}"),
+            fingerprint: "guard".into(),
+            expected_revision: revision,
+            puts: BTreeMap::from([("value".into(), serde_json::json!(index))]),
+            deletes: Vec::new(),
+            result: Value::Null,
+        })),
+    };
+    assert!(matches!(
+        store.apply([entry(1, 0)]).await.unwrap()[0],
+        ApplyResult::Committed(_)
+    ));
+    assert_eq!(store.snapshot_for(None).await.unwrap().data["value"], 1);
+    assert_eq!(
+        pool()
+            .unwrap()
+            .directory()
+            .unwrap()
+            .store_status_native(store.inner.capture_identity)
+            .unwrap(),
+        SourceStatus::Ready
+    );
+    store.inner.persistence.drain().await.unwrap();
+    let before = store.snapshot().await; // test-only state inspection, not serving
+    drop(PublicationGuard::acquire(&store.inner).unwrap());
+    assert!(store.apply([entry(2, 1)]).await.is_err());
+    assert_eq!(store.snapshot().await, before);
+    assert_eq!(
+        store.inner.state.read().await.last_applied.unwrap().index,
+        1
+    );
+    assert!(store.snapshot_for(None).await.is_err());
 }

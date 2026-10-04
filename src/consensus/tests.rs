@@ -648,7 +648,7 @@ async fn commit_group_limits_are_checked_before_proposing_a_log_entry() {
     );
     let error = node.raft().commit_many(vec![oversized]).await.unwrap_err();
     assert!(error.to_string().contains("FLOWER_TRANSACTION_MAX_BYTES"));
-    assert_eq!(node.raft().local_snapshot().await.revision, 0);
+    assert_eq!(node.raft().local_snapshot().await.unwrap().revision, 0);
     assert_eq!(node.raft().metrics().last_applied, None);
     node.stop().await;
 }
@@ -710,7 +710,7 @@ async fn projected_reads_preserve_quorum_revision_data_and_only_the_requested_re
     assert!(replay.duplicate);
     assert_eq!(replay.revision, 1);
     assert_eq!(replay.result, json!({"written": 10}));
-    assert_eq!(node.raft().local_snapshot().await, full);
+    assert_eq!(node.raft().local_snapshot().await.unwrap(), full);
     node.stop().await;
 }
 
@@ -900,7 +900,7 @@ async fn hostname_alias_of_one_process_cannot_supply_a_second_vote() {
             .await
             .is_err()
     );
-    assert_eq!(node.raft().local_snapshot().await.revision, 0);
+    assert_eq!(node.raft().local_snapshot().await.unwrap().revision, 0);
     node.stop().await;
 }
 
@@ -1101,7 +1101,7 @@ async fn leader(nodes: &[Node]) -> usize {
 async fn wait_revision(node: &Node, revision: u64) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if node.raft().local_snapshot().await.revision == revision {
+        if node.raft().local_snapshot().await.unwrap().revision == revision {
             return;
         }
         assert!(
@@ -1285,7 +1285,7 @@ async fn leader_restarted_with_lost_appends_does_not_resume_its_term() {
     loop {
         let current = leader(&nodes).await;
         let expected = nodes[current].raft().read().await.ok();
-        let local = nodes[first].raft().local_snapshot().await;
+        let local = nodes[first].raft().local_snapshot().await.unwrap();
         if expected.is_some_and(|expected| expected.revision == 5 && local == expected) {
             break;
         }
@@ -1395,7 +1395,13 @@ async fn slow_snapshot_catch_up_does_not_restart_itself_through_elections() {
     nodes[lagging].restart().await;
     let deadline = Instant::now() + Duration::from_secs(60);
     // Installing publishes the state before Raft's metrics show the snapshot.
-    while nodes[lagging].raft().local_snapshot().await.revision != 3
+    while nodes[lagging]
+        .raft()
+        .local_snapshot()
+        .await
+        .unwrap()
+        .revision
+        != 3
         || nodes[lagging].raft().metrics().snapshot.is_none()
     {
         assert!(
@@ -1475,7 +1481,7 @@ async fn three_node_snapshot_failover_restart_and_quorum_loss() {
     nodes[lagging].restart().await;
     wait_revision(&nodes[lagging], 6).await;
     assert_eq!(
-        nodes[lagging].raft().local_snapshot().await,
+        nodes[lagging].raft().local_snapshot().await.unwrap(),
         nodes[first_leader].raft().read().await.unwrap()
     );
     assert!(
@@ -1547,6 +1553,7 @@ async fn three_node_snapshot_failover_restart_and_quorum_loss() {
             .raft()
             .local_snapshot()
             .await
+            .unwrap()
             .revision,
         8
     );

@@ -92,7 +92,7 @@ async fn sql_commit_native_authorized_proposal_can_flush_after_expiry_but_later_
             panic!("SQL admission witness missing")
         };
         assert!(sql_admission.valid(command, entry.log_id));
-        assert_eq!(consensus.local_snapshot().await, baseline);
+        assert_eq!(consensus.local_snapshot().await.unwrap(), baseline);
         tokio::time::sleep(Duration::from_millis(
             before.saturating_sub(clock.sample_after(0).unwrap()) + 30,
         ))

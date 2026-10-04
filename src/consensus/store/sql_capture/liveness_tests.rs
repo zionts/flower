@@ -577,7 +577,7 @@ async fn sql_capture_liveness_cancelled_controller_retains_only_copied_input() {
                 .store
                 .partition_snapshot(binding, None, false)
                 .unwrap(),
-            None => fixture.store.snapshot_for(None).await,
+            None => fixture.store.snapshot_for(None).await.unwrap(),
         };
         assert_eq!(
             snapshot.data.get("source:[\"rows\",\"00000000\"]").unwrap()["n"],

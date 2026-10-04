@@ -330,18 +330,6 @@ impl From<&StoredState> for Published {
     }
 }
 
-fn publish(lock: &PublishedLock<Published>, state: &StoredState) {
-    let mut next = Published::from(state);
-    let previous = {
-        let mut guard = lock.write().expect("published state lock");
-        next.installation = guard.installation;
-        std::mem::replace(&mut *guard, next)
-    };
-    // A snapshot installation can replace the entire tree. Free its old nodes
-    // outside the publication lock rather than making new readers wait.
-    drop(previous);
-}
-
 /// A log entry as stored: its JSON, packed. Snapshot byte triggers count the
 /// JSON, which is what replaying it costs.
 fn encode_log(profile: &mut StorageTrace, entry: &Entry<TypeConfig>) -> anyhow::Result<Vec<u8>> {
@@ -848,15 +836,19 @@ impl Store {
         Ok(())
     }
 
+    /// Test-only state inspection. Production never bypasses guarded publication.
+    #[cfg(test)]
     pub(super) async fn snapshot(&self) -> Snapshot {
         self.inner.state.read().await.application.clone()
     }
 
     /// Queries need no receipts; a projected mutation read retains only the
     /// requested receipt allocation from the same published data revision.
-    pub(super) async fn snapshot_for(&self, request_id: Option<&str>) -> Snapshot {
+    pub(super) async fn snapshot_for(&self, request_id: Option<&str>) -> anyhow::Result<Snapshot> {
         let state = self.inner.published.read().expect("published state lock");
-        Snapshot {
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
+        Ok(Snapshot {
             revision: state.revision,
             data: state.data.clone(),
             requests: request_id
@@ -864,7 +856,7 @@ impl Store {
                 .map(|(id, receipt)| (id.to_owned(), receipt.clone()))
                 .into_iter()
                 .collect(),
-        }
+        })
     }
 
     /// The log position and application revision come from the same atomic
@@ -934,9 +926,14 @@ impl Store {
         }))
     }
 
-    pub(super) async fn snapshot_for_many(&self, request_ids: &[String]) -> Snapshot {
+    pub(super) async fn snapshot_for_many(
+        &self,
+        request_ids: &[String],
+    ) -> anyhow::Result<Snapshot> {
         let state = self.inner.published.read().expect("published state lock");
-        Snapshot {
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
+        Ok(Snapshot {
             revision: state.revision,
             data: state.data.clone(),
             requests: request_ids
@@ -944,36 +941,38 @@ impl Store {
                 .filter_map(|id| state.requests.get_shared(id).map(|value| (id, value)))
                 .map(|(id, receipt)| (id.clone(), receipt.clone()))
                 .collect(),
-        }
+        })
     }
 
     /// Full writer baseline: cloning both persistent roots is O(1), including
     /// arbitrarily old request IDs that can arrive in later pipeline groups.
-    pub(super) async fn snapshot_for_writer(&self) -> Snapshot {
+    pub(super) async fn snapshot_for_writer(&self) -> anyhow::Result<Snapshot> {
         let state = self.inner.published.read().expect("published state lock");
-        Snapshot {
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
+        Ok(Snapshot {
             revision: state.revision,
             data: state.data.clone(),
             requests: state.requests.clone(),
-        }
+        })
     }
 
-    pub(super) fn partition_infos(&self) -> Vec<PartitionInfo> {
-        self.inner
-            .published
-            .read()
-            .expect("published state lock")
+    pub(super) fn partition_infos(&self) -> anyhow::Result<Vec<PartitionInfo>> {
+        let state = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
+        Ok(state
             .partitions
             .iter()
             .map(|(_, state)| state.info.clone())
-            .collect()
+            .collect())
     }
 
     pub(super) fn partition_info(&self, id: &str) -> anyhow::Result<PartitionInfo> {
-        self.inner
-            .published
-            .read()
-            .expect("published state lock")
+        let state = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
+        state
             .partitions
             .get(id)
             .map(|state| state.info.clone())
@@ -981,10 +980,10 @@ impl Store {
     }
 
     pub(super) fn partition_state(&self, id: &str) -> anyhow::Result<PartitionState> {
-        self.inner
-            .published
-            .read()
-            .expect("published state lock")
+        let state = self.inner.published.read().expect("published state lock");
+        #[cfg(feature = "sql")]
+        sql_source::require_ready(&self.inner)?;
+        state
             .partitions
             .get(id)
             .cloned()
@@ -1829,7 +1828,6 @@ impl RaftStateMachine<TypeConfig> for Store {
             .map_err(|error| io_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
         let mut guard = self.inner.state.clone().write_owned().await;
         profile.phase(StoragePhase::StateLock);
-        let published = self.inner.published.clone();
         let lazy = self.inner.lazy.clone();
         let work = self.database_work();
         // Apply, publish and queue the redb projection without taking the I/O
@@ -1852,6 +1850,7 @@ impl RaftStateMachine<TypeConfig> for Store {
         let backup = self.inner.backup.clone();
         let responses = tokio::task::spawn_blocking(move || {
             let weak = Arc::downgrade(&source_lifetime);
+            let source = &*source_lifetime;
             let result = work.run(move |db| -> anyhow::Result<_> {
             let span = profile.span();
             let _entered = span.enter();
@@ -2005,6 +2004,13 @@ impl RaftStateMachine<TypeConfig> for Store {
                     written.push(write.changes(id));
                 }
             }
+            // Arm fail-stop under the actual SAME Published write lock before
+            // changing live state. A partial mutation, allocation panic or queue
+            // submission unwind marks only this Store Fatal before unlocking.
+            #[cfg(feature = "sql")]
+            let mut publication = sql_source::PublicationGuard::acquire(source)?;
+            #[cfg(not(feature = "sql"))]
+            let mut publication = source.published.write().expect("published state lock");
             for (_, mut write) in partition_writes {
                 write.stamp(sequence);
                 guard.partitions.insert(write.state);
@@ -2016,7 +2022,9 @@ impl RaftStateMachine<TypeConfig> for Store {
             guard.membership = metadata.membership;
             lazy.update_membership(&guard.membership);
             snapshot_accounting.applied(applied_bytes,guard.last_applied.map(|id|id.index));
-            publish(&published, &guard);
+            let mut next_publication = Published::from(&*guard);
+            next_publication.installation = publication.installation;
+            let previous = std::mem::replace(&mut *publication, next_publication);
             if let Some(applied) = guard.last_applied {
                 backup.applied(applied.index);
             }
@@ -2027,6 +2035,12 @@ impl RaftStateMachine<TypeConfig> for Store {
             // Queue under the guard: whoever next observes this state, even
             // after this future is cancelled, also finds its write submitted.
             persistence.submit(weak, holders, write);
+            #[cfg(feature = "sql")]
+            publication.complete();
+            #[cfg(not(feature = "sql"))]
+            drop(publication);
+            // The detached old roots are released outside Pubwrite.
+            drop(previous);
             profile.phase(StoragePhase::Publish);
             profile.report(true);
             Ok(responses)

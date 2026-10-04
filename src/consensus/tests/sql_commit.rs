@@ -44,7 +44,7 @@ async fn sql_commit_native_core_queue_expiry_refuses_before_any_log_id_or_payloa
         ))
         .await;
         assert!(clock.sample_after(0).unwrap() > before);
-        assert_eq!(node.raft().local_snapshot().await, baseline);
+        assert_eq!(node.raft().local_snapshot().await.unwrap(), baseline);
         release.send(()).unwrap();
         let error = writing.await.unwrap_err();
         assert!(crate::sql_commit::is_expired(&error), "{error}");
@@ -116,7 +116,7 @@ async fn sql_commit_native_logged_admission_is_deterministic_across_late_replay_
         .await
         .unwrap();
     assert!(matches!(&results[0], ApplyResult::Committed(value) if value.duplicate));
-    assert_eq!(node.raft().local_snapshot().await, before);
+    assert_eq!(node.raft().local_snapshot().await.unwrap(), before);
     // The exact leader identity, including node, is bound in the durable entry.
 
     replay.log_id.leader_id = CommittedLeaderId::new(entry.log_id.leader_id.term, 2);
@@ -124,7 +124,7 @@ async fn sql_commit_native_logged_admission_is_deterministic_across_late_replay_
         node.raft().store.clone().apply([replay]).await.unwrap()[0],
         ApplyResult::Rejected(_)
     ));
-    assert_eq!(node.raft().local_snapshot().await, before);
+    assert_eq!(node.raft().local_snapshot().await.unwrap(), before);
     node.stop().await;
 }
 
@@ -184,7 +184,7 @@ async fn sql_commit_native_same_revision_snapshot_install_refuses_original_basis
         .await
         .unwrap();
     assert_eq!(
-        node.raft().local_snapshot().await.revision,
+        node.raft().local_snapshot().await.unwrap().revision,
         baseline.revision
     );
     let logs = node.raft().test_log_entries().await;
@@ -197,7 +197,7 @@ async fn sql_commit_native_same_revision_snapshot_install_refuses_original_basis
         .await
         .unwrap_err();
     assert!(crate::sql_commit::is_stale(&error), "{error}");
-    assert_eq!(node.raft().local_snapshot().await, baseline);
+    assert_eq!(node.raft().local_snapshot().await.unwrap(), baseline);
     assert_eq!(node.raft().test_log_entries().await, logs);
     drop(store);
     node.stop().await;

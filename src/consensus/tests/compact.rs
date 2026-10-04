@@ -94,7 +94,7 @@ async fn precompacted_writer_batches_validate_before_append_and_count_scope_byte
     std::sync::Arc::make_mut(&mut scoped.limits).transaction_max_bytes = unscoped_size;
     let error = scoped.commit_compact(good).await.unwrap_err();
     assert!(error.to_string().contains("FLOWER_TRANSACTION_MAX_BYTES"));
-    assert_eq!(node.raft().local_snapshot().await.revision, 0);
+    assert_eq!(node.raft().local_snapshot().await.unwrap().revision, 0);
     assert_eq!(node.raft().metrics().last_applied, None);
     assert_eq!(
         node.raft()

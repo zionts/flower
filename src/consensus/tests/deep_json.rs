@@ -459,7 +459,10 @@ async fn three_node_deep_values_survive_grouped_replication_snapshot_and_restart
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(nodes[lagging].raft().local_snapshot().await, expected);
+    assert_eq!(
+        nodes[lagging].raft().local_snapshot().await.unwrap(),
+        expected
+    );
     for node in &mut nodes {
         node.stop().await;
     }

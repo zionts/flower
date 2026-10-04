@@ -367,12 +367,16 @@ async fn grouped_deltas_preserve_order_dedup_cas_and_untouched_allocations() {
             guard.application.requests.version("original").unwrap(),
         )
     };
-    let retained = store.snapshot_for_writer().await;
-    assert!(retained.data.ptr_eq(&store.snapshot_for(None).await.data));
+    let retained = store.snapshot_for_writer().await.unwrap();
+    assert!(
+        retained
+            .data
+            .ptr_eq(&store.snapshot_for(None).await.unwrap().data)
+    );
     assert!(
         retained
             .requests
-            .ptr_eq(&store.snapshot_for_writer().await.requests)
+            .ptr_eq(&store.snapshot_for_writer().await.unwrap().requests)
     );
     let mut internal = command("original", 2, &[("changing", json!(2))], &[]);
     internal.internal = true;
@@ -471,11 +475,11 @@ async fn snapshot_install_replaces_all_tables_and_preserves_legacy_wire_format()
         .unwrap();
     assert!(has_checkpoint(&store));
     assert_eq!(store.snapshot().await, old.application);
-    let published = store.snapshot_for(None).await;
+    let published = store.snapshot_for(None).await.unwrap();
     assert_eq!(published.revision, old.application.revision);
     assert_eq!(published.data, old.application.data);
     assert!(published.requests.is_empty());
-    let writer = store.snapshot_for_writer().await;
+    let writer = store.snapshot_for_writer().await.unwrap();
     assert_eq!(writer, old.application);
     assert!(!writer.requests.contains_key("obsolete-receipt"));
     let built = store.build_snapshot().await.unwrap();
@@ -540,7 +544,7 @@ async fn apply_publishes_before_its_write_and_cancelled_drains_still_persist_it(
     assert_eq!(expected.revision, 1);
     assert_eq!(expected.data["durable"], json!(7));
     assert_eq!(expected.requests["published"].revision, 1);
-    assert_eq!(store.snapshot_for(None).await.data, expected.data);
+    assert_eq!(store.snapshot_for(None).await.unwrap().data, expected.data);
     assert_eq!(store.applied_state().await.unwrap().0, Some(log_id(1)));
     // The queued write waits for the disk; abandoning a drain cannot drop it.
     assert!(
@@ -885,6 +889,10 @@ fn open_pausing_store(
 }
 
 fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
+    #[cfg(feature = "sql")]
+    sql_source::test_bootstrap().unwrap();
+    #[cfg(feature = "sql")]
+    let source_startup = sql_source::PreparingStore::begin().unwrap();
     let transaction = db.begin_write().unwrap();
     transaction.open_table(LOGS).unwrap();
     let mut state = load_application(&transaction, Tables::new("")).unwrap();
@@ -895,7 +903,7 @@ fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
     state.application =
         stored_application(&db, Tables::new(""), state.application.revision).unwrap();
     let current_snapshot = checkpoint;
-    Store {
+    let store = Store {
         inner: Arc::new(Inner {
             appending: Arc::new(PublishedLock::new(Vec::new())),
             pending: Default::default(),
@@ -905,7 +913,7 @@ fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
             snapshot_directory: directory.to_path_buf(),
             io: Arc::new(Mutex::new(())),
             #[cfg(feature = "sql")]
-            capture_identity: sql_capture::next_identity().unwrap(),
+            capture_identity: source_startup.identity(),
             snapshot_installation: AtomicU64::new(0),
             current_snapshot: PublishedLock::new(current_snapshot),
             snapshot_accounting: super::super::snapshot_policy::Accounting::new(0, None, None),
@@ -921,7 +929,10 @@ fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
             backup: Default::default(),
         }),
         raft_lifetime: None,
-    }
+    };
+    #[cfg(feature = "sql")]
+    source_startup.finish(&store.inner).unwrap();
+    store
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1123,8 +1134,8 @@ async fn published_readers_progress_during_apply_without_exposing_staged_records
     store.close().await.unwrap();
     drop(store);
     let store = Store::open(1, directory.path().into()).await.unwrap();
-    let initial = store.snapshot_for(None).await;
-    let initial_writer = store.snapshot_for_writer().await;
+    let initial = store.snapshot_for(None).await.unwrap();
+    let initial_writer = store.snapshot_for_writer().await.unwrap();
     let initial_fence = store.read_fence().unwrap();
     let next_fence = super::super::read::ReadFence {
         applied: log_id(2),
@@ -1159,6 +1170,12 @@ async fn published_readers_progress_during_apply_without_exposing_staged_records
     assert!(!acknowledged_before_publication);
     let (before, before_writer, before_receipt, before_many) =
         before.expect("published reader waited behind application transaction");
+    let (before, before_writer, before_receipt, before_many) = (
+        before.unwrap(),
+        before_writer.unwrap(),
+        before_receipt.unwrap(),
+        before_many.unwrap(),
+    );
     assert_eq!(before.revision, initial.revision);
     assert_eq!(before.data["value"], 1);
     assert!(before.data.ptr_eq(&initial.data));
@@ -1167,7 +1184,7 @@ async fn published_readers_progress_during_apply_without_exposing_staged_records
     assert!(!before_writer.requests.contains_key("next"));
     assert_eq!(before_receipt, initial_writer);
     assert_eq!(before_many, initial_writer);
-    let published = store.snapshot_for(None).await;
+    let published = store.snapshot_for(None).await.unwrap();
     assert_eq!(store.read_fence().unwrap().applied, next_fence.applied);
     assert_eq!(
         store.snapshot_after_fence(&next_fence).unwrap().unwrap(),
@@ -1177,7 +1194,7 @@ async fn published_readers_progress_during_apply_without_exposing_staged_records
     assert_eq!(published.data["value"], 2);
     assert!(published.data.ptr_eq(&durable.data));
     assert!(published.requests.is_empty());
-    let published_writer = store.snapshot_for_writer().await;
+    let published_writer = store.snapshot_for_writer().await.unwrap();
     assert_eq!(published_writer, durable);
     assert_eq!(published_writer.requests["next"].revision, 2);
     assert!(published_writer.requests.ptr_eq(&durable.requests));
@@ -1191,8 +1208,11 @@ async fn published_readers_progress_during_apply_without_exposing_staged_records
     drop(store);
     let reopened = Store::open(1, directory.path().into()).await.unwrap();
     assert_eq!(reopened.snapshot().await, durable);
-    assert_eq!(reopened.snapshot_for(None).await, published);
-    assert_eq!(reopened.snapshot_for_writer().await, published_writer);
+    assert_eq!(reopened.snapshot_for(None).await.unwrap(), published);
+    assert_eq!(
+        reopened.snapshot_for_writer().await.unwrap(),
+        published_writer
+    );
 }
 
 #[tokio::test]
@@ -1209,7 +1229,7 @@ async fn cancelled_snapshot_install_publishes_data_and_receipts_together_after_f
     store.close().await.unwrap();
     drop(store);
     let (store, pause) = open_pausing_store(directory.path());
-    let initial = store.snapshot_for_writer().await;
+    let initial = store.snapshot_for_writer().await.unwrap();
     let next = legacy_state();
     let expected = next.application.clone();
     let meta = SnapshotMeta {
@@ -1250,11 +1270,13 @@ async fn cancelled_snapshot_install_publishes_data_and_receipts_together_after_f
         .await
         .unwrap();
     assert!(!acknowledged_before_flush);
-    let before = before.expect("writer baseline waited behind snapshot fsync");
+    let before = before
+        .expect("writer baseline waited behind snapshot fsync")
+        .unwrap();
     assert_eq!(before, initial);
     assert!(before.requests.ptr_eq(&initial.requests));
     assert_eq!(durable, expected);
-    assert_eq!(store.snapshot_for_writer().await, expected);
+    assert_eq!(store.snapshot_for_writer().await.unwrap(), expected);
     assert!(initial.requests.contains_key("obsolete"));
     assert!(!durable.requests.contains_key("obsolete"));
     assert_eq!(durable.requests["old-b"].revision, durable.revision);
@@ -1262,7 +1284,7 @@ async fn cancelled_snapshot_install_publishes_data_and_receipts_together_after_f
     store.close().await.unwrap();
     drop(store);
     let reopened = Store::open(1, directory.path().into()).await.unwrap();
-    assert_eq!(reopened.snapshot_for_writer().await, expected);
+    assert_eq!(reopened.snapshot_for_writer().await.unwrap(), expected);
     assert!(has_checkpoint(&reopened));
     let restored = reopened
         .clone()

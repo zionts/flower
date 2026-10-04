@@ -312,7 +312,7 @@ async fn step(
         *watched = None;
         return Ok(IDLE);
     }
-    let state = app.consensus.local_snapshot().await;
+    let state = app.consensus.local_snapshot().await.map_err(error)?;
     let Some(status) = protocol::status(&state).map_err(error)? else {
         *watched = None;
         return Ok(IDLE);

@@ -776,7 +776,7 @@ impl Consensus {
     pub async fn read_for_many(&self, request_ids: &[String]) -> anyhow::Result<Snapshot> {
         self.read_barrier().await?;
         if self.partition.is_none() {
-            return Ok(self.store.snapshot_for_many(request_ids).await);
+            return self.store.snapshot_for_many(request_ids).await;
         }
         let mut snapshot = self.selected_snapshot(None, true).await?;
         snapshot.requests = request_ids
@@ -844,14 +844,13 @@ impl Consensus {
 
     /// A local snapshot is for diagnostics and replication-aware callers. It
     /// does not establish leadership and can be stale on a follower.
-    pub async fn local_snapshot(&self) -> Snapshot {
+    pub async fn local_snapshot(&self) -> anyhow::Result<Snapshot> {
         match &self.partition {
             Some(binding) => self
                 .store
                 .partition_state(&binding.partition)
-                .map(|state| state.snapshot)
-                .unwrap_or_default(),
-            None => self.store.snapshot().await,
+                .map(|state| state.snapshot),
+            None => self.store.snapshot_for_writer().await,
         }
     }
 
@@ -864,8 +863,8 @@ impl Consensus {
             Some(binding) => self
                 .store
                 .partition_snapshot(binding, request_id, all_receipts),
-            None if all_receipts => Ok(self.store.snapshot_for_writer().await),
-            None => Ok(self.store.snapshot_for(request_id).await),
+            None if all_receipts => self.store.snapshot_for_writer().await,
+            None => self.store.snapshot_for(request_id).await,
         }
     }
 

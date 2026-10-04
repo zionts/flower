@@ -81,7 +81,7 @@ fn projection_crash_child() {
                 let results = consensus.commit_many(vec![commit("acknowledged", 0, 41), commit("acknowledged-next", 1, 42)]).await.unwrap();
                 assert!(matches!(&results[0], ApplyResult::Committed(result) if result.result == json!({"written":41}) && result.revision == 1));
                 assert!(matches!(&results[1], ApplyResult::Committed(result) if result.result == json!({"written":42}) && result.revision == 2));
-                assert_eq!(consensus.local_snapshot().await.requests.len(), 2);
+                assert_eq!(consensus.local_snapshot().await.unwrap().requests.len(), 2);
                 // No shutdown, drop, later append, vote, or snapshot can flush apply.
                 std::process::exit(EXIT);
             }
@@ -313,7 +313,7 @@ async fn recovered_leader_serves_no_fence_before_tail_replay_in_a_new_term() {
         .await
         .is_err()
     );
-    assert_eq!(leader.local_snapshot().await.revision, 0);
+    assert_eq!(leader.local_snapshot().await.unwrap().revision, 0);
 
     let mut reads = Vec::new();
     let c = leader.clone();
@@ -336,7 +336,7 @@ async fn recovered_leader_serves_no_fence_before_tail_replay_in_a_new_term() {
         "availability cannot bypass recovery"
     );
     assert!(leader.recovering.load(Ordering::Acquire));
-    assert_eq!(leader.local_snapshot().await.revision, 0);
+    assert_eq!(leader.local_snapshot().await.unwrap().revision, 0);
 
     release.send(true).unwrap();
     for read in reads {
@@ -375,7 +375,7 @@ async fn recovered_leader_serves_no_fence_before_tail_replay_in_a_new_term() {
         barriers <= 1,
         "concurrent readers share one recovery barrier"
     );
-    assert_eq!(leader.local_snapshot().await.requests.len(), 2);
+    assert_eq!(leader.local_snapshot().await.unwrap().requests.len(), 2);
     for node in &mut nodes {
         node.stop().await;
     }
@@ -604,7 +604,7 @@ async fn recovery_gate_rejects_local_queries_without_quorum_then_allows_replica_
                     .is_err()
             );
             // Diagnostics remain accessible without opening application serving.
-            assert_eq!(node.raft().local_snapshot().await.revision, 0);
+            assert_eq!(node.raft().local_snapshot().await.unwrap().revision, 0);
             assert_eq!(node.raft().metrics().id, 1);
         }
         nodes.push(node);
@@ -674,7 +674,7 @@ async fn recovery_replaces_uncommitted_conflicting_suffix_before_opening_local_r
                 node.raft().snapshot_for(Some("root")).await.is_err(),
                 "an isolated old suffix is not proof of committed application state"
             );
-            let checkpoint = node.raft().local_snapshot().await;
+            let checkpoint = node.raft().local_snapshot().await.unwrap();
             assert_eq!(checkpoint.revision, 0);
             assert!(checkpoint.data.is_empty() && checkpoint.requests.is_empty());
         }
@@ -687,7 +687,7 @@ async fn recovery_replaces_uncommitted_conflicting_suffix_before_opening_local_r
             recovered_query(node.raft()).await.data["source:[\"counter\",\"one\"]"],
             99
         );
-        let state = node.raft().local_snapshot().await;
+        let state = node.raft().local_snapshot().await.unwrap();
         assert_eq!(state.revision, 2);
         assert!(!state.requests.contains_key("root"));
         assert!(!state.requests.contains_key("root-next"));
@@ -701,7 +701,8 @@ async fn recovery_replaces_uncommitted_conflicting_suffix_before_opening_local_r
             .partition("garden", 1)
             .unwrap()
             .local_snapshot()
-            .await;
+            .await
+            .unwrap();
         assert_eq!(scoped.data["source:[\"counter\",\"one\"]"], 105);
         assert!(!scoped.requests.contains_key("scoped"));
         assert_eq!(

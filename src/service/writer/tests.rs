@@ -865,7 +865,7 @@ async fn ordered_queue_stages_sources_derived_values_receipts_and_cas_without_er
     );
     assert_eq!(results[6].as_ref().unwrap()["revision"], 3);
     assert_eq!(results[6].as_ref().unwrap()["duplicate"], true);
-    let committed = fixture.app.consensus.local_snapshot().await;
+    let committed = fixture.app.consensus.local_snapshot().await.unwrap();
     assert_eq!(committed.revision, 3);
     assert_eq!(committed.data["source:[\"records\",\"value\"]"], 3);
     assert!(
@@ -992,7 +992,16 @@ async fn queued_deployments_change_alias_visibility_in_order_even_for_receipt_re
     assert_eq!(results[4].as_ref().unwrap()["duplicate"], true);
     assert_eq!(results[5].as_ref().unwrap()["revision"], 5);
     assert_eq!(results[5].as_ref().unwrap()["value"]["previous"], 1);
-    assert_eq!(fixture.app.consensus.local_snapshot().await.revision, 5);
+    assert_eq!(
+        fixture
+            .app
+            .consensus
+            .local_snapshot()
+            .await
+            .unwrap()
+            .revision,
+        5
+    );
     fixture.close().await;
 }
 
@@ -1018,7 +1027,16 @@ async fn full_or_closed_queue_returns_unavailable_without_retaining_waiting_requ
     assert_eq!(error.code, "UNAVAILABLE");
     assert!(error.message.contains("queue full"));
     assert_eq!(fixture.app.writer_queue.capacity(), 0);
-    assert_eq!(fixture.app.consensus.local_snapshot().await.revision, 1);
+    assert_eq!(
+        fixture
+            .app
+            .consensus
+            .local_snapshot()
+            .await
+            .unwrap()
+            .revision,
+        1
+    );
     fixture.receiver.take();
     let error = submit(&fixture.app, increment("d", 1, None), false)
         .await
@@ -1054,7 +1072,7 @@ async fn bounded_groups_preserve_fifo_across_deferred_and_newly_received_work() 
         assert_eq!(value["value"]["value"], index + 1);
         assert_eq!(value["value"]["doubled"], (index + 1) * 2);
     }
-    let state = fixture.app.consensus.local_snapshot().await;
+    let state = fixture.app.consensus.local_snapshot().await.unwrap();
     assert_eq!(state.revision, 71);
     assert_eq!(state.requests.len(), 71);
     fixture.close().await;

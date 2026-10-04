@@ -966,7 +966,7 @@ impl Consensus {
 
     pub async fn list_partitions(&self) -> anyhow::Result<Vec<PartitionInfo>> {
         self.read_barrier().await?;
-        Ok(self.store.partition_infos())
+        self.store.partition_infos()
     }
 
     pub async fn partition_info(&self, partition: &str) -> anyhow::Result<PartitionInfo> {
