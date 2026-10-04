@@ -222,7 +222,20 @@ export class TestDatabase<App = FlowerModule> {
           { code: "UNDECLARED_INDEX" });
       }
     };
+    let commitBefore: number | null = null;
+    let fenceFailure: { code: string; message: string } | null = null;
     const withIdentity = (ctx: any) => Object.freeze({
+      ...(kind === "mutation" ? { requireCommitBefore: (absoluteMs: number) => {
+        if (!Number.isSafeInteger(absoluteMs) || absoluteMs < 0) {
+          fenceFailure = { code: "INVALID_VALUE", message: "requireCommitBefore takes one absolute safe millisecond deadline" };
+          throw Object.assign(new Error(fenceFailure.message), fenceFailure);
+        }
+        commitBefore = commitBefore === null ? absoluteMs : Math.min(commitBefore, absoluteMs);
+        if (commitBefore <= this.now) {
+          fenceFailure = { code: "SQL_COMMIT_EXPIRED", message: "SQL completion authorization expired before ordered proposal" };
+          throw Object.assign(new Error(fenceFailure.message), fenceFailure);
+        }
+      } } : {}),
       ...ctx,
       principal: () => identity,
       history: ctx.history ?? (() => null),
@@ -261,6 +274,10 @@ export class TestDatabase<App = FlowerModule> {
       return definition.compute(undefined, { initialize: true, group: input, previous: null, changes });
     };
     const output = this.engine.flowerInvoke(data, { kind, name, args, requestId: `test-${++this.sequence}` } as unknown as Json, method, cell, this.now);
+    // This synchronous harness models a trusted declaration only. The real
+    // ordered-core, queued-proposal and fsync tests live in native writer tests.
+    if (fenceFailure !== null) throw Object.assign(new Error((fenceFailure as {message:string}).message), fenceFailure);
+    if (commitBefore !== null && this.now >= commitBefore) throw Object.assign(new Error("SQL completion authorization expired before ordered proposal"), {code:"SQL_COMMIT_EXPIRED"});
     // As the server does at the end of every mutation: rows refer only to rows that exist.
     if (kind === "mutation") checkReferences(this.module.collections ?? [], data, output.puts, output.deletes);
     return output;

@@ -1220,8 +1220,24 @@ where
             RaftMsg::CheckIsLeaderRequest { tx } => {
                 self.handle_check_is_leader_request(tx).await;
             }
-            RaftMsg::ClientWriteRequest { app_data, tx } => {
-                self.write_entry(C::Entry::from_app_data(app_data), Some(tx));
+            RaftMsg::ClientWriteRequest { mut app_data, tx } => {
+                // Flower: after queuing and exclusive leadership selection, but
+                // BEFORE a payload/log ID/append exists. No await from this
+                // final fresh decision through leader_append_entries.
+                if let Some((mut lh, tx)) = self.engine.get_leader_handler_or_reject(Some(tx)) {
+                    let leader = lh.leader.vote_ref().committed_leader_id().unwrap();
+                    let previous = lh.state.last_log_id().cloned();
+                    match C::admit_client_write(&mut app_data, leader, previous) {
+                        Err(reason) => {
+                            if let Some(tx) = tx { tx.send(Err(ClientWriteError::AdmissionRejected(reason))); }
+                        }
+                        Ok(()) => {
+                            lh.leader_append_entries(vec![C::Entry::from_app_data(app_data)]);
+                            let index = lh.state.last_log_id().unwrap().index;
+                            if let Some(tx) = tx { self.client_resp_channels.insert(index, tx); }
+                        }
+                    }
+                }
             }
             RaftMsg::Initialize { members, tx } => {
                 tracing::info!(

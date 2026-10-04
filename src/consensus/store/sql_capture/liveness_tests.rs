@@ -41,6 +41,7 @@ fn entry(index: u64, command: RaftCommand) -> Entry<TypeConfig> {
 }
 fn commit(revision: u64, puts: BTreeMap<String, Value>) -> RaftCommand {
     Commit {
+        sql_commit_before: None,
         internal: true,
         request_id: String::new(),
         fingerprint: String::new(),

@@ -174,6 +174,7 @@ pub(super) async fn commit(app: Arc<App>, input: Value) -> Result<Value, ApiErro
     let committed = app
         .consensus
         .commit(Commit {
+            sql_commit_before: None,
             internal: false,
             request_id,
             fingerprint,

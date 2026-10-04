@@ -204,6 +204,8 @@ struct Engine<'a> {
     clock_polled: bool,
     /// The earliest declared future instant at which the result may change.
     changes_at: Option<u64>,
+    sql_commit_before: Option<u64>,
+    sql_commit_unknown_policy_time: bool,
     speculative: bool,
     certificate: Option<DependencyCertificate>,
     retained_costs: HashMap<String, usize>,
@@ -413,6 +415,8 @@ fn run_with_limit_and_schema(
         certifying: query_cacheable || one_shot,
         clock_polled: false,
         changes_at: None,
+        sql_commit_before: None,
+        sql_commit_unknown_policy_time: false,
         speculative,
         certificate: (query_cacheable || one_shot || speculative)
             .then(DependencyCertificate::default),
@@ -1206,6 +1210,30 @@ impl Engine<'_> {
                 Ok(self.base.get("$flower.retention").map_or(Value::Null, |state|json!({"database":state["database"],"incarnation":state["incarnation"]})).into())
             }
             "codeVersion" => self.code_version(),
+            "requireCommitBefore" => {
+                self.writable()?;
+                if arguments.len() != 1 {
+                    return self.abort(
+                        "INVALID_VALUE",
+                        "requireCommitBefore takes one absolute safe millisecond deadline",
+                    );
+                }
+                let time = match safe_time(argument(0), "Commit deadline") {
+                    Ok(time) => time,
+                    Err(_) => {
+                        return self.abort(
+                            "INVALID_VALUE",
+                            "requireCommitBefore takes one absolute safe millisecond deadline",
+                        );
+                    }
+                };
+                self.sql_commit_before =
+                    Some(self.sql_commit_before.map_or(time, |old| old.min(time)));
+                if time <= self.now {
+                    return self.abort("SQL_COMMIT_EXPIRED", crate::sql_commit::EXPIRED_MESSAGE);
+                }
+                Ok(Value::Null.into())
+            }
             "managedKey" => self.managed_key(argument(0)).map(Reply::Value),
             "now" => {
                 self.query_cacheable = false;
@@ -1658,6 +1686,16 @@ impl Engine<'_> {
         let evaluated = std::mem::take(&mut self.evaluated);
         let query_cacheable = self.query_cacheable && certificate.is_some();
         let (query_clock_polled, query_changes_at) = (self.clock_polled, self.changes_at);
+        if self.sql_commit_before.is_some() && self.sql_commit_unknown_policy_time {
+            return self.abort(
+                "SQL_COMMIT_AUTHORITY_UNCERTIFIED",
+                "SQL completion requires a certified temporal policy",
+            );
+        }
+        // Preserve independently of optional read certificates, ctx.now(), and serial mode.
+        let sql_commit_before = self
+            .sql_commit_before
+            .map(|before| self.changes_at.map_or(before, |flip| before.min(flip)));
         let mode = self.mode;
         let sql_read = self.sql.deadline.is_some();
         let output_limit = self.output_limit;
@@ -1680,6 +1718,7 @@ impl Engine<'_> {
             query_changes_at,
             query_certificate: certificate,
             mutation_certificate,
+            sql_commit_before,
         };
         let bytes = patch_bytes(&result.puts, &result.deletes, &result.evaluated)
             + if mode == "deployment" {

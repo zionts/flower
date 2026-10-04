@@ -15,6 +15,7 @@ impl Fields {
     pub(super) const SCOPED: u16 = Self::PARTITION | (1 << 1) | (1 << 2);
     pub(super) const FENCED: u16 = (1 << 6) | (1 << 7);
     pub(super) const RECOVERY: u16 = 1 << 8;
+    pub(super) const SQL: u16 = 1 << 9;
     const ALL: Self = Self(u16::MAX);
 
     pub(super) fn inspect(raw: &serde_json::value::RawValue) -> Self {
@@ -49,6 +50,7 @@ impl<'de> Deserialize<'de> for Field {
                     "leader_id" => 1 << 6,
                     "commit" => 1 << 7,
                     "recovery_barrier" => Fields::RECOVERY,
+                    "sql_admission" => Fields::SQL,
                     _ => 0,
                 }))
             }

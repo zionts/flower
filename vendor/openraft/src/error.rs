@@ -193,6 +193,10 @@ where
     #[error(transparent)]
     ForwardToLeader(#[from] ForwardToLeader<NID, N>),
 
+    /// Flower: refused before proposal; unlike a timeout the entry was not logged.
+    #[error("application admission rejected: {0}")]
+    AdmissionRejected(String),
+
     /// When writing a change-membership entry.
     #[error(transparent)]
     ChangeMembershipError(#[from] ChangeMembershipError<NID>),

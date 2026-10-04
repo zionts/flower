@@ -104,6 +104,14 @@ pub trait RaftTypeConfig:
     /// [`Raft::client_write`]: `crate::raft::Raft::client_write`
     /// [`WriteResult`]: `crate::raft::message::ClientWriteResult`
     type Responder: Responder<Self>;
+
+    /// Flower: synchronous application attenuation at the last ordered
+    /// pre-proposal decision. Runs with the current leader handler, without an
+    /// await before append; returning an error discards the payload BEFORE any
+    /// log entry exists. Ordinary configs remain unchanged. Never run on replay.
+    fn admit_client_write(_data: &mut Self::D, _leader: crate::CommittedLeaderId<Self::NodeId>, _previous: Option<crate::LogId<Self::NodeId>>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[allow(dead_code)]

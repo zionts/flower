@@ -242,6 +242,9 @@ function bind(host: Host, runtime: Runtime): Session {
     return entry;
   }
   const ctx: MutationContext = Object.freeze({
+    ...(typeof host.requireCommitBefore === "function" ? {
+      requireCommitBefore: (absoluteMs: number) => { host.requireCommitBefore(absoluteMs); },
+    } : {}),
     sql: bindSql(host),
     now: () => host.now(),
     clock: () => host.clock(),

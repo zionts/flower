@@ -46,3 +46,16 @@ empty one. Between segments it yields once, where upstream slept a millisecond.
 
 To update, replace this directory with a newer published crate and reapply the
 changes marked `Flower:`.
+
+## Application ordered-proposal attenuation
+
+Flower's default-noop `RaftTypeConfig::admit_client_write` hook runs synchronously
+with the current committed leader handler and prior ordered log head, after API
+queuing but before constructing/assigning/appending the new payload. A refusal
+is `ClientWriteError::AdmissionRejected` and creates no log entry. Flower uses
+it only for explicitly guarded mutation deadlines and private native source
+basis checks; ordinary commands keep their prior behavior. All metadata/byte
+checks precede the final native clock sample. No await separates that decision
+from append. Replay never invokes the hook or branches on a replica wall clock.
+This is proposal admission, not a promise that quorum or fsync finishes before
+the deadline. Timeouts remain unknown outcomes.

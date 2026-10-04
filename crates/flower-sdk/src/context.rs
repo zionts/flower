@@ -291,6 +291,7 @@ mod op {
     pub const UNMATERIALIZE: i32 = 11;
     pub const CLOCK: i32 = 12;
     pub const CHANGES_AT: i32 = 13;
+    pub const REQUIRE_COMMIT_BEFORE: i32 = 17;
 }
 
 fn derived_reference(encoder: &mut Encoder, name: &str) {
@@ -380,6 +381,16 @@ impl<'r> Ctx<'r> {
         host(op::CHANGES_AT, |encoder| match time {
             Some(time) => encoder.number(time),
             None => encoder.null(),
+        })?;
+        Ok(())
+    }
+    /// Narrow this mutation's native ordered-proposal deadline. The trusted
+    /// application must verify its proof/lease/policy and supply their earliest
+    /// safe absolute millisecond expiry. No quorum/fsync deadline is promised.
+    pub fn require_commit_before(&mut self, absolute_ms: u64) -> Result<()> {
+        self.writable("requireCommitBefore")?;
+        host(op::REQUIRE_COMMIT_BEFORE, |encoder| {
+            encoder.number(absolute_ms as f64)
         })?;
         Ok(())
     }

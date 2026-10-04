@@ -1,4 +1,5 @@
 use super::*;
+mod sql_commit;
 use openraft::storage::RaftLogStorageExt;
 use openraft::{CommittedLeaderId, Membership};
 use redb::ReadableTableMetadata;
@@ -28,6 +29,7 @@ fn log_id(index: u64) -> LogId<u64> {
 
 fn command(id: &str, revision: u64, puts: &[(&str, Value)], deletes: &[&str]) -> Commit {
     Commit {
+        sql_commit_before: None,
         internal: false,
         request_id: id.into(),
         fingerprint: format!("fingerprint-{id}"),

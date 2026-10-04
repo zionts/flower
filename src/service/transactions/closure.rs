@@ -495,6 +495,7 @@ async fn begin(
     // Every future ACK must fit before installing an intent. Address/name sizes
     // are governed by the actual command budget, never an independent cap.
     let command = Commit {
+        sql_commit_before: None,
         internal: true,
         request_id: String::new(),
         fingerprint: String::new(),
@@ -638,6 +639,7 @@ fn collection_fits(app: &App, cursor: &Cursor, deletes: &[String]) -> bool {
     check_command_budget(
         app,
         &Commit {
+            sql_commit_before: None,
             internal: true,
             request_id: String::new(),
             fingerprint: String::new(),
@@ -653,6 +655,7 @@ fn collection_fits(app: &App, cursor: &Cursor, deletes: &[String]) -> bool {
 // adds only the newly serialized strings/commas; never rescan the growing batch.
 fn collection_base_bytes(cursor: &Cursor) -> Result<usize, ApiError> {
     let command = Commit {
+        sql_commit_before: None,
         internal: true,
         request_id: String::new(),
         fingerprint: String::new(),

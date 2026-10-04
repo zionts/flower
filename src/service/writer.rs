@@ -38,6 +38,7 @@ struct InputState {
     begun: bool,
     staged: Option<Prepared>,
     queued: Option<Instant>,
+    sql_commit_before: Option<u64>,
 }
 #[derive(Clone)]
 struct PendingInput {
@@ -56,6 +57,7 @@ impl PendingInput {
                 begun: false,
                 staged: None,
                 queued: None,
+                sql_commit_before: None,
             })),
             canceled: Arc::new(tokio::sync::Notify::new()),
             trace: if crate::telemetry::enabled() {
@@ -64,6 +66,26 @@ impl PendingInput {
                 tracing::Span::none()
             },
         }
+    }
+    fn fence(&self) -> Option<u64> {
+        self.state.lock().expect("pending input").sql_commit_before
+    }
+    fn narrow_fence(&self, before: u64) -> u64 {
+        let mut state = self.state.lock().expect("pending input");
+        let before = state
+            .sql_commit_before
+            .map_or(before, |old| old.min(before));
+        state.sql_commit_before = Some(before);
+        before
+    }
+    fn check_fence(&self, app: &App, state: &Snapshot) -> Result<(), ApiError> {
+        if self
+            .fence()
+            .is_some_and(|before| app.clock.sample(state).map_or(true, |now| now >= before))
+        {
+            return Err(sql_commit_expired());
+        }
+        Ok(())
     }
     fn enqueued(&self) {
         if crate::telemetry::enabled() {
@@ -621,16 +643,17 @@ async fn pipeline_with_controller(
         None => return false,
     };
     let reading = Instant::now();
-    let snapshot = if pipelined {
-        app.consensus.read_for_writer().await
-    } else {
-        let ids = pending
+    let ids = (!pipelined).then(|| {
+        pending
             .iter()
             .filter_map(|entry| entry.input.request_id())
-            .collect::<Vec<_>>();
-        app.consensus.read_for_many(&ids).await
-    };
-    let mut state = match snapshot {
+            .collect::<Vec<_>>()
+    });
+    let snapshot = app
+        .consensus
+        .read_for_writer_with_basis(ids.as_deref())
+        .await;
+    let (mut state, sql_basis) = match snapshot {
         Ok(state) => state,
         Err(error) => {
             let error = unavailable(error);
@@ -640,6 +663,22 @@ async fn pipeline_with_controller(
             return false;
         }
     };
+    let basis_class = pending.first().map_or(admission::Class::User, |first| {
+        admission_class(&first.input, first.deployment)
+    });
+    let basis_retained = match app
+        .admission
+        .retain_strong(basis_class, sql_basis.allocation_cost())
+    {
+        Ok(retained) => retained,
+        Err(error) => {
+            for entry in pending {
+                let _ = entry.reply.send(Err(error.clone()));
+            }
+            return false;
+        }
+    };
+    sql_basis.retain(basis_retained);
     let read_us = reading.elapsed().as_micros() as u64;
     // Candidates one group did not reach, prepared for its successor.
     let mut carried = None;
@@ -659,6 +698,7 @@ async fn pipeline_with_controller(
         hooks,
     )
     .await;
+    group.sql_basis = Some(sql_basis.clone());
     for entry in rest.into_iter().rev() {
         deferred.push_front(entry);
     }
@@ -750,7 +790,7 @@ async fn pipeline_with_controller(
             deadline: started + window,
             stop_reason: "queue_empty",
         };
-        let (committed, (next, rest)) = tokio::join!(
+        let (committed, (mut next, rest)) = tokio::join!(
             committing,
             prepare_group_carried(
                 app,
@@ -773,6 +813,7 @@ async fn pipeline_with_controller(
         for entry in rest.into_iter().rev() {
             deferred.push_front(entry);
         }
+        next.sql_basis = Some(sql_basis.clone());
         committed.observe(controller);
         if let Err(error) = committed.result {
             // A failed/unknown commit may have applied a prefix. Never submit
@@ -947,18 +988,14 @@ async fn prepare_candidate(
     prepare_candidate_admitted(app, state, pending, deployment, speculative_now, None, None).await
 }
 
-async fn admit(
-    app: &App,
-    pending: &PendingInput,
-    deployment: bool,
-) -> Result<admission::Permit, ApiError> {
+fn admission_class(pending: &PendingInput, deployment: bool) -> admission::Class {
     // Preparing a bundle (online, or blocking in the lane) compiles and
     // evaluates for seconds, so it takes a deployment slot. An online
     // deployment's cutover evaluates nothing unless its base changed, and then
     // for at most FLOWER_DEPLOYMENT_CUTOVER_MS, so it takes a control slot:
     // that is never held for long, while another database's preparation may
     // hold the deployment slot for seconds, and this lane would wait for it.
-    let class = if !deployment {
+    if !deployment {
         admission::Class::User
     } else if pending
         .state
@@ -970,7 +1007,15 @@ async fn admit(
         admission::Class::Control
     } else {
         admission::Class::Deployment
-    };
+    }
+}
+
+async fn admit(
+    app: &App,
+    pending: &PendingInput,
+    deployment: bool,
+) -> Result<admission::Permit, ApiError> {
+    let class = admission_class(pending, deployment);
     pending.dequeued();
     let enabled = crate::telemetry::enabled();
     let started = enabled.then(Instant::now);
@@ -1097,6 +1142,7 @@ async fn prepare_candidate_inner(
     if let Some(started) = started {
         started.store(true, std::sync::atomic::Ordering::Release);
     }
+    pending.check_fence(app, state)?;
     let body = pending.begin()?;
     let input = &body.value;
     let request_id = input["requestId"].as_str().unwrap().to_owned();
@@ -1295,6 +1341,29 @@ async fn prepare_candidate_inner(
     let response =
         json!({"revision":state.revision + 1,"value":evaluation.value,"duplicate":false});
     let certificate = evaluation.mutation_certificate;
+    let sql_commit_before = match evaluation.sql_commit_before.or(pending.fence()) {
+        None => None,
+        Some(mut before) => {
+            // A readless/polled authority decision has no complete time witness.
+            // An explicit business proof deadline is not a substitute for one.
+            if let Some(access) = &access {
+                match access.validity {
+                    Validity::Stable if access.observed.is_some() => {}
+                    Validity::Until(time) if access.observed.is_some() => before = before.min(time),
+                    _ => {
+                        return Err(ApiError::new(
+                            StatusCode::FORBIDDEN,
+                            "SQL_COMMIT_AUTHORITY_UNCERTIFIED",
+                            "SQL completion requires a certified current authority decision".into(),
+                        ));
+                    }
+                }
+            }
+            let before = pending.narrow_fence(before);
+            pending.check_fence(app, state)?;
+            Some(before)
+        }
+    };
     // A mutation that wrote nothing has no effect a retry could repeat: it
     // commits in order without a receipt, and its request ID may run again.
     // Most of a queue worker's mutations are empty claims. Methods declared
@@ -1306,6 +1375,7 @@ async fn prepare_candidate_inner(
     let mut prepared = Prepared {
         response,
         command: Some(Commit {
+            sql_commit_before,
             internal: receiptless,
             request_id,
             fingerprint,
@@ -1470,6 +1540,7 @@ fn stage_prepared(
 }
 
 struct Group {
+    sql_basis: Option<Arc<crate::consensus::NativeWriteBasis>>,
     pending: Vec<Pending>,
     results: Vec<Result<Prepared, ApiError>>,
     commands: Vec<SharedCommit>,
@@ -1764,7 +1835,15 @@ async fn prepare_group_inner<'a>(
         if speculative.is_some() {
             observability::stage("wave_wait", waiting.elapsed(), "batch");
         }
-        let prepared = if let Some(Ok(mut candidate)) = speculative {
+        let terminal_refusal = speculative
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .and_then(sql_commit_refusal);
+        let prepared = if let Some(error) = terminal_refusal {
+            // Preparation's fatal SQL refusal is terminal too. In particular,
+            // wrapped Engine errors must never become renewed serial attempts.
+            Err(error)
+        } else if let Some(Ok(mut candidate)) = speculative {
             match candidate.validate(app, state, &entry.input).await {
                 Ok(true) => {
                     observability::speculation("reused", 1);
@@ -1772,6 +1851,13 @@ async fn prepare_group_inner<'a>(
                     wave.as_mut().expect("candidate belongs to wave").reused += 1;
                     admission = Some(candidate.admission);
                     Ok(candidate.prepared)
+                }
+                Err(error)
+                    if error.code == "SQL_COMMIT_EXPIRED"
+                        || error.code == "SQL_COMMIT_AUTHORITY_UNCERTIFIED" =>
+                {
+                    // Drop its private artifact. No old-time retry may revive it.
+                    Err(error)
                 }
                 _ => {
                     observability::speculation("conflict", 1);
@@ -1786,8 +1872,14 @@ async fn prepare_group_inner<'a>(
                     // All methods in a wave share one logical clock. Advancing
                     // it here would invalidate otherwise independent siblings.
                     let rerun = Instant::now();
-                    let prepared =
-                        prepare_serial_at(app, state, entry, &mut admission, Some(now)).await;
+                    let prepared = prepare_serial_at(
+                        app,
+                        state,
+                        entry,
+                        &mut admission,
+                        entry.input.fence().is_none().then_some(now),
+                    )
+                    .await;
                     observability::stage("conflict_rerun", rerun.elapsed(), "batch");
                     prepared
                 }
@@ -1860,6 +1952,7 @@ async fn prepare_group_inner<'a>(
     drop(admission);
     let deferred = pending.split_off(results.len());
     let group = Group {
+        sql_basis: None,
         pending,
         results,
         commands,
@@ -1981,7 +2074,13 @@ impl Group {
                 Err(error) => Err(unavailable(error)),
             }
         } else {
-            commit_prepared_group(app, std::mem::take(&mut self.commands), &self.results).await
+            commit_prepared_group(
+                app,
+                std::mem::take(&mut self.commands),
+                &self.results,
+                self.sql_basis.clone(),
+            )
+            .await
         };
         #[cfg(test)]
         let committed = if committed.is_ok() && matches!(decision, tests::Decision::RejectAfter) {
@@ -2101,16 +2200,52 @@ async fn commit_prepared_group(
     app: &App,
     commands: Vec<SharedCommit>,
     prepared: &[Result<Prepared, ApiError>],
+    basis: Option<Arc<crate::consensus::NativeWriteBasis>>,
 ) -> Result<(), ApiError> {
     let count = commands.len();
+    // After Hooks.committing, reject the WHOLE overlay before converting or
+    // handing any sensitive patch/result/receipt to Raft. The ordered core
+    // samples again after its own queue and immediately before append.
+    if let Some(before) = commands
+        .iter()
+        .filter_map(|command| command.sql_commit_before)
+        .min()
+    {
+        let now = app.clock.sample_after(0).map_err(unavailable)?;
+        if now >= before {
+            return Err(sql_commit_expired());
+        }
+    }
+    let guarded = commands
+        .iter()
+        .any(|command| command.sql_commit_before.is_some());
     let applied = match count {
         0 => Vec::new(),
+        1 if guarded => vec![ApplyResult::Committed(
+            app.consensus
+                .commit_with_clock(
+                    commands.into_iter().next().unwrap().into_commit(),
+                    app.clock.clone(),
+                    basis.clone().ok_or_else(sql_commit_stale)?,
+                )
+                .await
+                .map_err(sql_commit_error)?,
+        )],
         1 => vec![ApplyResult::Committed(
             app.consensus
                 .commit(commands.into_iter().next().unwrap().into_commit())
                 .await
                 .map_err(unavailable)?,
         )],
+        _ if guarded => app
+            .consensus
+            .commit_compact_with_clock(
+                SharedCommit::compact(commands).map_err(unavailable)?,
+                app.clock.clone(),
+                basis.ok_or_else(sql_commit_stale)?,
+            )
+            .await
+            .map_err(sql_commit_error)?,
         _ => app
             .consensus
             .commit_compact(SharedCommit::compact(commands).map_err(unavailable)?)
@@ -2138,6 +2273,48 @@ async fn commit_commands(app: &App, commands: Vec<Commit>) -> Result<Vec<ApplyRe
             .commit_many(commands)
             .await
             .map_err(unavailable)
+    }
+}
+
+fn sql_commit_expired() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "SQL_COMMIT_EXPIRED",
+        crate::sql_commit::EXPIRED_MESSAGE.into(),
+    )
+}
+fn sql_commit_stale() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "SQL_COMMIT_STALE",
+        crate::sql_commit::STALE_MESSAGE.into(),
+    )
+}
+fn sql_commit_refusal(error: &ApiError) -> Option<ApiError> {
+    let code = error
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or(error.code);
+    match code {
+        "SQL_COMMIT_EXPIRED" => Some(sql_commit_expired()),
+        "SQL_COMMIT_STALE" => Some(sql_commit_stale()),
+        "SQL_COMMIT_AUTHORITY_UNCERTIFIED" => Some(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "SQL_COMMIT_AUTHORITY_UNCERTIFIED",
+            "SQL completion requires a certified current authority decision".into(),
+        )),
+        _ => None,
+    }
+}
+fn sql_commit_error(error: anyhow::Error) -> ApiError {
+    if crate::sql_commit::is_expired(&error) {
+        sql_commit_expired()
+    } else if crate::sql_commit::is_stale(&error) {
+        sql_commit_stale()
+    } else {
+        unavailable(error)
     }
 }
 

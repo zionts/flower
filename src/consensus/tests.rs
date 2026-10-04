@@ -28,6 +28,7 @@ mod partitions;
 mod read;
 mod recovery;
 mod retention;
+mod sql_commit;
 
 const TEST_TOKEN: &str = "flower-consensus-test-only-secret";
 
@@ -48,6 +49,7 @@ fn openraft_storage_conformance() {
 
 fn commit(request: &str, expected_revision: u64, value: u64) -> Commit {
     Commit {
+        sql_commit_before: None,
         internal: false,
         request_id: request.into(),
         fingerprint: format!("fingerprint-{request}"),
@@ -1355,6 +1357,7 @@ async fn slow_snapshot_catch_up_does_not_restart_itself_through_elections() {
             })
             .collect();
         let command = Commit {
+            sql_commit_before: None,
             internal: false,
             request_id: format!("blobs-{revision}"),
             fingerprint: format!("fingerprint-blobs-{revision}"),
@@ -1749,4 +1752,12 @@ async fn reopen_cost_with_many_receipts() {
         reopened.snapshot().await.requests.len(),
         started.elapsed().as_secs_f64() * 1e3
     );
+}
+
+// Test-only real Raft reader; never exposes application/log payloads to an API.
+impl Consensus {
+    pub(crate) async fn test_log_entries(&self) -> Vec<Entry<TypeConfig>> {
+        use openraft::RaftLogReader;
+        self.store.clone().try_get_log_entries(..).await.unwrap()
+    }
 }

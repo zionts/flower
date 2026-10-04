@@ -635,4 +635,20 @@ mod tests {
         assert_eq!(pool.metrics()["classes"][0]["active"], 0);
         assert_eq!(pool.metrics()["classes"][0]["retainedInputBytes"], 0);
     }
+    #[test]
+    fn writer_strong_metadata_lease_keeps_pool_and_charge_until_final_owner_drop() {
+        let pool = pool();
+        let weak = pool.downgrade();
+        let retained = pool.retain_strong(Class::User, 123).unwrap();
+        assert_eq!(pool.retained().0, 123);
+        drop(pool);
+        let surviving = weak
+            .upgrade()
+            .expect("queued metadata must keep actual budget owner alive");
+        assert_eq!(surviving.retained().0, 123);
+        drop(retained);
+        assert_eq!(surviving.retained().0, 0);
+        drop(surviving);
+        assert!(weak.upgrade().is_none());
+    }
 }
