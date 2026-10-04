@@ -756,6 +756,92 @@ fn inline_control_alignment_must_fit_actual_native_page() {
     }
     assert_eq!(owner.book.issued.load(Ordering::SeqCst), 0);
 }
+// Fixture-only strong-owner observer: no production admission is asserted.
+struct PartialOwner {
+    cancellation: std::sync::Weak<AtomicBool>,
+    released: Arc<AtomicUsize>,
+    stop_at: Option<MapKind>,
+}
+struct PartialLease {
+    cancellation: std::sync::Weak<AtomicBool>,
+    released: Arc<AtomicUsize>,
+    stop_at: Option<MapKind>,
+}
+unsafe impl NativeLease for PartialLease {
+    fn mapping_ids(&self) -> [u64; 2] {
+        [1, 2]
+    }
+    fn observe(&self, event: NativeEvent) {
+        if let NativeEvent::Mapped { kind, .. } = event
+            && Some(kind) == self.stop_at
+        {
+            self.cancellation
+                .upgrade()
+                .unwrap()
+                .store(true, Ordering::Release);
+        }
+    }
+}
+impl Drop for PartialLease {
+    fn drop(&mut self) {
+        // Only the external test owner remains. Both the original JobControl
+        // and the factory's cancel clone MUST end before job/node credit.
+        assert_eq!(self.cancellation.strong_count(), 1);
+        self.released.fetch_add(1, Ordering::SeqCst);
+    }
+}
+unsafe impl NativeOwner for PartialOwner {
+    type Lease = PartialLease;
+    fn immutable_worker_ceiling(&self) -> usize {
+        1
+    }
+    fn native_gate(&self, _: &WorkerLayout) -> Result<(), Hold> {
+        Ok(()) // Synthetic native fixture, NOT production resource proof.
+    }
+    fn admit(&self, _: &WorkerLayout, _: &JobControl) -> Result<PartialLease, WorkerError> {
+        Ok(PartialLease {
+            cancellation: self.cancellation.clone(),
+            released: self.released.clone(),
+            stop_at: self.stop_at,
+        })
+    }
+}
+#[test]
+fn partial_construction_drops_original_control_and_cancel_before_lease_credit() {
+    for stop_at in [
+        None,
+        Some(MapKind::StackAndGuards),
+        Some(MapKind::ControlAndTask),
+    ] {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicUsize::new(0));
+        let owner = PartialOwner {
+            cancellation: Arc::downgrade(&cancellation),
+            released: released.clone(),
+            stop_at,
+        };
+        let spec = if stop_at.is_none() {
+            StackSpec {
+                usable_bytes: isize::MAX as usize - 65536,
+            }
+        } else {
+            spec()
+        };
+        let original = JobControl::new(Duration::from_secs(10), cancellation.clone()).unwrap();
+        let result = WorkerFactory::new(&owner).unwrap().start::<NoSource>(
+            spec,
+            original,
+            WorkerBootstrap::InspectOwnedStack,
+        );
+        if stop_at.is_none() {
+            assert!(matches!(result, Err(WorkerError::MappingFailed)));
+        } else {
+            assert!(matches!(result, Err(WorkerError::Job(SqlError::Cancelled))));
+        }
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&cancellation), 1);
+    }
+}
 #[test]
 fn actual_impossible_native_mapping_refusal_returns_only_its_unused_lease() {
     let owner = TestOwner::fixture();

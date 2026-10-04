@@ -117,3 +117,21 @@ unimported new-only component. The parent must run coherent integration tests.
 Actual current source/capture code, depth128 code/cert/JSON, SourceScratch,
 Tokio fences/abort, original whole10s, HostCtxSourceRoots/native physical and
 production resource installation remain HOLD, regardless of harness success.
+
+## Partial-construction lifetime correction — October 4, 2026
+
+The published pre-correction constructor could drop its admitted lease before
+the still-local original JobControl/factory cancellation owners on pre-State
+refusals. A deterministic real-mapping lease-destructor regression failed on
+exact prior production source (strong count2 rather than external-owner-only1).
+Every pre-State refusal now explicitly ends those owners before cleanup can
+return job/node credit. The regression covers native first-map refusal,
+cancellation after stack mapping, and cancellation after control mapping.
+
+The immutable `reports/run-worker-partial-v1.sh` repeat completed all **25**
+current tests under System and pinned mimalloc, serial native interposition,
+two-thread regressions and optimized release, with strict Clippy/fmt and
+unchanged runtime/test/input hashes. The prior24-test evidence is historical.
+Normal join/TLS/unmap uncertainty continues to retain rather than mint credit.
+No production NativeOwner/SourceTask, TLS/allocator/kernel/backing/deep-callgraph
+profile or serving readiness is implied by this component repair.

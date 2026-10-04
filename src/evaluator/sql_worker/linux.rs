@@ -138,6 +138,9 @@ impl<'a, N: NativeOwner> WorkerFactory<'a, N> {
         // Admission owns ALL cleanup failures from this point onward.
         let ids = lease.mapping_ids();
         if ids[0] == 0 || ids[1] == 0 || ids[0] == ids[1] {
+            // The admitted lease may release the original job/node credit.
+            // Drop its original control owner BEFORE the lease can do so.
+            drop(original);
             return Err(WorkerError::InvalidLayout);
         }
         let cancel = original_cancellation(&original);
@@ -145,6 +148,8 @@ impl<'a, N: NativeOwner> WorkerFactory<'a, N> {
             match Mapping::new(layout.stack_mapping_bytes, ids[0], MapKind::StackAndGuards) {
                 Ok(map) => map,
                 Err(error) => {
+                    drop(original);
+                    drop(cancel);
                     if matches!(error, WorkerError::Unmap(_)) {
                         std::mem::forget(lease);
                     }
@@ -153,6 +158,8 @@ impl<'a, N: NativeOwner> WorkerFactory<'a, N> {
             };
         lease.observe(stack.mapped_event());
         if let Err(error) = stack.protect(layout.page_bytes, layout.stack_bytes) {
+            drop(original);
+            drop(cancel);
             cleanup_partial(&mut stack, None, lease);
             return Err(error);
         }
@@ -162,6 +169,8 @@ impl<'a, N: NativeOwner> WorkerFactory<'a, N> {
             layout.page_bytes,
             &mut original,
         ) {
+            drop(original);
+            drop(cancel);
             cleanup_partial(&mut stack, None, lease);
             return Err(error);
         }
@@ -172,6 +181,8 @@ impl<'a, N: NativeOwner> WorkerFactory<'a, N> {
         ) {
             Ok(map) => map,
             Err(error) => {
+                drop(original);
+                drop(cancel);
                 if matches!(error, WorkerError::Unmap(_)) {
                     let _ = stack.release();
                     std::mem::forget(lease);
@@ -193,6 +204,8 @@ impl<'a, N: NativeOwner> WorkerFactory<'a, N> {
                 )
             })
         {
+            drop(original);
+            drop(cancel);
             cleanup_partial(&mut stack, Some(&mut control), lease);
             return Err(error);
         }
