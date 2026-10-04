@@ -118,7 +118,7 @@ fn identity(registry: u64) -> RegistryIdentity {
         installation: 0,
         registry,
         bundle: registry + 1,
-        schema: registry + 2,
+        schema: SourceStamp::present(registry + 2).unwrap(),
         namespace: root_namespace(),
     }
 }
@@ -652,7 +652,7 @@ fn sql_registry_pool_foreign_cell_with_equal_uid_and_code_is_rejected_by_actual_
     let code = NativeCode {
         registry: 1,
         bundle: 2,
-        schema: 3,
+        schema: SourceStamp::present(3).unwrap(),
     };
     let directory = a.directory().unwrap();
     let token = directory
@@ -741,7 +741,7 @@ fn sql_registry_pool_concurrent_last_external_handles_clear_current_once_and_pre
     let code = NativeCode {
         registry: 1,
         bundle: 2,
-        schema: 3,
+        schema: SourceStamp::present(3).unwrap(),
     };
     let directory = pool.directory().unwrap();
     let token = directory

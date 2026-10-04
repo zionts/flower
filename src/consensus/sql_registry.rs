@@ -13,6 +13,9 @@ pub(in crate::consensus) use bootstrap::source_registry;
 pub(crate) use bootstrap::{StaticRegion, bootstrap_required_layout, install_source_registry};
 #[path = "sql_registry/pool.rs"]
 mod pool;
+#[path = "sql_registry/stamp.rs"]
+mod stamp;
+pub(crate) use stamp::SourceStamp;
 
 pub(crate) use pool::{
     RegistryAdmission, RegistryDirectoryLimits, RegistryPool, RegistryPoolLayout,
@@ -43,23 +46,21 @@ pub(crate) enum RegistryError {
 }
 
 /// Assigned by the actual native publication, not by a parsed guest registry.
-/// Required positive physical versions refer to the same published code set.
+/// Registry/bundle physical versions and explicit schema presence refer to the
+/// same published code set. An empty schema can be native-certified absent;
+/// missing/unknown registry is never an installed empty registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::consensus) struct RegistryIdentity {
     pub(in crate::consensus) store: u64,
     pub(in crate::consensus) installation: u64,
     pub(in crate::consensus) registry: u64,
     pub(in crate::consensus) bundle: u64,
-    pub(in crate::consensus) schema: u64,
+    pub(in crate::consensus) schema: SourceStamp,
     pub(in crate::consensus) namespace: RegistryNamespace,
 }
 
 impl RegistryIdentity {
     fn valid(self) -> bool {
-        self.store != 0
-            && self.registry != 0
-            && self.bundle != 0
-            && self.schema != 0
-            && self.namespace.uid != 0
+        self.store != 0 && self.registry != 0 && self.bundle != 0 && self.namespace.uid != 0
     }
 }

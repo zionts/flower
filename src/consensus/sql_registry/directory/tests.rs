@@ -57,7 +57,7 @@ fn code(registry: u64) -> NativeCode {
     NativeCode {
         registry,
         bundle: registry + 1,
-        schema: registry + 2,
+        schema: SourceStamp::present(registry + 2).unwrap(),
     }
 }
 fn register(directory: &Directory<'_>, issuer: &Issuer, name: &str) -> NativeHeadToken {
@@ -435,7 +435,7 @@ fn directory_updates_never_alias_old_code_and_unattached_heads_are_unavailable()
             ..code(20)
         },
         NativeCode {
-            schema: 100,
+            schema: SourceStamp::present(100).unwrap(),
             ..code(20)
         },
     ] {
@@ -1000,7 +1000,7 @@ fn directory_cell_identity_and_requested_code_mismatches_refuse_without_replacin
             ..identity
         },
         RegistryIdentity {
-            schema: identity.schema + 1,
+            schema: SourceStamp::present(identity.schema.version().unwrap().get() + 1).unwrap(),
             ..identity
         },
         RegistryIdentity {
@@ -1043,7 +1043,7 @@ fn directory_cell_identity_and_requested_code_mismatches_refuse_without_replacin
             ..code(1)
         },
         NativeCode {
-            schema: 99,
+            schema: SourceStamp::present(99).unwrap(),
             ..code(1)
         },
     ] {
@@ -1597,4 +1597,93 @@ fn directory_current_owner_cross_thread_selection_and_cell_clone_are_safe_zero_h
     });
     assert_eq!(pool.live_cells(), 1);
     assert_zero(|| drop(witness));
+}
+
+#[test]
+fn directory_explicit_absent_schema_is_selectable_and_never_matches_present_or_old_current() {
+    let (pool, _) = fixture_combined_pool(3, 2, 6);
+    let directory = pool.directory().unwrap();
+    let empty = br#"{"format":1,"methods":{}}"#;
+    for origin in [
+        origin(NativeKey::Root),
+        NativeOrigin {
+            epoch: 7,
+            ..scoped("tenant")
+        },
+    ] {
+        let absent = NativeCode {
+            schema: SourceStamp::KnownAbsent,
+            ..code(1)
+        };
+        let present = NativeCode {
+            schema: SourceStamp::present(55).unwrap(),
+            ..code(1)
+        };
+        assert_zero(|| {
+            let (token, namespace) = register_from_pool(&directory, &pool, origin, absent);
+            let identity = fixture_identity(origin, namespace, absent);
+            directory
+                .attach_current_native(origin, token, absent, seal_cell(&pool, identity, empty))
+                .unwrap();
+            let old_absent = directory
+                .select_current_native(origin, token, absent)
+                .unwrap();
+            assert_eq!(old_absent.identity().schema, SourceStamp::KnownAbsent);
+            assert_eq!(old_absent.raw_json(), empty);
+            assert_eq!(
+                directory
+                    .select_current_native(origin, token, present)
+                    .map(|_| ()),
+                Err(DirectoryError::CurrentUnavailable)
+            );
+            directory
+                .update_code_native(origin, token, present)
+                .unwrap();
+            assert_eq!(
+                directory
+                    .select_current_native(origin, token, present)
+                    .map(|_| ()),
+                Err(DirectoryError::CurrentUnavailable)
+            );
+            assert_eq!(
+                directory
+                    .select_current_native(origin, token, absent)
+                    .map(|_| ()),
+                Err(DirectoryError::CurrentUnavailable)
+            );
+            directory
+                .attach_current_native(
+                    origin,
+                    token,
+                    present,
+                    seal_cell(&pool, fixture_identity(origin, namespace, present), empty),
+                )
+                .unwrap();
+            let old_present = directory
+                .select_current_native(origin, token, present)
+                .unwrap();
+            assert_eq!(old_present.identity().schema.version().unwrap().get(), 55);
+            directory.update_code_native(origin, token, absent).unwrap();
+            assert_eq!(
+                directory
+                    .select_current_native(origin, token, absent)
+                    .map(|_| ()),
+                Err(DirectoryError::CurrentUnavailable)
+            );
+            directory
+                .attach_current_native(origin, token, absent, seal_cell(&pool, identity, empty))
+                .unwrap();
+            let current_absent = directory
+                .select_current_native(origin, token, absent)
+                .unwrap();
+            assert_eq!(current_absent.identity().schema, SourceStamp::KnownAbsent);
+            assert_eq!(pool.live_cells(), 3);
+            drop(old_absent);
+            drop(old_present);
+            drop(current_absent);
+            assert_eq!(pool.live_cells(), 1);
+            directory.retire_native(origin, token).unwrap();
+            assert_eq!(pool.live_cells(), 0);
+        });
+    }
 }
