@@ -133,6 +133,12 @@ export interface Collection<T = Json, K extends Json = string, I extends IndexMa
    * already there. References held by fields get an index of them.
    */
   references(target: ReferenceTarget, on: ReferencePlace<T>, options?: ReferenceOptions): Collection<T, K, I>;
+  /**
+   * Declare this physical source's native lifetime protection. This is deny-only
+   * metadata, not read/write authority; omitting it later does not clear protection
+   * retained by the native source owner. There is no unprotect operation.
+   */
+  protectLifetime(): Collection<T, K, I>;
   /** A new reference whose keys are validated JSON values, stored as canonical JSON. */
   key<K2 extends Json>(schema: SchemaLike<K2>): Collection<T, K2, I>;
   by<N extends Extract<keyof I, string>>(name: N): Index<T, K, I[N]>;
@@ -149,6 +155,7 @@ export interface CollectionInfo {
   readonly value: Schema<unknown> | null;
   readonly access?: AccessManifest;
   readonly references?: readonly ReferenceInfo[];
+  readonly nativeLifetime?: "protected";
 }
 const collectionInfos = new WeakMap<object, CollectionInfo>();
 const rangeOwners = new WeakMap<object, Collection<any, any, any>>();
@@ -263,6 +270,11 @@ class CollectionReference {
     const reference: ReferenceInfo = Object.freeze({ target: target as ReferenceTarget, ...place, onDelete });
     return new CollectionReference(this.name, Object.assign(Object.create(null), this.indexes),
       { ...info, references: Object.freeze([...(info.references ?? []), reference]) });
+  }
+  protectLifetime(): CollectionReference {
+    const info = collectionInfos.get(this);
+    if (arguments.length !== 0 || !info) throw new TypeError("protectLifetime requires a declared collection and no arguments");
+    return new CollectionReference(this.name, Object.assign(Object.create(null), this.indexes), { ...info, nativeLifetime: "protected" });
   }
   key(keySchema: SchemaLike<Json>): CollectionReference {
     return new CollectionReference(this.name, Object.assign(Object.create(null), this.indexes), { ...collectionInfos.get(this)!, key: adopt(keySchema) });
@@ -574,6 +586,8 @@ export interface CollectionManifest {
   readonly indexes: Readonly<Record<string, readonly string[]>>;
   readonly access?: AccessManifest;
   readonly references?: readonly ReferenceManifest[];
+  /** Closed native source-lifetime declaration; absence does not revoke retained protection. */
+  readonly nativeLifetime?: "protected";
 }
 export interface FlowerModule<H extends HttpMap = HttpMap> {
   readonly definitions: Readonly<Record<string, Definition>>;

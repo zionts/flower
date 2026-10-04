@@ -95,7 +95,8 @@ export function referenceManifest(collection: Collection<any, any, any>, referen
 /**
  * Merge collection declarations by name; one name must always carry the same indexes. With `references`,
  * entries list those the declarations carry (resolving their targets): declarations without any don't
- * conflict with them, but two different sets do.
+ * conflict with them, but two different sets do. Lifetime protection must agree on
+ * every declaration of one name: an omitted flag cannot silently erase or add it.
  */
 export function collectionManifest(references: Iterable<Collection<any, any, any>>, withReferences = true): CollectionManifest[] {
   const byName = new Map<string, CollectionManifest>();
@@ -105,6 +106,9 @@ export function collectionManifest(references: Iterable<Collection<any, any, any
       if (!property || !("value" in property)) throw new TypeError("collections requires collection references");
     }
     if (reference.kind !== "collection") throw new TypeError("collections requires collection references");
+    // Only the builder's private declaration can supply the flag, never a raw
+    // caller reference's own/inherited property or getter.
+    if ("nativeLifetime" in reference) throw new TypeError("nativeLifetime requires collection.protectLifetime()");
     requireName(reference.name, "Collection name");
     const declared = plainObject(reference.indexes, "Collection indexes");
     const indexes: Record<string, readonly string[]> = Object.create(null);
@@ -113,6 +117,8 @@ export function collectionManifest(references: Iterable<Collection<any, any, any
       indexes[index] = fields(columns);
     }
     const access = collectionInfo(reference)?.access;
+    const nativeLifetime = collectionInfo(reference)?.nativeLifetime;
+    if (nativeLifetime !== undefined && nativeLifetime !== "protected") throw new TypeError('nativeLifetime must be "protected"');
     // Only JSON keys have parts: a plain string key that happens to parse as JSON must not.
     if (access && !collectionInfo(reference)?.key && usesKeyParts(access)) {
       throw new TypeError(`Access rules of ${JSON.stringify(reference.name)} read key parts; declare its keys with collection.key(schema)`);
@@ -122,10 +128,14 @@ export function collectionManifest(references: Iterable<Collection<any, any, any
       .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, each]) => each);
     const entry: CollectionManifest = Object.freeze({
       name: reference.name, indexes: Object.freeze(indexes), ...(access ? { access } : {}), ...(referring.length ? { references: Object.freeze(referring) } : {}),
+      ...(nativeLifetime === undefined ? {} : { nativeLifetime }),
     });
     const previous = byName.get(reference.name);
     if (previous && canonicalJson(previous.indexes) !== canonicalJson(entry.indexes)) {
       throw new TypeError(`Collection ${JSON.stringify(reference.name)} is declared with different indexes`);
+    }
+    if (previous && previous.nativeLifetime !== entry.nativeLifetime) {
+      throw new TypeError(`Collection ${JSON.stringify(reference.name)} is declared with different native lifetime protection`);
     }
     // Access belongs to the collection: references without it (in a trigger, say) don't
     // conflict, but two different policies do.

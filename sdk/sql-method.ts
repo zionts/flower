@@ -20,6 +20,8 @@ export interface SqlFinishBinding {
   readonly catalogVersion: string;
   readonly authorityContext: Json;
   readonly sourceRevision: number;
+  /** Actual native permission-ledger bound, exclusive; null is evaluated independence/invariance only. */
+  readonly validUntil: number | null;
   readonly partition: {readonly name: string; readonly epoch: number} | null;
 }
 export interface SqlFinishMetadata extends SqlFinishBinding {readonly request: SqlTerminalRequest}
@@ -101,7 +103,16 @@ export function sqlMethod(name: string, spec: SqlMethodSpec<any, SqlOperation, a
     if (operation === "cancel") fail("SQL_CANCEL_NATIVE_ONLY", "Cancellation uses closed native formatting");
     // These values come only from the native fresh-finish binding. This adapter
     // deliberately never binds a database host or supplies source getters.
-    const binding = Object.freeze({...input.binding});
+    const native = input?.binding;
+    if (!native || typeof native !== "object" || !Object.hasOwn(native, "validUntil")
+      || !Number.isSafeInteger(native.clock) || native.clock < 0
+      || (native.validUntil !== null && (typeof native.validUntil !== "number"
+        || !Number.isSafeInteger(native.validUntil) || native.validUntil <= native.clock))) {
+      fail("SQL_NATIVE_BINDING_INVALID", "SQL_NATIVE_BINDING_INVALID");
+    }
+    // Shape validation is not JWT/source/runtime verification. Only the native
+    // producer may issue null after a healthy completed permission callback.
+    const binding = Object.freeze({...native});
     const ctx: SqlFinishContext = Object.freeze({
       principal: () => binding.principal, clock: () => binding.clock,
       history: () => binding.history, codeVersion: () => binding.codeVersion, binding,

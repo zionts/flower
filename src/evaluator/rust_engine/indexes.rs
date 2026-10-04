@@ -114,6 +114,7 @@ fn schema_parses() -> usize {
     PARSES.get()
 }
 
+// Descriptor limits only, not physical backing or a separate source-roster allowance.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
@@ -136,6 +137,11 @@ pub struct Schema {
     /// rows that exist. Each one held by fields has its index among `indexes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<super::ReferenceSpec>,
+    /// Explicit physical source selectors accepted from collection declarations.
+    /// This is deny-only metadata, independent of SQL catalogs and the SQL feature.
+    /// Missing on a later schema means no new declaration, not roster revocation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_sources: Vec<String>,
     /// Explicit opt-in logical catalogs, cut over atomically with code and policies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) sql: Vec<crate::evaluator::sql::Catalog>,
@@ -149,6 +155,9 @@ pub struct IndexSpec {
 }
 
 impl Schema {
+    pub(crate) const MAX_PROTECTED_SOURCES: usize = 256;
+    pub(crate) const MAX_PROTECTED_SOURCE_BYTES: usize = 32 * 1024;
+
     pub(super) fn load_shared(
         record: Option<&Arc<Value>>,
         available_bytes: usize,
@@ -210,6 +219,9 @@ impl Schema {
         let policies = self.references.iter().fold(policies, |bytes, reference| {
             bytes.saturating_add(reference.allocation_cost())
         });
+        let policies = self.protected_sources.iter().fold(policies, |bytes, name| {
+            bytes.saturating_add(32 + name.len())
+        });
         let policies = self.sql.iter().fold(policies, |bytes, catalog| {
             bytes.saturating_add(catalog.allocation_cost())
         });
@@ -229,6 +241,22 @@ impl Schema {
     }
 
     pub(super) fn validate(mut self) -> EngineResult<Self> {
+        if self.protected_sources.len() > Self::MAX_PROTECTED_SOURCES
+            || self.protected_sources.iter().any(String::is_empty)
+            || self
+                .protected_sources
+                .iter()
+                .try_fold(0usize, |bytes, name| bytes.checked_add(name.len()))
+                .is_none_or(|bytes| bytes > Self::MAX_PROTECTED_SOURCE_BYTES)
+            || self.protected_sources.iter().collect::<HashSet<_>>().len()
+                != self.protected_sources.len()
+        {
+            return Err(EngineError::new(
+                "INPUT_INVALID",
+                "Malformed protected source selectors",
+            ));
+        }
+        self.protected_sources.sort();
         for index in self.indexes.iter().chain(self.aggregates.values()) {
             if index.collection.is_empty()
                 || index.fields.is_empty()
@@ -323,6 +351,7 @@ impl Schema {
             && self.policies.is_empty()
             && self.derived_access.is_empty()
             && self.references.is_empty()
+            && self.protected_sources.is_empty()
             && self.sql.is_empty()
     }
 }
@@ -780,6 +809,74 @@ mod schema_cache_tests {
 
     fn record(collection: &str) -> Arc<Value> {
         Arc::new(json!({"indexes":[{"collection":collection,"fields":["shop"]}]}))
+    }
+
+    #[test]
+    fn native_lifetime_only_schema_is_not_empty_and_roundtrips_through_native_loader() {
+        let encoded = json!({"protected_sources":["zSource", "arbitrarySource"]});
+        let schema = Schema::load(Some(&encoded)).unwrap();
+        assert!(!schema.empty());
+        assert_eq!(schema.protected_sources, ["arbitrarySource", "zSource"]);
+        assert_eq!(
+            schema.allocation_cost(),
+            32 * 2 + "arbitrarySourcezSource".len()
+        );
+        let stored = serde_json::to_value(&schema).unwrap();
+        assert_eq!(Schema::load(Some(&stored)).unwrap(), schema);
+        let record = Arc::new(stored);
+        let (shared, bytes) = Schema::load_shared(Some(&record), usize::MAX).unwrap();
+        assert_eq!(*shared, schema);
+        assert_eq!(bytes, allocation_cost(&record) * 2);
+        assert_eq!(
+            Schema::load_shared(Some(&record), bytes - 1)
+                .unwrap_err()
+                .code,
+            "EVALUATION_BUDGET"
+        );
+        // Absence on a new declaration is empty, not a claim about persistent META.
+        for old in [
+            None,
+            Some(&json!({})),
+            Some(&json!({"protected_sources":[]})),
+        ] {
+            let empty = Schema::load(old).unwrap();
+            assert!(empty.empty());
+            assert!(
+                !serde_json::to_value(empty)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .contains_key("protected_sources")
+            );
+        }
+    }
+
+    #[test]
+    fn native_lifetime_stored_selectors_reject_malformed_and_excessive_values() {
+        for selectors in [
+            Value::Null,
+            json!(false),
+            json!("protected"),
+            json!([null]),
+            json!([false]),
+            json!([{}]),
+            json!([""]),
+            json!(["same", "same"]),
+            json!(["x".repeat(Schema::MAX_PROTECTED_SOURCE_BYTES + 1)]),
+            json!(
+                (0..=Schema::MAX_PROTECTED_SOURCES)
+                    .map(|n| format!("s{n}"))
+                    .collect::<Vec<_>>()
+            ),
+        ] {
+            let encoded = json!({"protected_sources":selectors});
+            assert_eq!(
+                Schema::load(Some(&encoded)).unwrap_err().code,
+                "INPUT_INVALID"
+            );
+        }
+        assert!(Schema::load(Some(&json!({"protectedSources":["custom"]}))).is_err());
+        assert!(Schema::load(Some(&json!({"nativeLifetime":"protected"}))).is_err());
     }
 
     #[test]
