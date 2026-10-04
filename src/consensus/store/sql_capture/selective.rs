@@ -31,7 +31,10 @@ impl Store {
                 .inner
                 .published
                 .try_read()
-                .map_err(|_| SqlCaptureError::Busy)?;
+                .map_err(|error| match error {
+                    std::sync::TryLockError::WouldBlock => SqlCaptureError::Busy,
+                    std::sync::TryLockError::Poisoned(_) => SqlCaptureError::Storage,
+                })?;
             super::super::sql_source::require_ready(&self.inner)
                 .map_err(|_| SqlCaptureError::Storage)?;
             let applied = published

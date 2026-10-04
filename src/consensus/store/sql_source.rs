@@ -15,12 +15,14 @@ use crate::consensus::sql_registry::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceError {
     Bootstrap,
+    Publication,
     Directory(DirectoryError),
 }
 impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bootstrap => f.write_str("native source bootstrap unavailable"),
+            Self::Publication => f.write_str("native source publication unavailable"),
             Self::Directory(_) => f.write_str("native source lifetime unavailable"),
         }
     }
@@ -121,6 +123,19 @@ pub(super) fn require_ready(inner: &Inner) -> Result<(), SourceError> {
         .map_err(SourceError::Directory)
 }
 
+/// Only this actual Pubread yields a production source view. Poison is a
+/// permanent typed refusal, not a panic, Busy, recovered Ready or root clone.
+pub(super) fn read_publication(
+    inner: &Inner,
+) -> Result<std::sync::RwLockReadGuard<'_, Published>, SourceError> {
+    let guard = inner
+        .published
+        .read()
+        .map_err(|_| SourceError::Publication)?;
+    require_ready(inner)?;
+    Ok(guard)
+}
+
 /// Own the SAME actual Published write guard, not an inert caller boolean or
 /// a reference that can outlive an unlocked guard. Drop marks this affected
 /// Store BEFORE Rust drops the real guard field, including during unwinding.
@@ -132,13 +147,25 @@ pub(super) struct PublicationGuard<'a> {
 }
 impl<'a> PublicationGuard<'a> {
     pub(super) fn acquire(inner: &'a Inner) -> Result<Self, SourceError> {
-        let guard = inner.published.write().expect("published state lock");
+        let guard = inner
+            .published
+            .write()
+            .map_err(|_| SourceError::Publication)?;
         require_ready(inner)?;
         Ok(Self {
             inner,
             guard,
             armed: true,
         })
+    }
+    /// Private actual owner identity for the coupled projection token, not a
+    /// caller boolean or a serialized source/lifetime/authority claim.
+    pub(super) fn require_owner(&self, inner: &Inner) -> Result<(), SourceError> {
+        if std::ptr::eq(self.inner, inner) {
+            Ok(())
+        } else {
+            Err(SourceError::Publication)
+        }
     }
     pub(super) fn complete(mut self) {
         self.armed = false;

@@ -821,9 +821,7 @@ impl Store {
         &self,
         binding: Option<&PartitionBinding>,
     ) -> anyhow::Result<()> {
-        let published = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let published = sql_source::read_publication(&self.inner)?;
         if let Some(binding) = binding {
             partitions::active(published.partitions.get(&binding.partition), binding)?;
         }
@@ -839,9 +837,7 @@ impl Store {
     /// Queries need no receipts; a projected mutation read retains only the
     /// requested receipt allocation from the same published data revision.
     pub(super) async fn snapshot_for(&self, request_id: Option<&str>) -> anyhow::Result<Snapshot> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         Ok(Snapshot {
             revision: state.revision,
             data: state.data.clone(),
@@ -856,9 +852,7 @@ impl Store {
     /// The log position and application revision come from the same atomic
     /// publication as query data, including blank/membership/rejected entries.
     pub(super) fn read_fence(&self) -> anyhow::Result<super::read::ReadFence> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         Ok(super::read::ReadFence {
             applied: state
                 .last_applied
@@ -869,9 +863,7 @@ impl Store {
 
     /// Fence readiness without cloning/pinning either persistent root.
     pub(super) fn has_applied_fence(&self, fence: &super::read::ReadFence) -> anyhow::Result<bool> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(false);
         };
@@ -894,9 +886,7 @@ impl Store {
         &self,
         fence: &super::read::ReadFence,
     ) -> anyhow::Result<Option<Snapshot>> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(None);
         };
@@ -924,9 +914,7 @@ impl Store {
         &self,
         request_ids: &[String],
     ) -> anyhow::Result<Snapshot> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         Ok(Snapshot {
             revision: state.revision,
             data: state.data.clone(),
@@ -941,9 +929,7 @@ impl Store {
     /// Full writer baseline: cloning both persistent roots is O(1), including
     /// arbitrarily old request IDs that can arrive in later pipeline groups.
     pub(super) async fn snapshot_for_writer(&self) -> anyhow::Result<Snapshot> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         Ok(Snapshot {
             revision: state.revision,
             data: state.data.clone(),
@@ -952,9 +938,7 @@ impl Store {
     }
 
     pub(super) fn partition_infos(&self) -> anyhow::Result<Vec<PartitionInfo>> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         Ok(state
             .partitions
             .iter()
@@ -963,9 +947,7 @@ impl Store {
     }
 
     pub(super) fn partition_info(&self, id: &str) -> anyhow::Result<PartitionInfo> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         state
             .partitions
             .get(id)
@@ -974,9 +956,7 @@ impl Store {
     }
 
     pub(super) fn partition_state(&self, id: &str) -> anyhow::Result<PartitionState> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         state
             .partitions
             .get(id)
@@ -990,9 +970,7 @@ impl Store {
         request_id: Option<&str>,
         all: bool,
     ) -> anyhow::Result<Snapshot> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         let snapshot = partitions::active(state.partitions.get(&binding.partition), binding)?;
         let requests = if all {
             snapshot.requests.clone()
@@ -1019,9 +997,7 @@ impl Store {
         fence: &super::read::ReadFence,
         binding: Option<&PartitionBinding>,
     ) -> anyhow::Result<Option<Snapshot>> {
-        let state = self.inner.published.read().expect("published state lock");
-
-        sql_source::require_ready(&self.inner)?;
+        let state = sql_source::read_publication(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(None);
         };

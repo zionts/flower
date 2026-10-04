@@ -261,3 +261,73 @@ async fn sql_source_real_apply_guard_completes_and_fatal_store_cannot_publish_an
     );
     assert!(store.snapshot_for(None).await.is_err());
 }
+
+#[tokio::test]
+async fn sql_source_actual_unwind_poison_is_typed_refusal_not_busy_or_root_clone() {
+    fixture::bootstrap().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let healthy_dir = tempfile::tempdir().unwrap();
+    let store = Store::open(1, dir.path().into()).await.unwrap();
+    let healthy = Store::open(2, healthy_dir.path().into()).await.unwrap();
+    let (_, basis) = store
+        .snapshot_for_writer_with_basis(None, None, openraft::CommittedLeaderId::new(3, 1))
+        .unwrap();
+    #[cfg(feature = "sql")]
+    let capture_fence = store.sql_capture_bind_fence(
+        crate::consensus::read::ReadFence {
+            applied: LogId::new(openraft::CommittedLeaderId::new(3, 1), 0),
+            revision: 0,
+        },
+        None,
+    ); // Failure-only path: no positive quorum/source grant inferred.
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _publication = PublicationGuard::acquire(&store.inner).unwrap();
+        panic!("actual source publication unwind");
+    }));
+    assert!(caught.is_err());
+    assert!(store.inner.published.is_poisoned());
+    assert_eq!(
+        pool()
+            .unwrap()
+            .directory()
+            .unwrap()
+            .store_status_native(store.inner.capture_identity)
+            .unwrap(),
+        SourceStatus::Fatal
+    );
+    assert!(store.snapshot_for(None).await.is_err());
+    assert!(store.snapshot_for_many(&[]).await.is_err());
+    assert!(store.snapshot_for_writer().await.is_err());
+    assert!(store.partition_infos().is_err());
+    assert!(store.partition_state("missing").is_err());
+    assert!(store.check_availability(None).is_err());
+    assert!(store.read_fence().is_err());
+    assert!(PublicationGuard::acquire(&store.inner).is_err());
+    assert!(
+        basis
+            .decide::<()>(0, openraft::CommittedLeaderId::new(3, 1), None, || panic!(
+                "poison reached final Clock"
+            ))
+            .is_err()
+    );
+    #[cfg(feature = "sql")]
+    assert_eq!(
+        store
+            .sql_capture_slice(
+                None,
+                &capture_fence,
+                None,
+                crate::consensus::SqlCaptureRequest {
+                    selection: crate::consensus::SqlCaptureSelection::Keys(&["row"]),
+                    max_records: 1,
+                    max_examined: 1
+                },
+                crate::consensus::SqlCaptureBuffer::from_reserved(vec![0; 1024].into_boxed_slice())
+                    .unwrap()
+            )
+            .unwrap_err(),
+        crate::consensus::SqlCaptureError::Storage,
+        "publication poison must not masquerade as retriable Busy/cold empty"
+    );
+    assert!(healthy.snapshot_for_writer().await.is_ok());
+}
