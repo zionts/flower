@@ -111,7 +111,7 @@ pub(super) struct Runtime {
     client: reqwest::Client,
     pub catalog_writer: Mutex<()>,
     export: Mutex<Option<coordinator::ExportCache>>,
-    admission: Arc<super::admission::Pool>,
+    admission: super::admission::Owner,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,7 +131,7 @@ impl Runtime {
     pub fn new(
         consensus: Consensus,
         token: String,
-        admission: Arc<super::admission::Pool>,
+        admission: super::admission::Owner,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         let Some(config) = Config::load()? else {
             return Ok(None);

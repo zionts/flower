@@ -22,6 +22,84 @@ pub(super) struct Allowance {
     pub executed: bool,
 }
 impl Engine<'_> {
+    // Keep SQL-only planning/allocation locals out of the deeply recursive
+    // generic host dispatcher. Ordinary derived recursion must retain its
+    // original native frame footprint, even when SQL is compiled in.
+    pub(super) fn code_version(&mut self) -> EngineResult<Reply> {
+        self.record_read("bundle");
+        self.record_read("schema");
+        let generation = self
+            .staged
+            .get("bundle")
+            .and_then(|bundle| bundle.get("hash"))
+            .and_then(Value::as_str)
+            .map(|hash| {
+                let binding = json!([hash, self.staged.get("schema").unwrap_or(&Value::Null)]);
+                crate::evaluator::hash(canonical_json(&binding).as_bytes())
+            });
+        Ok(generation.map_or(Value::Null, Value::String).into())
+    }
+    pub(super) fn sql_admit_scan(&mut self, options: Option<&Value>) -> EngineResult<()> {
+        if self.sql.callback.is_none() {
+            return Ok(());
+        }
+        let limit = options
+            .and_then(|options| options.get("limit"))
+            .and_then(Value::as_u64);
+        if limit.is_none_or(|limit| limit == 0 || limit > catalog::BATCH_ROWS as u64)
+            || options.and_then(|options| options.get("index")).is_none()
+        {
+            return self.abort(
+                "SQL_SOURCE_BUDGET",
+                "SQL callback scans require a bounded declared native index",
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn sql_admit_range(&mut self, value: &Value) -> EngineResult<()> {
+        if self.sql.callback.is_some()
+            && value
+                .get("options")
+                .and_then(|options| options.get("limit"))
+                .and_then(Value::as_u64)
+                .is_none_or(|limit| limit == 0 || limit > catalog::BATCH_ROWS as u64)
+        {
+            return self.abort("SQL_SOURCE_BUDGET", "SQL callback ranges must be bounded");
+        }
+        Ok(())
+    }
+    pub(super) fn sql_callback_query(&mut self, query: &Query) -> EngineResult<Reply> {
+        if !self.has_index(&query) {
+            return self.abort(
+                "SQL_SOURCE_BUDGET",
+                "SQL callback queries require a declared index",
+            );
+        }
+        let prefix = if query.fields.len() == 1 {
+            vec![query.expected.clone()]
+        } else {
+            query.expected.as_array().cloned().ok_or_else(|| {
+                EngineError::new(
+                    "SQL_SOURCE_BUDGET",
+                    "SQL callback query requires scalar index components",
+                )
+            })?
+        };
+        let range = ranges::RangeQuery::parse(
+            &json!({"kind":"range","collection":query.collection,"fields":query.fields,"options":{"prefix":prefix,"limit":crate::evaluator::sql::BATCH_ROWS + 1}}),
+        )?;
+        let result = self.range_rows(&range, true)?.rows.into_value();
+        let rows = result["rows"].as_array().expect("native page");
+        if rows.len() > crate::evaluator::sql::BATCH_ROWS {
+            return self.abort(
+                "SQL_SOURCE_BUDGET",
+                "SQL callback query exceeds bounded batch",
+            );
+        }
+        Ok(Reply::Value(Value::Array(
+            rows.iter().map(|row| row["value"].clone()).collect(),
+        )))
+    }
     pub(super) fn sql_check(&mut self) -> EngineResult<()> {
         self.check_fatal()?;
         if self
@@ -105,6 +183,9 @@ impl Engine<'_> {
             .first()
             .and_then(Value::as_str)
             .ok_or_else(|| EngineError::new("SQL_INPUT_INVALID", "SQL operation required"))?;
+        if !matches!(operation, "query" | "explain" | "catalog" | "cancel") {
+            return self.abort("SQL_INPUT_INVALID", "Unknown SQL operation");
+        }
         let name = arguments
             .get(1)
             .and_then(Value::as_str)
@@ -160,7 +241,7 @@ impl Engine<'_> {
         let original_system = self.system;
         let original_access = std::mem::take(&mut self.access);
         self.system = true;
-        let request = json!({"catalog":registered.name,"invoker":self.principal,"purpose":purpose});
+        let request = json!({"catalog":registered.name,"operation":operation,"invoker":self.principal,"purpose":purpose});
         let decision = self.sql_callback(Callback::Authority, &registered.authority, &request);
         self.system = original_system;
         self.access = original_access;

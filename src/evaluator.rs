@@ -12,6 +12,13 @@ mod profile;
 pub(crate) mod rust_engine;
 pub(crate) mod sql;
 #[cfg(feature = "sql")]
+pub(crate) mod sql_bridge;
+#[cfg(feature = "sql")]
+pub(crate) mod sql_control;
+#[cfg(feature = "sql")]
+pub(crate) mod sql_frame;
+mod sql_registry;
+#[cfg(feature = "sql")]
 pub(crate) mod sqlite;
 pub(crate) mod staging;
 pub use rust_engine::{
@@ -108,6 +115,8 @@ pub struct HttpMethod {
     /// again. Only mutations may give it up.
     #[serde(skip_serializing_if = "is_true")]
     pub receipt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal: Option<sql::TerminalMethod>,
     /// Whether the service may reuse or coalesce a query result.
     #[serde(skip_serializing_if = "is_true")]
     pub cache: bool,
@@ -125,6 +134,8 @@ fn is_true(value: &bool) -> bool {
 struct RawHttpMethod {
     name: String,
     kind: MethodKind,
+    #[serde(default)]
+    terminal: Option<sql::TerminalMethod>,
     // Distinguish absence from an explicitly supplied null or default: mutations
     // must reject the property even when it would mean linearizable on a query.
     #[serde(default, deserialize_with = "present_consistency")]
@@ -162,7 +173,16 @@ impl TryFrom<RawHttpMethod> for HttpMethod {
         if method.kind != MethodKind::Query && (method.cache.is_some() || method.watch.is_some()) {
             return Err("cache and watch are only supported on query methods");
         }
+        if method.terminal.is_some()
+            && (method.kind != MethodKind::Query
+                || method.cache.unwrap_or(true)
+                || method.watch.unwrap_or(true)
+                || method.consistency == Some(QueryConsistency::ReplicaLocal))
+        {
+            return Err("terminal SQL requires fresh one-shot query flags");
+        }
         Ok(Self {
+            terminal: method.terminal,
             name: method.name,
             kind: method.kind,
             consistency: method.consistency.unwrap_or_default(),
@@ -682,6 +702,10 @@ fn evaluate_selected_cancellable(
     } else {
         None
     };
+    let terminal_registry = manifest
+        .as_ref()
+        .map(|manifest| sql_registry::build(&manifest.http))
+        .transpose()?;
     if let Some(manifest) = &manifest {
         // Install declarations before evaluating roots in the new bundle.
         // This field is internal and cannot be supplied by a public mutation.
@@ -704,6 +728,12 @@ fn evaluate_selected_cancellable(
         )?
     };
     limits.check()?;
+    if let Some(registry) = terminal_registry {
+        // This is in the SAME committed write set as bundle/schema/httpMethods.
+        // A capture preflight must not infer SQL absence from a legacy/missing
+        // registry, nor use this descriptor as authenticated authority.
+        result.puts.insert(sql_registry::RECORD.into(), registry);
+    }
     if let Some(manifest) = manifest {
         result.puts.insert(
             "authorizationMethod".into(),
@@ -888,7 +918,7 @@ const MANIFEST: &str = r#"
         }
         return value;
     }
-    const kinds = {derived: 'derived', queryMethod: 'query', mutationMethod: 'mutation', transactionMethod: 'transaction', sqlAuthority: 'sqlAuthority', sqlProvider: 'sqlProvider'};
+    const kinds = {derived: 'derived', queryMethod: 'query', mutationMethod: 'mutation', transactionMethod: 'transaction', sqlAuthority: 'sqlAuthority', sqlProvider: 'sqlProvider', sqlFinalizer: 'sqlFinalizer'};
     const members = ['http', 'maintenance', 'authorize', 'collections', 'keys', 'sql'];
     return () => {
         const app = record(typeof __flowerBundle !== 'undefined' && __flowerBundle.default, 'application');
@@ -906,6 +936,7 @@ const MANIFEST: &str = r#"
             if (Object.hasOwn(definition, 'watch')) entry.watch = definition.watch;
             if (Object.hasOwn(definition, 'aggregate')) entry.aggregate = definition.aggregate;
             if (Object.hasOwn(definition, 'access')) entry.access = definition.access;
+            if (Object.hasOwn(definition, 'terminal')) entry.terminal = definition.terminal;
         }
         for (const key of Object.keys(app)) {
             if (key === 'definitions' || app[key] === undefined) continue;
@@ -922,7 +953,7 @@ const MANIFEST: &str = r#"
 // Values cross natively: the host encoder validates results and arguments.
 const CELL_RUNNER: &str = r#"
 ((host) => {
-    const kinds = ['query', 'mutation', 'transaction', 'derived', 'sqlAuthority', 'sqlProvider'];
+    const kinds = ['query', 'mutation', 'transaction', 'derived', 'sqlAuthority', 'sqlProvider', 'sqlPlan', 'sqlFinalizer'];
     function ref(value) {
         if (typeof value === 'string') return value;
         if (value && (value.kind === 'collection' || value.kind === 'derived'))
@@ -970,16 +1001,22 @@ const CELL_RUNNER: &str = r#"
     // subsequent cell.
     const derivedContext = Object.freeze({...readers});
     const methodContext = Object.freeze({...readers, ...writers});
+    const readlessContext = Object.freeze({principal:readers.principal,clock:readers.clock,history:readers.history,codeVersion:readers.codeVersion});
     // Published before the bundle initializes, so the SDK can bind contexts
     // into the initialization snapshot instead of in every callback.
-    Object.defineProperty(globalThis, '__flowerContexts', {value: Object.freeze([derivedContext, methodContext])});
+    Object.defineProperty(globalThis, '__flowerContexts', {value: Object.freeze([derivedContext, methodContext, readlessContext])});
     const run = (kind, name, args) => {
         const definitions = typeof __flowerBundle !== 'undefined' && __flowerBundle.default.definitions;
         if (!definitions || !Object.hasOwn(definitions, name) || typeof definitions[name].compute !== 'function')
             throw Object.assign(new Error('Unknown derived definition: ' + name), {code: 'DEFINITION_MISSING'});
-        const expectedKind = kind >= 3 ? kinds[kind] : kinds[kind] + 'Method';
+        const expectedKind = kind === 6 ? 'queryMethod' : kind >= 3 ? kinds[kind] : kinds[kind] + 'Method';
         if (definitions[name].kind !== expectedKind)
             throw Object.assign(new Error('Definition ' + name + ' is not a ' + kinds[kind] + ' method'), {code: 'METHOD_KIND_MISMATCH'});
+        if (kind === 6 && !Object.hasOwn(definitions[name], 'terminal'))
+            throw Object.assign(new Error('SQL planner requires terminal metadata'), {code:'METHOD_KIND_MISMATCH'});
+        if (kind !== 6 && Object.hasOwn(definitions[name], 'terminal'))
+            throw Object.assign(new Error('Terminal SQL cannot enter an ordinary invocation'), {code:'SQL_TERMINAL_UNAVAILABLE'});
+        if (kind === 6 || kind === 7) return definitions[name].compute(readlessContext, args);
         if (kind >= 3) return definitions[name].compute(derivedContext, args);
         if (kind === 0) return definitions[name].compute(methodContext, args);
         return definitions[name].compute(methodContext, args, elevate);

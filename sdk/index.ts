@@ -3,17 +3,17 @@ export type { Json } from "./json.ts";
 export { v, ValidationError } from "./schema.ts";
 export type { Schema, SchemaLike, SchemaPath, StandardSchema, Infer, ObjectOf, Optional } from "./schema.ts";
 export {
-  fail, collection, derive, query, mutation, transaction, participant, task, trigger, component,
+  fail, collection, derive, query, mutation, transaction, participant, task, trigger, retainDeleted, component,
 } from "./core.ts";
 export type {
   Failure, IndexScalar, IndexMap, FieldOf, IndexValues, EqualityValue, RangeOptions, ScanOptions, Row, RangePage, Query, RangeQuery, Index, Collection,
-  Principal, AuthorizationRequest, HistoryIdentity, Context, QueryContext, MutationContext, SetOptions,
+  Principal, AuthorizationRequest, HistoryIdentity, Context, QueryContext, MutationContext, SetOptions, DeleteOptions,
   AggregateMetadata, Derived, Materialization, DeriveOptions, QueryConsistency, Access, MethodSpec, MutationSpec, QuerySpec,
   QueryMethod, MutationMethod, TransactionTarget, TransactionCall, TransactionPlan, TransactionMethod, TransactionResult,
   Definition, HttpMethod, HttpMap, ManifestMethod, CollectionManifest, ReferenceManifest, FlowerModule,
   OnDelete, ReferencePlace, ReferenceOptions, ReferenceTarget,
   ApiOf, ArgsOf, ResultOf, AliasOf, QueryAliasOf, MutationAliasOf, ArgsParameter,
-  TaskFailure, Task, Change, Trigger, Usable, ComponentParts, Component,
+  TaskFailure, Task, Change, Trigger, DeletedRow, Usable, ComponentParts, Component,
 } from "./core.ts";
 export type { Rule, RuleLike, Operand, OperandLike, KeyOperand, ArgsOperand, DerivedScope, DerivedAccess, RowFields, PrincipalFields, AccessScope, CollectionName, AccessRules, FieldAccess, CollectionAccess, AccessManifest } from "./access.ts";
 export { define } from "./define.ts";
@@ -42,3 +42,6 @@ export type { WatchDelta, WatchSnapshot, WatchPatch, JsonPatchOperation } from "
 
 export { sqlTable, sqlCatalog } from "./sql.ts";
 export type { SqlCell, JsonScalar, SqlColumn, SqlIndex, SqlRelationship, SqlReadContext, SqlProviderContext, SqlAuthorityContext, SqlProviderInput, SqlProjectedRow, SqlProviderBatch, SqlAuthorityRequest, SqlAuthorityDecision, SqlTableSpec, SqlTable, SqlCatalogSpec, SqlCatalog, SqlQueryInput, SqlResultColumn, SqlResult, SqlExecution, SqlCatalogColumn, SqlCatalogInfo, SqlExplain, SqlContext } from "./sql.ts";
+
+export { sqlMethod } from "./sql-method.ts";
+export type { SqlOperation, SqlCancelResultShape, SqlTerminalRequest, SqlFinishBinding, SqlFinishMetadata, SqlFinishContext, SqlPublicResult, SqlOperationResult, SqlFinishInput, SqlMethodSpec, SqlTerminalMetadata } from "./sql-method.ts";

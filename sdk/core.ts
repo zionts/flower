@@ -1,6 +1,7 @@
 import { canonicalJson, type Json } from "./json.ts";
 import { schema as adopt, ValidationError, type Infer, type Schema, type SchemaLike } from "./schema.ts";
-import type { SqlCatalog, SqlContext } from "./sql.ts";
+import type { SqlContext } from "./sql.ts";
+import type { SqlTerminalMetadata } from "./sql-method.ts";
 import type { ManagedKey } from "./keys.ts";
 import { compileAccess, compileDerivedAccess, type AccessManifest, type CollectionAccess, type DerivedAccess } from "./access.ts";
 
@@ -349,9 +350,13 @@ export interface SetOptions<T = Json> {
    */
   readonly clear?: readonly FieldOf<T>[];
 }
+export interface DeleteOptions {
+  /** Skip retainDeleted callbacks for this deletion and its foreign-key cascades. */
+  readonly permanent?: boolean;
+}
 export interface MutationContext extends QueryContext {
   set<T, K extends Json>(collection: Collection<T, K, any>, key: K, value: T, options?: SetOptions<NoInfer<T>>): void;
-  delete<T, K extends Json>(collection: Collection<T, K, any>, key: K): void;
+  delete<T, K extends Json>(collection: Collection<T, K, any>, key: K, options?: DeleteOptions): void;
   materialize<V>(derived: Derived<null, V>): void;
   materialize<A, V>(derived: Derived<A, V>, args: A): void;
   unmaterialize<V>(derived: Derived<null, V>): void;
@@ -440,6 +445,7 @@ export interface QueryMethod<A = Json, V = Json> {
   readonly consistency?: "replica-local";
   readonly cache?: false;
   readonly watch?: false;
+  readonly terminal?: SqlTerminalMetadata;
 }
 export interface MutationMethod<A = Json, V = Json> {
   readonly kind: "mutationMethod";
@@ -456,7 +462,7 @@ export interface TransactionMethod<A = Json, V = Json> {
   readonly compute: (ctx: Context, args: A) => TransactionPlan<V>;
 }
 export interface SqlCallback {
-  readonly kind: "sqlAuthority" | "sqlProvider";
+  readonly kind: "sqlAuthority" | "sqlProvider" | "sqlFinalizer";
   readonly name: string;
   readonly compute: (ctx: any, args: any) => any;
 }
@@ -467,6 +473,12 @@ export type HttpMap = { readonly [alias: string]: HttpMethod };
 export interface MethodInfo { readonly args: Schema<unknown> | null; readonly access: Access | undefined }
 const methodInfos = new WeakMap<object, MethodInfo>();
 export function methodInfo(method: object): MethodInfo { return methodInfos.get(method) ?? { args: null, access: undefined }; }
+/** Internal pure argument admission retained across bundled VM realms. */
+export const METHOD_ARGS_GUARD = Symbol.for("$flower.method.arguments");
+export function validateMethodArgs(method: object, raw: unknown): unknown {
+  return parseArgs(methodInfo(method).args, raw);
+}
+
 
 function access(value: unknown): Access | undefined {
   if (value === undefined || value === "public" || value === "authenticated" || typeof value === "function") return value as Access | undefined;
@@ -538,7 +550,7 @@ export function transaction(name: string, specOrPlan: unknown, maybePlan?: unkno
 
 /** A committed transaction: each call's result, and the plan's value when it has one. */
 export interface TransactionResult<V = Json> { results: Json[]; value?: V }
-export interface ManifestMethod { readonly name: string; readonly kind: "query" | "mutation" | "transaction"; readonly consistency?: "replica-local"; readonly receipt?: false; readonly cache?: false; readonly watch?: false }
+export interface ManifestMethod { readonly name: string; readonly kind: "query" | "mutation" | "transaction"; readonly consistency?: "replica-local"; readonly receipt?: false; readonly cache?: false; readonly watch?: false; readonly terminal?: SqlTerminalMetadata }
 /**
  * A reference as the server enforces it: the target's name, where the row holds its key, and whether the
  * target's keys are JSON (`collection.key(schema)`), which the parts then make as one value or a tuple.
@@ -632,6 +644,37 @@ export function trigger<T, K extends Json>(name: string, source: Collection<T, K
   if (!collectionInfos.has(source)) throw new TypeError("A trigger requires a collection");
   if (typeof run !== "function") throw new TypeError("A trigger requires a function");
   return Object.freeze({ kind: "trigger" as const, name, source, run });
+}
+
+/** The complete stored row immediately before an effective deletion. */
+export interface DeletedRow<T = Json, K = string> {
+  readonly collection: string;
+  readonly key: K;
+  readonly value: T;
+  /** Server time in epoch milliseconds, from the deleting invocation. */
+  readonly deletedAt: number;
+}
+const retentions = new WeakMap<Trigger, (ctx: MutationContext, deleted: DeletedRow<any, any>) => void>();
+/** SDK internals: retention hooks observe successful deletes, independently of net row changes. */
+export function retentionOf(each: Trigger): ((ctx: MutationContext, deleted: DeletedRow<any, any>) => void) | undefined {
+  return retentions.get(each);
+}
+/**
+ * Retain each row removed from source in the same transaction, with the application's
+ * rights. The callback receives the full final stored value, including hidden fields.
+ * Register the returned trigger in define({ triggers }) or a component. Store retained
+ * rows separately and protect them with access rules; this helper exposes no restore API.
+ * Ordinary triggers still observe net changes. Deletes followed by recreation, and rows
+ * created then deleted in one mutation, are retained too. Missing or policy-skipped deletes
+ * do nothing. delete(source, key, { permanent: true }) skips retention, also for FK cascades.
+ */
+export function retainDeleted<T, K extends Json>(name: string, source: Collection<T, K, any>,
+  retain: (ctx: MutationContext, deleted: DeletedRow<T, K>) => void): Trigger<T, K> {
+  if (typeof retain !== "function") throw new TypeError("retainDeleted requires a retain function");
+  // Retention is dispatched from successful deletion events, not this net-change callback.
+  const each = trigger(name, source, () => {});
+  retentions.set(each, retain);
+  return each;
 }
 
 export type Usable = Component | { readonly component: Component };

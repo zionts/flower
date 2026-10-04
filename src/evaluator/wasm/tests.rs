@@ -379,6 +379,9 @@ fn minimal_guest_exposes_only_deterministic_javascript_intrinsics() {
 
 #[test]
 fn snapshotted_api_functions_are_isolated_and_application_freeze_hooks_are_not_called() {
+    // Shared engine/module setup precedes the finite invocation allowance,
+    // just as production warms its runtime before admitting timed requests.
+    warmup().unwrap();
     let code = format!(
         "{STATIC_INIT_MARKER}const originalFreeze=Object.freeze;let freezes=0;Object.freeze=function(value){{++freezes;return originalFreeze(value)}};{}",
         bundle(
@@ -391,7 +394,7 @@ fn snapshotted_api_functions_are_isolated_and_application_freeze_hooks_are_not_c
     // local to a single fresh Wasm invocation.
     let expected = json!({"ok":true,"value":{
         "before":null,"freezes":0,"frozen":true,
-        "keys":["now","clock","changesAt","principal","history","get","scan","query","range","set","delete","materialize","unmaterialize"]
+        "keys":["now","clock","changesAt","principal","history","codeVersion","get","scan","query","range","sql","set","delete","materialize","unmaterialize"]
     }});
     for _ in 0..3 {
         assert_eq!(run(&code, Value::Null).unwrap(), expected);
@@ -573,6 +576,52 @@ fn sql_callbacks_have_dedicated_read_only_kinds_without_definer_capability() {
             "test",
             &Value::Null,
             "derived",
+            &mut |_, _| Ok(Value::Null),
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(wrong["error"]["code"], "METHOD_KIND_MISMATCH");
+    }
+}
+
+#[test]
+fn terminal_plan_and_finalizer_have_readless_callback_kinds() {
+    warmup().unwrap();
+    for (kind, definition_kind) in [("sqlPlan", "queryMethod"), ("sqlFinalizer", "sqlFinalizer")] {
+        let metadata = if kind == "sqlPlan" {
+            "terminal:{},"
+        } else {
+            ""
+        };
+        let source = format!(
+            "var __flowerBundle={{default:{{definitions:{{test:{{name:'test',kind:'{definition_kind}',{metadata}compute:function(ctx,args,capability){{return [Object.isFrozen(ctx),typeof ctx.get,typeof ctx.scan,typeof ctx.now,typeof ctx.sql,typeof ctx.set,typeof capability,ctx.principal(),ctx.clock(),ctx.history(),ctx.codeVersion()]}}}}}},http:{{}}}}}};"
+        );
+        let result = execute(
+            &source,
+            "test",
+            &Value::Null,
+            kind,
+            &mut |operation, _| {
+                Ok(match operation {
+                    "principal" => json!({"subject":"verified"}),
+                    "clock" => json!(1000),
+                    "history" => json!({"database":"db","incarnation":"epoch"}),
+                    "codeVersion" => json!("generation"),
+                    operation => panic!("terminal readless host {operation}"),
+                })
+            },
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["value"],
+            json!([true,"undefined","undefined","undefined","undefined","undefined","undefined",{"subject":"verified"},1000,{"database":"db","incarnation":"epoch"},"generation"])
+        );
+        let wrong = execute(
+            &source,
+            "test",
+            &Value::Null,
+            "sqlProvider",
             &mut |_, _| Ok(Value::Null),
             limits(),
         )

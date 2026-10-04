@@ -82,7 +82,7 @@ pub(super) async fn application(javascript: String) -> (TempDir, Arc<App>) {
 
 async fn application_with_admission(
     javascript: String,
-    pool: Option<Arc<admission::Pool>>,
+    pool: Option<admission::Owner>,
 ) -> (TempDir, Arc<App>) {
     build_application(javascript, pool, false, None).await
 }
@@ -103,7 +103,7 @@ pub(super) async fn application_with_maintenance(javascript: String) -> (TempDir
 
 async fn build_application(
     javascript: String,
-    pool: Option<Arc<admission::Pool>>,
+    pool: Option<admission::Owner>,
     automatic_maintenance: bool,
     watch_hubs: Option<crate::service::watch::hubs::Registry>,
 ) -> (TempDir, Arc<App>) {

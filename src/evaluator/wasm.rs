@@ -18,6 +18,9 @@ mod native_profile;
 mod recycle;
 mod reset_surface;
 mod shadow_stack;
+#[cfg(all(test, feature = "sql"))]
+#[path = "wasm/tests/sql_encoded.rs"]
+mod sql_encoded_tests;
 mod surface;
 #[cfg(test)]
 mod tests;
@@ -27,6 +30,8 @@ use abi::Abi;
 use anyhow::{Result, ensure};
 pub(super) use cache::Prepared;
 use host::Callback;
+#[cfg(feature = "sql")]
+pub(super) use host::EncodedHost;
 pub use limits::Limits;
 use limits::MemoryLimit;
 use serde_json::Value;
@@ -45,6 +50,9 @@ pub const STATIC_INIT_MARKER: &str = "/* flower:static-init */";
 struct Host {
     abi: Option<Abi>,
     callback: Option<Callback>,
+    // This is invocation state, never a managed-crypto fallback or budget error.
+    #[cfg(feature = "sql")]
+    encoded_crypto_denied: bool,
     entropy_allowed: bool,
     managed_shared: std::collections::HashMap<String, crypto::SharedKey>,
     managed_shared_bytes: usize,
@@ -60,6 +68,8 @@ impl Host {
         Self {
             abi: None,
             callback,
+            #[cfg(feature = "sql")]
+            encoded_crypto_denied: false,
             entropy_allowed: false,
             managed_shared: std::collections::HashMap::new(),
             managed_shared_bytes: 0,
@@ -173,6 +183,8 @@ fn kind_number(kind: &str) -> Result<i32> {
         "derived" => 3,
         "sqlAuthority" => 4,
         "sqlProvider" => 5,
+        "sqlPlan" => 6,
+        "sqlFinalizer" => 7,
         _ => anyhow::bail!("unknown callback kind {kind}"),
     })
 }
@@ -231,6 +243,88 @@ pub(super) fn execute_prepared_profiled(
     if result.is_ok() {
         let _reset_timer = super::profile::timer(profile, super::profile::Stage::CellReset);
         recycle::finish(cell, &shared, profile)?;
+    } else {
+        recycle::discard(cell);
+    }
+    result
+}
+
+/// Raw SQL callbacks have a separate, admitted byte transport. This is NOT a
+/// native-memory admission proof and does not enable any service entry point.
+/// The caller must admit/encode `args` before entering this function and consume
+/// `finish` through its bounded outcome arena while the guest is suspended.
+#[cfg(feature = "sql")]
+pub(super) fn execute_prepared_encoded(
+    prepared: &Prepared,
+    name: &str,
+    args: &[u8],
+    kind: &str,
+    host: &mut dyn EncodedHost,
+    shared: Arc<Limits>,
+) -> Result<()> {
+    ensure!(
+        matches!(
+            kind,
+            "sqlAuthority" | "sqlProvider" | "sqlPlan" | "sqlFinalizer"
+        ),
+        "SQL_KIND_INVALID: encoded execution requires a SQL callback kind"
+    );
+    ensure!(
+        name.len()
+            .checked_add(args.len())
+            .is_some_and(|size| size <= host::MAX_ENCODED_BYTES),
+        "SQL_WIRE_CAPACITY: invocation input exceeds the admitted wire limit"
+    );
+    let _depth = shared.enter()?;
+    let kind_number = kind_number(kind)?;
+    let runtime = cache::runtime()?;
+    shared.check()?;
+    // SAFETY: only this stack frame owns `bridge`. The token is a synchronous
+    // capability, not a stored fat pointer into a request or a guest buffer.
+    // It is detached below on every Result path before reset/recycle; unwinding
+    // drops the owned Cell/Store instead of returning it to the pool. No token
+    // or input/output byte borrow can survive this scope.
+    let mut bridge = host;
+    let callback = unsafe { Callback::scoped_encoded(&mut bridge) };
+    let mut cell = recycle::checkout(prepared, &runtime.engine, shared.clone(), callback, &None)?;
+    let result = (|| {
+        let store = &mut cell.store;
+        let abi = &cell.abi;
+        if let Some(bytecode) = prepared.bytecode.as_deref() {
+            // No owned byte result or ordinary wire/JSON parser during loading.
+            abi.bytecode_encoded(store, bytecode)?;
+        }
+        shared.check()?;
+        // Invocation copies the admitted bytes into this cell immediately. It
+        // retains only guest offsets, never a pointer into caller-owned `args`.
+        let invocation = abi.invocation(store, kind_number, name, args, prepared.input_buffer)?;
+        shared.check()?;
+        let encoded = abi.run_once(store, invocation)?;
+        shared.check()?;
+        ensure!(
+            !store.data().encoded_crypto_denied,
+            "SQL_CRYPTO_FORBIDDEN: crypto is unavailable on the bounded SQL route"
+        );
+        // finish cannot keep this borrowed memory in a safe implementation, or
+        // reenter/mutate this Store: it has no Store/ABI capability. The host's
+        // fixed arena must consume the outcome before this borrow ends.
+        bridge.finish(abi.outcome_bytes(store, encoded)?)
+    })();
+    cell.store.data_mut().callback = None;
+    let crypto_denied = cell.store.data().encoded_crypto_denied;
+    if result.as_ref().err().is_some_and(is_guest_trap) && !crypto_denied {
+        shared.fail();
+    }
+    if let Err(error) = shared.check() {
+        recycle::discard(cell);
+        return Err(error);
+    }
+    if crypto_denied {
+        recycle::discard(cell);
+        anyhow::bail!("SQL_CRYPTO_FORBIDDEN: crypto is unavailable on the bounded SQL route");
+    }
+    if result.is_ok() {
+        recycle::finish(cell, &shared, &None)?;
     } else {
         recycle::discard(cell);
     }

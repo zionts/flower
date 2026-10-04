@@ -46,10 +46,15 @@ export function tally(name: string) {
 <tr><th scope="row"><code data-api-symbol="trigger">trigger(name, source, run): Trigger</code></th><td>Runs <code>run(ctx, change)</code> inside every mutation that changed a row of <code>source</code>, once per changed key, before the commit. The source collection is declared for you.</td></tr>
 <tr><th scope="row"><code data-api-symbol="Trigger">Trigger&lt;T, K&gt;</code></th><td>Readonly <code>kind: "trigger"</code>, <code>name</code>, <code>source</code> and <code>run</code>.</td></tr>
 <tr><th scope="row"><code data-api-symbol="Change">Change&lt;T, K&gt;</code></th><td><code>key</code> (decoded for typed-key collections), <code>before</code> and <code>after</code>; <code>null</code> means the row didn’t exist.</td></tr>
+<tr><th scope="row"><code data-api-symbol="retainDeleted">retainDeleted(name, source, retain): Trigger&lt;T, K&gt;</code></th><td>A retention hook to register in <code>triggers</code>. Calls <code>retain(ctx, deleted)</code> for every effective removal from the named source, before commit and with the application's rights. Only one retention hook per collection name is allowed.</td></tr>
+<tr><th scope="row"><code data-api-symbol="DeletedRow">DeletedRow&lt;T = Json, K = string&gt;</code></th><td>Readonly <code>collection: string</code>, decoded <code>key: K</code>, complete final stored <code>value: T</code> (including hidden fields), and <code>deletedAt: number</code>, server time in epoch milliseconds.</td></tr>
 </tbody></table></div>
 <ul>
 <li>Triggers see and join the mutation’s writes. A row that ends where it started doesn’t fire.</li>
 <li>Writes made by triggers can fire more triggers. After 32 rounds the mutation fails with <code>TRIGGER_LOOP</code>.</li>
 <li>Trigger names must be unique per collection.</li>
+<li>Retention observes successful deletes independently of ordinary net-change triggers: updating then deleting captures the updated value; deletion/recreation and rows created then deleted are retained too. Missing and policy-skipped deletes do nothing. A fresh reference with the same source name still retains.</li>
+<li>Keep retained data separately, under an operator-only <a href="access.html#collection-access">access policy</a>. Removed rows stay absent from active reads, indexes, aggregates and foreign keys. Retention failures roll back deletion and all other writes. There is no automatic restore endpoint.</li>
+<li><code>ctx.delete(source, key, { permanent: true })</code> skips retention for this deletion and its declared foreign-key <code>cascade</code> descendants. It does not elevate the caller, bypass <code>restrict</code>, stop ordinary triggers, or alter <code>setNull</code>. Custom application triggers must explicitly pass options to their own deletes.</li>
 </ul>
 </section>

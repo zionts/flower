@@ -220,6 +220,27 @@ impl Abi {
         Ok(Ok(arguments))
     }
 
+    /// Borrow native concatenated arguments while this guest is suspended. No
+    /// decoder runs here; the SQL host must use its admitted argument arena.
+    #[cfg(feature = "sql")]
+    pub(super) fn arguments_bytes<'a, S: AsContextMut<Data = Host>>(
+        &self,
+        s: &'a S,
+        pointer: i32,
+        length: i32,
+    ) -> Result<&'a [u8]> {
+        let length = length as u32 as usize;
+        ensure!(
+            length <= super::host::MAX_ENCODED_BYTES,
+            "SQL_WIRE_CAPACITY: guest arguments exceed the admitted wire limit"
+        );
+        let start = pointer as u32 as usize;
+        self.memory
+            .data(s)
+            .get(start..start.checked_add(length).context("arguments overflow")?)
+            .context("guest arguments bounds")
+    }
+
     /// Packed results own a malloc buffer. Bit 63 marks a guest exception; the
     /// other high bits give its length. Copy and release on success and errors.
     fn result<S: AsContextMut<Data = Host>>(
@@ -297,6 +318,43 @@ impl Abi {
         let function = self.instance.get_typed_func(&mut *s, "flower_load")?;
         self.call_bytes(s, &function, bytes, super::max_json_bytes()?)
             .map(|_| ())
+    }
+
+    /// Load a pre-admitted prepared image without the ordinary owned-byte result
+    /// helper. Successful initialization diagnostics are ignored; exceptions
+    /// return a fixed native error rather than formatting/copying guest text.
+    #[cfg(feature = "sql")]
+    pub(super) fn bytecode_encoded(&self, s: &mut Store<Host>, bytes: &[u8]) -> Result<()> {
+        let function = self
+            .instance
+            .get_typed_func::<(i32, i32), i64>(&mut *s, "flower_load")?;
+        let pointer = self.bytes(s, bytes)?;
+        let packed = function.call(&mut *s, (pointer, i32::try_from(bytes.len())?))?;
+        self.free()?.call(&mut *s, pointer)?;
+        let bits = packed as u64;
+        let output_pointer = bits as u32 as i32;
+        let length = ((bits >> 32) & 0x7fff_ffff) as usize;
+        let checked = (|| {
+            ensure!(
+                length <= super::host::MAX_ENCODED_BYTES,
+                "SQL_WIRE_CAPACITY: guest initialization result exceeds the admitted wire limit"
+            );
+            ensure!(output_pointer != 0 || length == 0, "null guest result");
+            let start = output_pointer as u32 as usize;
+            self.memory
+                .data(&*s)
+                .get(start..start.checked_add(length).context("result overflow")?)
+                .context("guest initialization result bounds")?;
+            ensure!(
+                bits >> 63 == 0,
+                "SQL_GUEST_INIT: bytecode initialization failed"
+            );
+            Ok(())
+        })();
+        if output_pointer != 0 {
+            self.free()?.call(&mut *s, output_pointer)?;
+        }
+        checked
     }
 
     /// Reserve only while constructing an image, after initialization/GC. The
@@ -395,6 +453,27 @@ impl Abi {
                 details: None,
             }),
         )
+    }
+
+    /// Borrow the suspended callback outcome. The encoded host must consume it
+    /// synchronously before reset/discard; no ordinary outcome decoder runs.
+    #[cfg(feature = "sql")]
+    pub(super) fn outcome_bytes<'a>(
+        &self,
+        s: &'a Store<Host>,
+        result: CallbackResult,
+    ) -> Result<&'a [u8]> {
+        let bits = result.0 as u64;
+        let pointer = bits as u32 as usize;
+        let length = (bits >> 32) as usize;
+        ensure!(
+            length <= super::host::MAX_ENCODED_BYTES,
+            "SQL_WIRE_CAPACITY: guest outcome exceeds the admitted wire limit"
+        );
+        self.memory
+            .data(s)
+            .get(pointer..pointer.checked_add(length).context("result overflow")?)
+            .context("guest outcome bounds")
     }
 
     /// The guest owns the returned buffer and frees it after decoding.

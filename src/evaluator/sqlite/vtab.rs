@@ -1,14 +1,14 @@
 //! Minimal read-only virtual tables. Equality is a candidate restriction only:
 //! omit remains false, no affinity is declared, only BINARY comparisons are
 //! pushed, and ORDER BY is never claimed. Every cursor has its own bounded batch.
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 
 use libsqlite3_sys as ffi;
 
 use super::{
-    Batch, Context, Equality, Lease, MAX_CELL_BYTES, MAX_COLUMNS, MAX_TOKEN_BYTES, ScanRequest,
-    SqlCell, SqlError, read_value,
+    Batch, Context, Equality, Lease, MAX_CELL_BYTES, MAX_COLUMNS, MAX_TOKEN_BYTES, QuotaBuffer,
+    ScanRequest, SqlCell, SqlError, read_value,
 };
 
 pub(super) struct Binding {
@@ -130,7 +130,7 @@ static MODULE: ffi::sqlite3_module = ffi::sqlite3_module {
     xEof: Some(eof),
     xColumn: Some(column),
     xRowid: Some(rowid),
-    xUpdate: None,
+    xUpdate: Some(deny_update),
     xBegin: None,
     xSync: None,
     xCommit: None,
@@ -143,6 +143,23 @@ static MODULE: ffi::sqlite3_module = ffi::sqlite3_module {
     xShadowName: None,
     xIntegrity: None,
 };
+
+// SQLite classifies a virtual table with xUpdate=NULL as read-only before
+// invoking the user authorizer for some DML. Advertise only this DENY callback
+// so valid DML reaches the authorizer's canonical Forbidden decision. Defense
+// in depth: even if invoked independently it records a sticky policy failure
+// and returns READONLY, without reading arguments, changing rows or calling a
+// Source. Statement execution additionally requires sqlite3_stmt_readonly().
+unsafe extern "C" fn deny_update(
+    table: *mut ffi::sqlite3_vtab,
+    _: c_int,
+    _: *mut *mut ffi::sqlite3_value,
+    _: *mut ffi::sqlite3_int64,
+) -> c_int {
+    let table = unsafe { &*table.cast::<Table>() };
+    table.binding().context().fail(SqlError::Forbidden);
+    ffi::SQLITE_READONLY
+}
 
 // SQLite retains each auxiliary pointer; Vec growth must not move a Binding.
 #[allow(clippy::vec_box)]
@@ -158,12 +175,21 @@ pub(super) fn register(
             table: i,
             _lease: Lease::new(&context.quota, size_of::<Binding>())?,
         });
-        let module_name =
-            CString::new(format!("flower_source_{i}")).map_err(|_| SqlError::InvalidRequest)?;
+        // i<67, represented into fixed stack bytes with no formatting heap.
+        let mut digits = [0u8; 2];
+        let decimal = if i >= 10 {
+            digits[0] = b'0' + (i / 10) as u8;
+            digits[1] = b'0' + (i % 10) as u8;
+            &digits[..]
+        } else {
+            digits[0] = b'0' + i as u8;
+            &digits[..1]
+        };
+        let module_name = QuotaBuffer::c_text(&context.quota, &[b"flower_source_", decimal])?;
         let rc = unsafe {
             ffi::sqlite3_create_module_v2(
                 db,
-                module_name.as_ptr(),
+                module_name.pointer(),
                 &MODULE,
                 (&*binding as *const Binding).cast_mut().cast(),
                 None,
@@ -175,15 +201,19 @@ pub(super) fn register(
         bindings.push(binding);
         // All identifiers were checked against a strict ASCII grammar. Quotes
         // additionally protect SQL keywords, not user-supplied SQL interpolation.
-        let declaration = CString::new(format!(
-            "CREATE VIRTUAL TABLE \"{}\" USING flower_source_{i}",
-            table.name
-        ))
-        .map_err(|_| SqlError::InvalidRequest)?;
+        let declaration = QuotaBuffer::c_text(
+            &context.quota,
+            &[
+                b"CREATE VIRTUAL TABLE \"",
+                table.name.as_bytes(),
+                b"\" USING flower_source_",
+                decimal,
+            ],
+        )?;
         let rc = unsafe {
             ffi::sqlite3_exec(
                 db,
-                declaration.as_ptr(),
+                declaration.pointer(),
                 None,
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -208,15 +238,24 @@ unsafe extern "C" fn connect(
     context.callback(|| {
         context.poll(1)?;
         let schema = &context.tables[binding.table];
-        let columns = schema
+        let capacity = schema
             .columns
             .iter()
-            .map(|name| format!("\"{name}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        let declaration = CString::new(format!("CREATE TABLE logical({columns})"))
-            .map_err(|_| SqlError::Provider)?;
-        let rc = unsafe { ffi::sqlite3_declare_vtab(db, declaration.as_ptr()) };
+            .try_fold(b"CREATE TABLE logical(".len() + 2, |sum, name| {
+                sum.checked_add(name.len() + 3).ok_or(SqlError::MemoryLimit)
+            })?;
+        let mut declaration = QuotaBuffer::new(&context.quota, capacity)?;
+        declaration.append(b"CREATE TABLE logical(")?;
+        for (index, name) in schema.columns.iter().enumerate() {
+            if index != 0 {
+                declaration.append(b",")?;
+            }
+            declaration.append(b"\"")?;
+            declaration.append(name.as_bytes())?;
+            declaration.append(b"\"")?;
+        }
+        declaration.append(b")\0")?;
+        let rc = unsafe { ffi::sqlite3_declare_vtab(db, declaration.pointer()) };
         if rc != ffi::SQLITE_OK {
             return Err(context.sqlite_error(rc));
         }

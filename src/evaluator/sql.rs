@@ -221,3 +221,83 @@ impl Catalog {
         })
     }
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct TerminalMethod {
+    pub catalog: String,
+    pub operation: Operation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_result: Option<CancelResultShape>,
+    pub finalizer: String,
+    #[serde(default)]
+    pub signing_keys: Vec<serde_json::Value>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Operation {
+    Query,
+    Explain,
+    Catalog,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CancelResultShape {
+    Boolean,
+    Cancelled,
+}
+impl TerminalMethod {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if !identifier(&self.catalog)
+            || self.finalizer.is_empty()
+            || self.finalizer.len() > 384
+            || self.signing_keys.len() > 8
+            || (self.operation == Operation::Cancel && !self.signing_keys.is_empty())
+            || (self.operation != Operation::Cancel && self.cancel_result.is_some())
+        {
+            return Err("Invalid terminal SQL metadata");
+        }
+        if !distinct(
+            self.signing_keys
+                .iter()
+                .filter_map(|key| key["name"].as_str()),
+        ) || self.signing_keys.iter().any(|key| {
+            !key["usages"]
+                .as_array()
+                .is_some_and(|usages| usages.iter().any(|usage| usage == "sign"))
+        }) {
+            return Err("Invalid terminal SQL signing keys");
+        }
+        Ok(())
+    }
+
+    /// Closed native cancellation output. The actual terminal descriptor,
+    /// verified live owner and authorization must be checked by the controller;
+    /// this formatter is not an authority verifier or a guest finalizer.
+    /// It performs no source read, projection, signing or allocation.
+    pub(crate) fn native_cancel_result(
+        &self,
+        cancelled: bool,
+    ) -> Result<&'static [u8], &'static str> {
+        if self.operation != Operation::Cancel || !self.signing_keys.is_empty() {
+            return Err("Invalid terminal SQL cancellation");
+        }
+        Ok(
+            match (
+                self.cancel_result.unwrap_or(CancelResultShape::Boolean),
+                cancelled,
+            ) {
+                (CancelResultShape::Boolean, false) => b"false",
+                (CancelResultShape::Boolean, true) => b"true",
+                (CancelResultShape::Cancelled, false) => b"{\"cancelled\":false}",
+                (CancelResultShape::Cancelled, true) => b"{\"cancelled\":true}",
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "sql/metadata_tests.rs"]
+mod metadata_tests;

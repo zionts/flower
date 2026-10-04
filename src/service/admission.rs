@@ -43,13 +43,67 @@ impl Class {
     }
 }
 
-pub(super) struct Pool {
+pub(crate) struct Pool {
     state: Mutex<State>,
     workers: [usize; 3],
     memory: [usize; 3],
     input: [usize; 3],
     per_job: usize,
     exhausted: &'static str,
+}
+/// Ordinary pools retain their historical Arc/Weak lifetime. Native handles
+/// borrow the ONE real Pool inside the permanently published node mmap; cloning
+/// or downgrading those handles never allocates and can never free that Pool.
+#[derive(Clone)]
+pub(crate) enum Owner {
+    Shared(Arc<Pool>),
+    NativeStatic(&'static Pool),
+}
+#[derive(Clone)]
+struct WeakOwner {
+    value: WeakValue,
+}
+#[derive(Clone)]
+enum WeakValue {
+    Shared(Weak<Pool>),
+    NativeStatic(&'static Pool),
+}
+impl std::ops::Deref for Owner {
+    type Target = Pool;
+    fn deref(&self) -> &Pool {
+        match self {
+            Self::Shared(pool) => pool,
+            Self::NativeStatic(pool) => pool,
+        }
+    }
+}
+impl Owner {
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        std::ptr::eq::<Pool>(&**self, &**other)
+    }
+    fn downgrade(&self) -> WeakOwner {
+        WeakOwner {
+            value: match self {
+                Self::Shared(pool) => WeakValue::Shared(Arc::downgrade(pool)),
+                Self::NativeStatic(pool) => WeakValue::NativeStatic(pool),
+            },
+        }
+    }
+}
+impl WeakOwner {
+    fn upgrade(&self) -> Option<Owner> {
+        match &self.value {
+            WeakValue::Shared(pool) => pool.upgrade().map(Owner::Shared),
+            WeakValue::NativeStatic(pool) => Some(Owner::NativeStatic(pool)),
+        }
+    }
+}
+/// The input drops FIRST, while the strong owner still exists to discharge the
+/// charge. Writer-owned metadata retains this opaque value past request/App
+/// timeouts; neither a weak input nor the caller's lifetime is enough.
+pub(crate) struct StrongInput {
+    _input: Input,
+    _pool: Owner,
 }
 #[derive(Default)]
 struct State {
@@ -74,13 +128,13 @@ struct Waiter {
     input: Input,
     send: oneshot::Sender<Permit>,
 }
-pub(super) struct Input {
-    pool: Weak<Pool>,
+pub(crate) struct Input {
+    pool: WeakOwner,
     class: Class,
     bytes: usize,
 }
 struct Active {
-    pool: Weak<Pool>,
+    pool: WeakOwner,
     class: Class,
     _input: Input,
 }
@@ -89,7 +143,7 @@ pub(super) struct Permit {
     _active: Arc<Active>,
 }
 struct Waiting {
-    pool: Arc<Pool>,
+    pool: Owner,
     class: Class,
     lane: String,
     id: u64,
@@ -142,7 +196,7 @@ pub(super) async fn acquire_retained(app: &App, class: Class) -> Result<Permit, 
 }
 
 impl Pool {
-    pub(super) fn configured() -> anyhow::Result<Arc<Self>> {
+    pub(super) fn configured() -> anyhow::Result<Owner> {
         let settings = tuning::settings()?;
         let evaluator = crate::evaluator::config::settings()?;
         Ok(Self::with_deployment(
@@ -170,12 +224,16 @@ impl Pool {
     }
     /// User and control capacity; deployment work gets as much as control.
     #[cfg(test)]
+    #[allow(
+        clippy::new_ret_no_self,
+        reason = "legacy test constructor returns the owner wrapper"
+    )]
     pub(super) fn new(
         workers: [usize; 2],
         memory: [usize; 2],
         input: [usize; 2],
         per_job: usize,
-    ) -> Arc<Self> {
+    ) -> Owner {
         Self::with_deployment(
             [workers[0], workers[1], workers[1]],
             [memory[0], memory[1], memory[1]],
@@ -188,34 +246,68 @@ impl Pool {
         memory: [usize; 3],
         input: [usize; 3],
         per_job: usize,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Owner {
+        Owner::Shared(Arc::new(Self::value(workers, memory, input, per_job)))
+    }
+    /// Construct the actual Pool by VALUE. The native node writes this value
+    /// directly into its prepaid mapping; no hidden Arc/Box/allocator owner.
+    pub(super) fn value(
+        workers: [usize; 3],
+        memory: [usize; 3],
+        input: [usize; 3],
+        per_job: usize,
+    ) -> Self {
+        Self {
             state: Mutex::new(State::default()),
             workers,
             memory,
             input,
             per_job,
             exhausted: "node queued-input byte budget exhausted; retry later",
-        })
+        }
     }
     /// Bytes that open watches hold, apart from what requests queue in, so
     /// that watches can never exhaust the requests' budget.
-    pub(super) fn watches(bytes: usize) -> Arc<Self> {
-        Arc::new(Self {
+    pub(super) fn watches(bytes: usize) -> Owner {
+        Owner::Shared(Arc::new(Self {
             state: Mutex::new(State::default()),
             workers: [0; 3],
             memory: [0; 3],
             input: [bytes, 0, 0],
             per_job: 0,
             exhausted: "watch byte budget exhausted (FLOWER_WATCH_RETAINED_BYTES); retry later",
-        })
+        }))
     }
     /// Bytes retained, and the budget, of a pool made by `watches`.
     pub(super) fn retained(&self) -> (usize, usize) {
         let state = self.state.lock().expect("admission mutex");
         (state.classes[0].input, self.input[0])
     }
-    pub(super) fn retain(self: &Arc<Self>, class: Class, bytes: usize) -> Result<Input, ApiError> {
+    pub(super) fn metrics(&self) -> Value {
+        let state = self.state.lock().expect("admission mutex");
+        let classes:Vec<_> = [Class::User, Class::Control, Class::Deployment].into_iter().map(|class| {
+            let (i, queue) = (class.index(), &state.classes[class.index()]);
+            let oldest = queue.lanes.values().filter_map(|lane|lane.front()).map(|waiter|waiter.queued_at.elapsed().as_millis()).max().unwrap_or(0);
+            json!({"class":class.name(),"active":queue.active,"queued":queue.queued,
+                "lanes":queue.lanes.len(),"retainedInputBytes":queue.input,"inputBudgetBytes":self.input[i],
+                "reservedEvaluationBytes":queue.active.saturating_mul(self.per_job),"memoryBudgetBytes":self.memory[i],
+                "workerBudget":self.workers[i],"oldestQueuedMs":oldest})
+        }).collect();
+        json!({"classes":classes,"admitted":state.admitted,"rejected":state.rejected,"canceled":state.canceled})
+    }
+}
+impl Owner {
+    pub(super) fn retain_strong(
+        &self,
+        class: Class,
+        bytes: usize,
+    ) -> Result<StrongInput, ApiError> {
+        Ok(StrongInput {
+            _input: self.retain(class, bytes)?,
+            _pool: self.clone(),
+        })
+    }
+    pub(super) fn retain(&self, class: Class, bytes: usize) -> Result<Input, ApiError> {
         let mut state = self.state.lock().expect("admission mutex");
         let queue = &mut state.classes[class.index()];
         let Some(total) = queue
@@ -228,13 +320,13 @@ impl Pool {
         };
         queue.input = total;
         Ok(Input {
-            pool: Arc::downgrade(self),
+            pool: self.downgrade(),
             class,
             bytes,
         })
     }
     pub(in crate::service) async fn acquire(
-        self: &Arc<Self>,
+        &self,
         lane: String,
         class: Class,
         bytes: usize,
@@ -282,7 +374,7 @@ impl Pool {
         drop(waiting);
         result
     }
-    fn schedule(self: &Arc<Self>) {
+    fn schedule(&self) {
         {
             let mut state = self.state.lock().expect("admission mutex");
             if state.scheduling {
@@ -313,7 +405,7 @@ impl Pool {
                         queue.active += 1;
                         let permit = Permit {
                             _active: Arc::new(Active {
-                                pool: Arc::downgrade(self),
+                                pool: self.downgrade(),
                                 class,
                                 _input: waiter.input,
                             }),
@@ -333,18 +425,6 @@ impl Pool {
                 let _ = send.send(permit);
             }
         }
-    }
-    pub(super) fn metrics(&self) -> Value {
-        let state = self.state.lock().expect("admission mutex");
-        let classes:Vec<_> = [Class::User, Class::Control, Class::Deployment].into_iter().map(|class| {
-            let (i, queue) = (class.index(), &state.classes[class.index()]);
-            let oldest = queue.lanes.values().filter_map(|lane|lane.front()).map(|waiter|waiter.queued_at.elapsed().as_millis()).max().unwrap_or(0);
-            json!({"class":class.name(),"active":queue.active,"queued":queue.queued,
-                "lanes":queue.lanes.len(),"retainedInputBytes":queue.input,"inputBudgetBytes":self.input[i],
-                "reservedEvaluationBytes":queue.active.saturating_mul(self.per_job),"memoryBudgetBytes":self.memory[i],
-                "workerBudget":self.workers[i],"oldestQueuedMs":oldest})
-        }).collect();
-        json!({"classes":classes,"admitted":state.admitted,"rejected":state.rejected,"canceled":state.canceled})
     }
 }
 impl Drop for Input {
@@ -404,12 +484,73 @@ impl Drop for Waiting {
     }
 }
 
+// Only the lifetime regression observes a real legacy Pool's final Drop.
+// No production state/layout change; the permanent native Pool never drops.
+#[cfg(test)]
+impl Drop for Pool {
+    fn drop(&mut self) {
+        tests::observe_final_pool_drop(self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::task::Poll;
-    fn pool() -> Arc<Pool> {
+    use std::{cell::Cell, task::Poll};
+    thread_local! {
+        static FINAL_DROP: Cell<Option<(usize, Option<usize>)>> = const { Cell::new(None) };
+    }
+    pub(super) fn observe_final_pool_drop(pool: &mut Pool) {
+        let address = std::ptr::from_ref(pool).addr();
+        FINAL_DROP.with(|observer| {
+            if observer
+                .get()
+                .is_some_and(|(expected, _)| expected == address)
+            {
+                let bytes = pool.state.get_mut().expect("admission mutex").classes[0].input;
+                observer.set(Some((address, Some(bytes))));
+            }
+        });
+    }
+    fn pool() -> Owner {
         Pool::new([1, 1], [10, 10], [4096, 4096], 10)
+    }
+
+    // Legacy Shared lifetime regressions; NOT native-positive fixtures.
+    #[test]
+    fn strong_metadata_lease_keeps_pool_and_charge_until_final_owner_drop() {
+        let pool = pool();
+        let weak = pool.downgrade();
+        let address = std::ptr::from_ref(&*pool).addr();
+        FINAL_DROP.with(|observer| observer.set(Some((address, None))));
+        let metadata = Arc::new(pool.retain_strong(Class::User, 777).unwrap());
+        let queued = metadata.clone();
+        drop(pool);
+        drop(metadata);
+        assert_eq!(
+            weak.upgrade()
+                .expect("queued metadata owns the legacy Pool")
+                .metrics()["classes"][0]["retainedInputBytes"],
+            777
+        );
+        // No extra strong observer remains. This is the ACTUAL final owner:
+        // Pool::drop must see a discharged charge, not 777 skipped because a
+        // wrongly first-dropped _pool destroyed it before Input::drop.
+        drop(queued);
+        assert!(weak.upgrade().is_none());
+        FINAL_DROP.with(|observer| {
+            assert_eq!(observer.replace(None), Some((address, Some(0))));
+        });
+    }
+
+    #[test]
+    fn legacy_weak_inputs_do_not_keep_independent_pools_alive() {
+        let pool = pool();
+        let weak = pool.downgrade();
+        let input = pool.retain(Class::User, 777).unwrap();
+        drop(pool);
+        assert!(weak.upgrade().is_none());
+        drop(input);
     }
 
     #[tokio::test]

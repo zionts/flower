@@ -46,3 +46,34 @@ Exact transport: `null`, `{ "integer": "9223372036854775807" }` (decimal string,
 SQLite is globally configured with the header-owner custom allocator exactly once, before its first use. If another library has already initialized SQLite, initialization fails closed (never shuts another client's SQLite down). Initialization has a separate fixed 1 MiB quota; post-init native allocations require a query TLS quota. A private VFS denies filesystem opens, deletion, dynamic libraries, entropy, and time; connections are memory-only, temp_store=MEMORY, no worker threads. Each connection/statement is closed before its TLS scope ends. Cursor/batch/result Rust storage additionally reserves the query quota and output is capped using a conservative encoded-size/capacity bound; provider-private state still requires the caller's separate bounds. Result column names remain positional and duplicate aliases are preserved.
 
 Verification (October 3, 2026): `cargo test --lib --features sql evaluator::sqlite` passes all 16 tests in Flower. The independent native harness also passes all 16 tests and `cargo clippy --all-targets -- -D warnings`; rustfmt passes on these files. High-cardinality sort exhaustion verifies peak quota <= 512 KiB, zero retained query allocations on failure, and zero VFS open attempts. Parallel isolation covers 120 successful/failing queries across 12 threads; header ownership is also tested after TLS scope exit and on another freeing thread.
+
+
+## Terminal capture preparation (October 3, 2026)
+
+`referenced_tables(sql, parameters, tables, options, check)` prepares and binds the
+same authorizer-validated single statement without stepping it or opening a
+Source cursor, and returns a fixed `ReferencedTables` bitmap. `contains(index)`
+identifies logical inputs authorized by SQLite's READ callbacks, including
+subqueries, unions, joins, aliases and COUNT(*) reads. Unrelated logical tables
+are not captured. Connections/statements are destroyed on return; the bitmap
+contains no source/database capability. Every authorized READ and other
+user-authorizer action charges work and checks cancellation.
+
+This is NOT an equality/LIMIT pushdown proof. The terminal controller must
+capture every referenced relation completely under independent row/byte caps,
+or fail, unless it separately proves a mandatory safe candidate restriction.
+SQLite planner preferences and output row caps never justify incomplete
+aggregate inputs.
+
+The virtual table has an always-denying xUpdate callback solely so SQLite
+classifies valid DML through the normal authorizer rather than rejecting a NULL
+xUpdate table first as generic invalid SQL. The callback returns READONLY and
+records sticky Forbidden without reading arguments or invoking any Source.
+Execution still requires sqlite3_stmt_readonly(). Current-tree native tests
+assert DELETE/INSERT/UPDATE/DDL/PRAGMA/ATTACH/load_extension/recursive/schema/rowid
+refuse with Forbidden, and no Source scan or source-row change occurs. Unknown
+physical tables, invalid syntax, unsupported readfile, and a second statement
+refuse as InvalidSql. No handwritten SQL keyword parser participates.
+
+These local native proofs do not implement or enable the terminal Flower
+service/capture/authority/finish lifecycle. The serving route remains HOLD.

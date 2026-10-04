@@ -1,4 +1,4 @@
-mod admission;
+pub(crate) mod admission;
 pub(crate) mod cancellation;
 mod clock;
 mod forwarding;
@@ -6,6 +6,10 @@ mod keys;
 mod partitions;
 mod process;
 mod query_cache;
+#[cfg(feature = "sql")]
+pub(crate) mod sql_ingress;
+#[cfg(any(feature = "sql", test))]
+pub(crate) mod sql_node;
 mod staged_deployment;
 #[cfg(test)]
 mod tests;
@@ -42,7 +46,7 @@ struct App {
     writer_queue: mpsc::Sender<writer::Pending>,
     evaluations: Arc<Semaphore>,
     query_evaluations: Arc<Semaphore>,
-    admission: Arc<admission::Pool>,
+    admission: admission::Owner,
     query_cache: query_cache::QueryCache,
     authorizations: authorization::memo::Memo,
     watch_hubs: watch::hubs::Registry,
@@ -136,7 +140,7 @@ fn make_app(
     consensus: Consensus,
     admin_token: String,
     query_evaluations: Arc<Semaphore>,
-    admission: Arc<admission::Pool>,
+    admission: admission::Owner,
     partition_gate: Option<Arc<partitions::router::Gate>>,
 ) -> Arc<App> {
     let (writer_queue, receiver) = mpsc::channel(
@@ -810,6 +814,14 @@ async fn evaluate_query(
     mut now: u64,
     mut permit: admission::Permit,
 ) -> Result<QueryResult, ApiError> {
+    if method.terminal.is_some() {
+        return Err(evaluation_error(anyhow::Error::new(
+            evaluator::rust_engine::EngineError::new(
+                "SQL_TERMINAL_UNAVAILABLE",
+                "Detached terminal SQL capture is not enabled until its storage/frame/finish gates pass",
+            ),
+        )));
+    }
     if input.get("expectedRevision").is_some() {
         return Err(invalid(anyhow::anyhow!(
             "expectedRevision applies only to mutation methods"

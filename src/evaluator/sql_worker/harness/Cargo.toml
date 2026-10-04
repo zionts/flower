@@ -1,0 +1,23 @@
+[package]
+name = "flower-sql-host-worker-probe"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[features]
+mimalloc-probe = ["dep:mimalloc"]
+[dependencies]
+libc = "=0.2.189"
+mimalloc = {version = "=0.1.52", default-features = false, optional = true}
+[lib]
+path = "lib.rs"
+[profile.dev]
+debug = 0
+[profile.release]
+debug = 0
+lto = false
+
+[[bin]]
+name = "native-worker-diagnostic"
+path = "native.rs"
+test = false
+bench = false

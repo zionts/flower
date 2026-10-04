@@ -36,6 +36,7 @@ enum Kind {
     Derived,
     SqlAuthority,
     SqlProvider,
+    SqlFinalizer,
     Method(MethodKind),
 }
 
@@ -43,6 +44,7 @@ struct Definition<'a> {
     kind: Kind,
     consistency: QueryConsistency,
     receipt: bool,
+    terminal: Option<super::sql::TerminalMethod>,
     cache: bool,
     watch: bool,
     aggregate: Option<&'a Value>,
@@ -397,6 +399,7 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
             Some("derived") => Some(Kind::Derived),
             Some("sqlAuthority") => Some(Kind::SqlAuthority),
             Some("sqlProvider") => Some(Kind::SqlProvider),
+            Some("sqlFinalizer") => Some(Kind::SqlFinalizer),
             kind => method_kind(kind).map(Kind::Method),
         };
         let Some(kind) = kind.filter(|_| {
@@ -411,6 +414,7 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
                         "watch",
                         "aggregate",
                         "access",
+                        "terminal",
                     ],
                 )
         }) else {
@@ -420,18 +424,68 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
         let receipt = receipt(definition, kind == Kind::Method(MethodKind::Mutation))?;
         let cache = query_flag(definition, "cache", kind == Kind::Method(MethodKind::Query))?;
         let watch = query_flag(definition, "watch", kind == Kind::Method(MethodKind::Query))?;
+        let terminal: Option<super::sql::TerminalMethod> = definition
+            .get("terminal")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
+        ensure!(
+            terminal.is_none()
+                || (kind == Kind::Method(MethodKind::Query)
+                    && !cache
+                    && !watch
+                    && consistency == QueryConsistency::Linearizable),
+            "Terminal SQL requires fresh one-shot query flags: {name}"
+        );
+        ensure!(
+            definition
+                .get("terminal")
+                .is_none_or(|value| !value.is_null()),
+            "Terminal SQL metadata cannot be null: {name}"
+        );
         definitions.insert(
             name.as_str(),
             Definition {
                 kind,
                 consistency,
                 receipt,
+                terminal,
                 cache,
                 watch,
                 aggregate: definition.get("aggregate"),
                 access: definition.get("access"),
             },
         );
+    }
+    for (name, definition) in &definitions {
+        if let Some(terminal) = &definition.terminal {
+            terminal.validate().map_err(anyhow::Error::msg)?;
+            ensure!(
+                definitions
+                    .get(terminal.finalizer.as_str())
+                    .is_some_and(|entry| entry.kind == Kind::SqlFinalizer),
+                "Terminal SQL finalizer requires dedicated readless callback: {name}"
+            );
+            let declared: Vec<super::sql::Catalog> = app
+                .get("sql")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default();
+            ensure!(
+                declared
+                    .iter()
+                    .any(|catalog| catalog.name == terminal.catalog),
+                "Terminal SQL catalog must be explicitly registered: {name}"
+            );
+            for key in &terminal.signing_keys {
+                ensure!(
+                    keys.contains(key)
+                        && key["usages"]
+                            .as_array()
+                            .is_some_and(|usages| usages.iter().any(|usage| usage == "sign")),
+                    "Terminal SQL signer must match a declared signing key: {name}"
+                );
+            }
+        }
     }
     let definition = |name: Option<&str>, kind: MethodKind| {
         name.and_then(|name| definitions.get(name))
@@ -451,7 +505,15 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
             !alias.is_empty()
                 && only(
                     method,
-                    &["name", "kind", "consistency", "receipt", "cache", "watch"]
+                    &[
+                        "name",
+                        "kind",
+                        "consistency",
+                        "receipt",
+                        "cache",
+                        "watch",
+                        "terminal"
+                    ]
                 ),
             "Invalid HTTP method mapping: {alias}"
         );
@@ -475,10 +537,19 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
             watch == target.watch,
             "HTTP watch must match its query definition: {alias}"
         );
+        let terminal: Option<super::sql::TerminalMethod> = method
+            .get("terminal")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
+        ensure!(
+            terminal == target.terminal,
+            "HTTP terminal metadata must match its definition"
+        );
         http.insert(
             alias.clone(),
             HttpMethod {
                 name: name.to_owned(),
+                terminal,
                 kind,
                 consistency: mode,
                 receipt,
@@ -515,6 +586,7 @@ pub(super) fn validate(raw: &Value) -> Result<Manifest> {
                         kind: MethodKind::Mutation,
                         consistency: QueryConsistency::Linearizable,
                         receipt: true,
+                        terminal: None,
                         cache: true,
                         watch: true,
                     })
@@ -606,6 +678,74 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn terminal_sql_metadata_is_query_only_and_requires_registered_readless_capabilities() {
+        let terminal = json!({"catalog":"app","operation":"query","finalizer":"run.$sql.finalize","signingKeys":[]});
+        let base = json!({
+            "definitions":{"auth":{"kind":"sqlAuthority"},"project":{"kind":"sqlProvider"},"run":{"kind":"query","cache":false,"watch":false,"terminal":terminal},"run.$sql.finalize":{"kind":"sqlFinalizer"}},
+            "http":{"alias":{"name":"run","kind":"query","cache":false,"watch":false,"terminal":terminal}},
+            "collections":[{"name":"private","indexes":{}}],
+            "sql":[{"name":"app","version":"1","authority":"auth","tables":[{"name":"notes","sources":[{"name":"private"}],"columns":[{"name":"id","type":"text","sourceKey":true}],"provider":"project"}]}]
+        });
+        assert_eq!(
+            validate(&base).unwrap().http["alias"]
+                .terminal
+                .as_ref()
+                .unwrap()
+                .catalog,
+            "app"
+        );
+        for (path, value) in [
+            (vec!["definitions", "run", "kind"], json!("mutation")),
+            (vec!["definitions", "run", "kind"], json!("derived")),
+            (vec!["definitions", "run", "cache"], json!(true)),
+            (vec!["definitions", "run", "watch"], json!(true)),
+            (
+                vec!["definitions", "run", "consistency"],
+                json!("replica-local"),
+            ),
+            (vec!["definitions", "run", "terminal"], Value::Null),
+            (
+                vec!["definitions", "run.$sql.finalize", "kind"],
+                json!("query"),
+            ),
+            (
+                vec!["definitions", "run", "terminal", "catalog"],
+                json!("unregistered"),
+            ),
+            (
+                vec!["definitions", "run", "terminal", "operation"],
+                json!("write"),
+            ),
+            (
+                vec!["definitions", "run", "terminal", "sources"],
+                json!(["private"]),
+            ),
+            (vec!["http", "alias", "terminal", "catalog"], json!("other")),
+            (vec!["http", "alias", "terminal"], Value::Null),
+            (
+                vec!["definitions", "run", "terminal", "signingKeys"],
+                json!([{"name":"undeclared","usages":["sign"]}]),
+            ),
+        ] {
+            let mut raw = base.clone();
+            let mut cursor = &mut raw;
+            for field in &path[..path.len() - 1] {
+                cursor = &mut cursor[*field];
+            }
+            cursor[path[path.len() - 1]] = value;
+            assert!(validate(&raw).is_err(), "must reject {:?}", path);
+            // Hidden definitions must fail closed too, not only HTTP aliases.
+            raw["http"] = json!({});
+            if path[0] == "definitions" {
+                assert!(validate(&raw).is_err(), "unexposed terminal {:?}", path);
+            }
+        }
+        let mut raw = base;
+        raw["http"]["exposeSigner"] = json!({"name":"run.$sql.finalize","kind":"query"});
+        assert!(validate(&raw).is_err());
+    }
 
     fn error(raw: Value) -> String {
         validate(&raw).unwrap_err().to_string()

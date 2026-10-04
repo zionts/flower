@@ -41,7 +41,7 @@ impl Default for Registry {
 struct RegistryInner {
     hubs: Mutex<HashMap<String, Weak<Hub>>>,
     /// What open watches hold: their inputs, hubs and current values.
-    budget: Arc<admission::Pool>,
+    budget: admission::Owner,
     wakes: Mutex<wakes::Wakes>,
     /// Raised when every watch must refresh: this replica's freshness came
     /// into doubt or it stopped, or its view of writes has a gap.

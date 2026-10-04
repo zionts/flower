@@ -89,6 +89,7 @@ pub(super) fn evaluation_memory_bytes(guest: usize, rust: usize) -> Result<usize
     #[cfg(feature = "sql")]
     let sql = crate::evaluator::sql::NATIVE_BYTES
         .checked_add(crate::evaluator::sql::BRIDGE_BYTES)
+        .and_then(|bytes| bytes.checked_add(crate::evaluator::sql::SNAPSHOT_BYTES))
         .ok_or_else(|| anyhow::anyhow!("native SQL memory reservation overflow"))?;
     #[cfg(not(feature = "sql"))]
     let sql = 0;

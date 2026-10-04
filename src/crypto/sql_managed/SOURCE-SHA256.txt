@@ -1,0 +1,16 @@
+515687dfeea618632d79fbbf2fb85570622306a7eec5344ae0594714eb6bb844  aes-gcm-0.10.3/Cargo.toml.orig
+9261306cb6e8ce08a3559d69b2c301b9c0474234b3ff4b92e3e3c8cd7937f479  aes-gcm-0.10.3/src/lib.rs
+150d63066a8f1a6cac359661752db49d2d5c8d2d5b34cfee413072ff95b9041f  aes-0.8.4/src/autodetect.rs
+15b9a67dbedc3b558ddec063489be4a6607e568afddd8345506be36952fc3bde  aes-0.8.4/src/ni.rs
+3a84211717fdc86a2b0f0d9086f33410bee2ff9be480f50c981980f678a0c2a8  aes-0.8.4/src/soft.rs
+df449412b068a1d66fad81b814347980b04ea724e0642fb10a84b53806d6c302  ghash-0.5.1/src/lib.rs
+9a12a24ecb07df1128eba52b91c1e555672bfdfed88f824e6076fe219ac5d1d0  polyval-0.6.2/src/backend/autodetect.rs
+bfd926a7a9f0b053b4b29e074ea482f7298e5d357805d8616223b53cb8d88345  polyval-0.6.2/src/backend/clmul.rs
+c51a6ebea44e3a74da58094b622266983ad21debd3974f2b9e0b2bd5bb5def91  polyval-0.6.2/src/backend/soft64.rs
+a69ff75e5e5d4d99adaa31025d82464aa34aafd83464dfc82e4932d85b28d096  polyval-0.6.2/src/backend/soft32.rs
+1622f2637f7f67b141ec24a9f6db0d84e164575d1f215ddeb8110587cb3d3814  polyval-0.6.2/src/backend/pmull.rs
+3d633614ff24afdba603e4f2d3e36bdb7b190fff9e7f0d2b385c1f9d5d8144d1  cpufeatures-0.2.17/src/lib.rs
+7604e26ffc27c0b388cc507faa0f3762ab0fa79776a0ea5b558262bf345beb5a  aws-lc-rs-1.18.1/src/aead/aead_ctx.rs
+c323141142c007eda6e6daabeb7a061e10bb8710e3dae0cb259751a7f804ff17  aws-lc-sys-0.45.0/aws-lc/crypto/err/err.c
+27d635df03ef8d525f755abb02c8915589b6df8e2b07820233ea8fea305c2e51  ed25519-dalek-3.0.0/src/signing.rs
+3d52bcfc8d0693d9d3f237c8ef645d7d7995e56637a148260a0939acd44d855f  ed25519-dalek-3.0.0/src/hazmat.rs

@@ -1,13 +1,32 @@
 # Flower SQL foundation (experimental, disabled by default)
 
-SQL is an **explicit catalog over Flower's current snapshot**, not a second database or an export of every collection. Build the experimental native evaluator with `cargo build --features sql --bin flower`. A default server builds without it. Registering SDK descriptors is not a claim that an older/default binary can execute them: native query/explain/cancel fail with `SQL_UNAVAILABLE` there.
+SQL is an **explicit curated catalog over Flower**, not a second database or an export of every collection. Cargo's `default = []` remains unchanged. Build the experimental native foundation with `cargo build --features sql --bin flower`; an ordinary server build has SQL capability **OFF**.
 
-**Launch status: HOLD.** The complete snapshot retention hard gate is not proved; `Records::sql_snapshot_reservation_bytes()` returns None for every root. Native host operations reject this with `SQL_SNAPSHOT_UNBOUNDED` even in a feature-enabled build, before authority/provider execution. There is no public/test bypass. Read `src/consensus/records_sql_snapshot.md` for the root/backing/native allocator evidence. Source foundation in development. Do not enable public aliases until the native/provider/snapshot/cancellation/authority conformance gates and application-specific disclosure tests pass. In particular, bounded SQLite allocations alone do not bound pinned snapshot retention under writes.
+**Launch status: HOLD. Two boundaries must not be confused:**
 
-## Application contract
+- **Legacy `ctx.sql` is permanently on HOLD.** Its original-snapshot retention gate is unproved: `Records::sql_snapshot_reservation_bytes()` returns `None` for every root. The feature-enabled path rejects with `SQL_SNAPSHOT_UNBOUNDED` before authority/provider execution; default builds reject native SQL with `SQL_UNAVAILABLE`. There is no test/public bypass, and the replacement terminal API must never fall back to this path. Read `src/consensus/records_sql_snapshot.md` for the root/backing/native allocator evidence.
+- **`sqlMethod` declares the replacement detached terminal contract, but the native terminal lifecycle is not implemented or enabled yet.** The service refuses it with `SQL_TERMINAL_UNAVAILABLE`. SDK declarations/adapters, manifest callback numbers, owned-frame work, and SQLite allocator/operator tests do not establish capture/provider/finish conformance or enable serving.
+
+Do not expose SQL aliases until the complete native storage/capture/frame/resource/callback/cancellation/authority/signing gates and application-specific disclosure tests pass. Bounded SQLite allocations alone do not bound a pinned Records snapshot under writes.
+
+## Explicit opt-in packaging
+
+The Nix flake exposes separate artifacts:
+
+| Selection | Native build | Status |
+| --- | --- | --- |
+| `packages.<system>.flower` / `default`, `apps.<system>.flower` / `default`, overlay `pkgs.flower` | `--bin flower`, no `sql` feature | SQL capability OFF |
+| `packages.<system>.flower-sql`, `apps.<system>.flower-sql`, overlay `pkgs.flower-sql` | `--bin flower --features sql` | Experimental foundation compiled; serving still HOLD |
+
+Both packages participate in flake checks. The server source fileset includes the optional `vendor/redb` seam with `lib.fileset.maybeMissing`, so the storage child's vendored implementation is retained once present without making an intermediate checkout require that path. This packaging is not permission to remove either runtime gate. Source packaging tests do not substitute for Nix evaluation/build; those need a Nix-capable environment.
+
+## Application declarations
+
+This is a declaration example, **not a working server demo**. The authenticator deliberately refuses all credentials until real verification is configured.
 
 ```ts
-import { collection, define, query, sqlCatalog, sqlTable } from "@flower-js/sdk";
+import { collection, define, sqlCatalog, sqlMethod, sqlTable, v } from "@flower-js/sdk";
+
 const notes = collection<{owner: string; text: string}>("notes")
   .index("owner", ["owner"]);
 const visibleNotes = sqlTable({
@@ -19,8 +38,8 @@ const visibleNotes = sqlTable({
     {name: "id", type: "text", sourceKey: true},
     {name: "text", type: "text", sourceField: "text"},
   ],
-  // This runs AFTER collection ACL filtering/redaction. It must add any
-  // additional product policy, never restore a hidden source field.
+  // Candidates have already passed collection ACL filtering/redaction.
+  // Add product policy; never restore a hidden source field.
   project(ctx, batch) {
     return {rows: batch.rows.flatMap((row, sourceRow) =>
       row.value.owner === ctx.principal()?.subject
@@ -36,33 +55,86 @@ const catalog = sqlCatalog({
     return {principal: request.invoker, context: null, tables: ["notes"]};
   },
 });
+const queryArgs = v.object({sql: v.string()});
 const app = define({
+  // Register the exact catalog declaration explicitly; sqlMethod does not do it.
   sql: [catalog],
-  // Configure real authentication! No SQL principal comes from client args.
-  auth: {authenticate: (_ctx, credentials) => {
-    // Example only: replace with deployed credential verification.
-    throw new Error("Configure an authenticator");
+  auth: {authenticate: (_ctx, _credentials) => {
+    throw new Error("Configure deployed credential verification");
   }},
   http: {
-    "sql.query": query("sql.query", {cache: false, watch: false},
-      (ctx, input: {sql: string}) => ctx.sql.query(catalog, input).result),
+    "sql.query": sqlMethod("sql.query", {
+      catalog, operation: "query", args: queryArgs, access: "authenticated",
+      // Readless: actual verified invoker and validated args, no database ctx.
+      plan(_invoker, args) { return {input: args, purpose: null}; },
+      // Exactly THREE arguments. Native fresh-finish validation must precede it.
+      finalize(_ctx, execution, _metadata) { return execution.result; },
+    }),
+    "sql.explain": sqlMethod("sql.explain", {
+      catalog, operation: "explain", args: queryArgs, access: "authenticated",
+    }),
+    "sql.catalog": sqlMethod("sql.catalog", {
+      catalog, operation: "catalog", access: "authenticated",
+    }),
+    "sql.cancel": sqlMethod("sql.cancel", {
+      catalog, operation: "cancel", args: v.object({queryId: v.string()}),
+      access: "authenticated",
+    }),
   },
 });
 ```
 
-`sqlTable` requires exactly one `source` or `sources` (1–8 registered collections). Sources are walked lazily in bounded candidate batches. A union supports facts rooted in different collections—for example a scope board plus the organization's no-scope board even when there are zero scopes. It is not an arbitrary privileged provider.
+`sqlMethod(name,spec)` returns a `QueryMethod`, preserves argument schemas and compiled access policy, and forces `cache:false, watch:false`. It accepts only `catalog`, `operation`, `cancelResult`, `args`, `access`, `plan`, `finalize`, and `signingKeys`. These are ordinary authenticated named application aliases, never `$flower.sql` or a universal raw endpoint. Client input does not select arbitrary deployed callbacks. The SDK rejects an HTTP terminal method unless the same catalog declaration is present in `define({sql:[catalog]})`.
 
-Each projector gets `{source:{name},rows:[{key,value}],purpose}`. Keys are decoded by the SDK for JSON-key collections; `sourceKey` SQL columns intentionally contain the encoded key as text. Projected rows are `{sourceRow,cells}`. `sourceRow` is a validated batch-local ordinal; one candidate may emit many embedded task/goal rows. Native `sourceField`/`sourceKey` mappings fill their cells from that referenced **redacted** row, overriding placeholder cells. All other cells are explicit tagged scalars. No implicit `row_json` exists.
+`plan(invoker,args)` has **no database context**. It receives the actual verified `Principal | null` and validated method arguments, and returns `SqlTerminalRequest = {input,purpose}`; both properties are required. `input` is `SqlQueryInput`, `{queryId:string}`, or `null`. Without a custom plan, the adapter returns `{input:args ?? null,purpose:null}`. Request purpose is untrusted data: only catalog authority validation can confer rights.
 
-A catalog requires a separate `sqlAuthority` callback returning `{principal,context,tables}` or null. `tables` is an explicit logical-table allowlist, also applied to discovery/relationships. Only its validated `context` reaches provider `purpose`. Authority validation may read application authorization rows with trusted application rights; those rights end before provider execution. Ordinary SQL is rejected for system/definer invocations. Applications must deny raw process contexts unless their deployed authority callback proves a live captured grant/lease and expressly attenuates them; users cannot provide a SQL principal.
+### Readless finalization and signing declarations
 
-Providers run as `sqlProvider`, not as derived callbacks. They retain the effective invoker, same snapshot, dependency collector and cumulative budgets. Writes, definer elevation, derived reads, managed keys, recursive SQL, filesystem/network/entropy are unavailable. Callback scans/ranges need declared indexes and bounded pages (32); equality `ctx.query` is permitted only for a declared scalar index and fails if more than 32 visible rows are required. Use point reads or bounded range pages for policies, never a full collection dump.
+The application callback is exactly:
 
-`ctx.sql.query(catalog,input,purpose?)` returns **`{result,provenance}`**. Only `.result` belongs in a public human response. Provenance is bounded internal application evidence for independently reauthorized result/logging admission; do not expose physical source identifiers in cells, catalog metadata, plans, errors, or failure logs. The evaluator itself does not mutate a conversation or authorize publication.
+```ts
+finalize(ctx, execution, metadata)
+```
 
-Other methods: `ctx.sql.catalog(catalog,purpose?)`, `ctx.sql.explain(catalog,input,purpose?)`, `ctx.sql.cancel(catalog,queryId,purpose?)`. They are ordinary authenticated named application methods, never `$flower.sql` or a universal raw endpoint. Every SQL alias must declare `cache:false, watch:false`; the server bypasses lookup/coalescing/insertion and rejects watch creation before registration.
+- `ctx: SqlFinishContext` exposes **only** `principal()`, `clock()`, `history()`, `codeVersion()`, and readonly `binding`. There is no source getter, recursive SQL, write/definer operation, ambient `now()`, or secret handle. The SDK adapter freezes the context using a trusted finish binding rather than binding a database host.
+- `execution: SqlOperationResult<O>` is `{result,provenance}` (`SqlExecution`) for `query`. For `explain` and `catalog` it is respectively `SqlExplain` and `SqlCatalogInfo`, not that wrapper. Cancellation never invokes a guest finalizer; native output is a boolean or the exact `{cancelled:boolean}` shape declared below. Human query finalizers return `execution.result` only. Without a custom finalizer, the generated callback returns the public operation result and never query provenance.
+- `metadata: SqlFinishMetadata` is the trusted `SqlFinishBinding` plus `request`. The binding contains `invoker`, effective `principal`, `clock`, `history: HistoryIdentity | null`, `codeVersion`, `catalogVersion`, validated `authorityContext`, `sourceRevision`, and `partition:{name,epoch}|null`. These values must come from native fresh-finish validation, not client args or result fields.
 
-## Transport and snapshot semantics
+`SqlFinishInput<O>` is internal trusted callback transport `{request,result,provenance,binding}`. The SDK adapts it to the three application arguments. Neither that adapter nor directly unit-testing it proves the native host has produced a valid binding.
+
+Each declaration generates a dedicated `sqlFinalizer` callback named `${name}.$sql.finalize`, even when no custom callback is supplied. Both the query definition and HTTP manifest entry carry matching `SqlTerminalMetadata = {catalog,operation,cancelResult?,finalizer,signingKeys}`. Native callback kind **6** selects the readless `sqlPlan` profile for that terminal query definition; kind **7** selects its dedicated `sqlFinalizer` definition. These are callback kinds, not host-call opcodes.
+
+Optional `signingKeys` contains at most eight declared `ManagedKey` descriptors. Every descriptor must include `sign` usage, and a nonempty list requires a custom finalizer. For example, `key("sql.proof", {algorithm:"HS256",usages:["sign"]})` may be listed in `signingKeys`; `define` adds it to the application key manifest. A declaration is not a loaded key or secret-byte capability. The native finish boundary must admit **only these keys and signing operations**, not general managed-key access. That boundary is a launch requirement, not a claim that finalizer signing currently runs.
+
+## Required detached terminal lifecycle (not implemented yet)
+
+The replacement must admit work quota-first and capture tiny bounded **owned** source/support slices. It must not retain the original Records root, read transaction, physical/logical storage guard, or provider/database capability across application callbacks or SQLite work. Cold/oversized resident reads must be refused before allocation/I/O inside a guard; any prefetch belongs outside those guards without an old transaction/root pin. Revision/epoch changes must invalidate the artifact, not silently weaken consistency.
+
+Sealing must discard raw/support/managed/cache/provider references and leave only authorized typed logical rows for SQLite. Capture, provider reads, expanded rows, bridge buffers, provenance, native allocations and output must all share hard cumulative allowances; repeated slices/callbacks cannot reset them.
+
+After execution, fresh bounded serving state must revalidate original/effective authority, captured grants/leases, source/policy certificates, temporal expiry, code/catalog generation and history. Only then may the readless three-argument finalizer use its bound metadata and admitted signing keys. A change or unknown dependency must discard the artifact instead of returning stale or partial results. A successful SELECT or signature still does not authorize a different audience: agent exposure/log append requires separate atomic current-recipient admission, including implicit forwarding destinations.
+
+Cancellation must use one shared token across capture, VM progress, provider work and finish. Dropping a request or losing an agent lease must cancel it; worker/frame/storage reservations cannot be released while blocking work still owns them. Query IDs remain ephemeral names bound to freshly verified original/effective principal, validated purpose and partition, not authorization capabilities. Cancellation declarations reject every custom `finalize` and every signing key. `cancelResult?: "boolean" | "cancelled"` is accepted **only** on `operation:"cancel"`; the default is the literal boolean, while `cancelResult:"cancelled"` preserves an application API returning exactly `{cancelled:boolean}`. This is a closed native descriptor choice, never caller input or a JavaScript formatter. The controller bypasses the generated private finalizer and performs no SQL operator, source projection, result-proof signing or arbitrary wrapper on cancellation. The SDK's generated cancellation finalizer itself refuses invocation. The native terminal cancellation/finish lifecycle is still unavailable.
+
+## Catalog and provider contract
+
+`sqlTable` requires exactly one `source` or `sources` (1–8 registered collections). A union supports facts rooted in different collections—for example a scope board plus the organization's no-scope board even when there are zero scopes. It is not an arbitrary privileged provider.
+
+Each projector gets `{source:{name},rows:[{key,value}],purpose}`. Keys are decoded by the SDK for JSON-key collections; `sourceKey` SQL columns intentionally contain the encoded key as text. Projected rows are `{sourceRow,cells}`. `sourceRow` is a validated batch-local ordinal; one candidate may emit many embedded task/goal rows. Native `sourceField`/`sourceKey` mappings must fill their cells from that referenced **redacted** row, overriding placeholder cells. All other cells are explicit tagged scalars. No implicit `row_json` exists.
+
+A catalog requires a separate `sqlAuthority` callback receiving `{catalog,operation,invoker,purpose}` and returning `{principal,context,tables}` or null. `operation` comes from the validated deployed terminal descriptor, never a field in the untrusted plan/input/purpose. `tables` is an explicit logical-table allowlist, also applied to discovery/relationships. Only its validated `context` reaches provider `purpose`. Authority validation may read application authorization rows with trusted application rights; those rights end before provider execution. Ordinary SQL is rejected for system/definer invocations. Applications must deny raw process contexts unless their deployed authority callback proves a live captured grant/lease and expressly attenuates them; users cannot provide a SQL principal.
+
+Providers use the dedicated `sqlProvider` callback, not a derived callback. They retain the effective invoker, dependencies and cumulative budgets bound to capture. Writes, definer elevation, derived reads, managed keys, recursive SQL, filesystem/network/entropy are unavailable. The legacy foundation limits callback scans/ranges to declared indexes and bounded pages (32); equality `ctx.query` requires a declared scalar index and fails if more than 32 visible rows are needed. These tested legacy constraints are not evidence of a completed terminal provider runtime. Use point reads or bounded range pages for policies, never a full collection dump.
+
+Policy helpers must use `clock()` and declare every known future expiry with `changesAt()`. `SqlReadContext` retains `now()` in its source type, but polled/uncertified temporal dependencies fail closed. This authority/provider context is not the readless plan/finalizer context.
+
+### Legacy declarations, permanently held
+
+The legacy source surface remains `ctx.sql.query(catalog,input,purpose?)`, `catalog(catalog,purpose?)`, `explain(catalog,input,purpose?)`, and `cancel(catalog,queryId,purpose?)`. Its query type is `{result,provenance}`. These signatures are documented for source compatibility only, **not as a serving recipe or an eventual fallback**. Explicit one-shot/cache/watch flags cannot repair the unbounded original snapshot. New aliases must be terminal declarations, not ordinary `query` callbacks calling `ctx.sql`.
+
+Provenance is bounded internal application evidence for independently reauthorized result/logging admission; do not expose physical source identifiers in human cells, catalog metadata, plans, errors, or failure logs. SQL evaluation itself does not mutate a conversation or authorize publication.
+
+## Transport and receipt semantics
 
 Input: `{sql,parameters?:JsonScalar[],maxRows?:number,queryId?:string}`. Scalars are null, boolean, finite JSON number or string. Use positional bindings, not interpolation. Integer source values beyond JavaScript's safe range must be exact signed-i64 decimal text mapped to an integer column, or tagged projector cells.
 
@@ -79,26 +151,24 @@ type SqlResult = {
 };
 ```
 
-Rows are arrays, preserving duplicate SQL aliases and exact integer values. Nonfinite reals and blobs are rejected. Missing/redacted/null mapped properties become SQL NULL; unavailable values are not fabricated zeros. Metadata discovery describes logical columns and coverage, never physical collection/provider names. Built-in `sql_tables`, `sql_columns`, `sql_relationships` are metadata-only virtual relations filtered by the same table allowlist.
+Rows are arrays, preserving duplicate SQL aliases and exact integer values. Nonfinite reals and blobs are rejected. Missing/redacted/null mapped properties become SQL NULL; unavailable values are not fabricated zeros. Metadata discovery describes logical columns and coverage, never physical collection/provider names. Built-in `sql_tables`, `sql_columns`, `sql_relationships` are metadata-only logical relations filtered by the same table allowlist.
 
-The trusted service envelope keeps `{revision,value,duplicate:false}` and adds `history:{database,incarnation}|null` to explicitly one-shot reads, from that exact captured snapshot's retention state. Clients keep history optional for an older binary. It is not generated by the application and is not a durable cursor. Separate requests take separate snapshots.
+The existing trusted one-shot service envelope keeps `{revision,value,duplicate:false}` and adds `history:{database,incarnation}|null` beside `value`, from native retention identity; clients keep history optional for an older binary. Application `value.history` is not a trusted receipt. Terminal completion must bind the actual capture's `sourceRevision` and `history` to its evidence and receipt, never an application-selected or later unrelated revision. This is not a durable cursor, and separate requests do not share a capture. No successful terminal receipt is currently available while serving is held.
 
-Before delivering native SQL, the service acquires current serving authority, reauthorizes the original request and checks the complete source/policy certificate and temporal validity. A revocation, policy/data/code change or unknown temporal dependency discards the artifact rather than silently rerun or emit a partial aggregate. SQL policy helpers must use `clock()` and declare every known future expiry with `changesAt()`. A polled `now()`/uncertified dependency fails closed. Applications also reauthorize agent completion atomically with exposure/log append; a successful SELECT does not authorize a different audience.
+## SQLite foundation and resource evidence
 
-## Dialect and resource boundary
+SQLite supplies the real parser and operators. The foundation accepts one read-only SELECT (including nonrecursive CTEs), joins, grouping, ordering and a default-deny deterministic function subset. It denies writes/DDL, transaction control, recursive evaluation, pragmas, attach/detach, schema/rowid escape, extension/file/network/random/ambient-time functions. SQLite NULL/no-affinity/BINARY comparison semantics apply. Integer SUM overflow fails; expressions SQLite represents as real are tagged real, not falsely promised as exact integers.
 
-SQLite supplies the real parser and operators. Accepted: one read-only SELECT (including nonrecursive CTEs), joins, grouping, ordering and a default-deny deterministic function subset. Denied: writes/DDL, transaction control, recursive evaluation, pragmas, attach/detach, schema/rowid escape, extension/file/network/random/ambient-time functions. SQLite NULL/no-affinity/BINARY comparison semantics apply. Integer SUM overflow fails; expressions that SQLite represents as real are tagged real, not falsely promised as exact integers.
+The legacy candidate virtual-table implementation pushes only native-mapped **BINARY text equality** and encoded-source-key equality initially. Native compound indexes may use a proven text equality prefix. SQLite retains the residual predicate (`omit=false`), and no ordering/limit/range is claimed consumed. Unicode string ranges, numeric affinities, NULL/missing behavior and protected fields deliberately fall back rather than change answers. Authorized aggregates never substitute all-source maintained aggregates. None of this permits SQLite to reenter Records in the replacement sealed-frame lifecycle.
 
-Only native-mapped **BINARY text equality** and encoded-source-key equality are pushed initially. Native compound indexes may use a proven text equality prefix. SQLite retains the residual predicate (`omit=false`), and no ordering/limit/range is claimed consumed. Unicode string ranges, numeric affinities, NULL/missing behavior and protected fields deliberately fall back rather than change answers. Authorized aggregates never substitute all-source maintained aggregates.
+Existing foundation ceilings (caller may only lower presentation limits): SQL 64 KiB; 256 parameters and 1 MiB parameter allowance; 1–1000 output rows (default 100); 1 MiB encoded response; 2-second cumulative SQL deadline; 10,000 source reads/8 MiB source allocations (including policy reads); 20,000 expanded rows; 256 KiB internal provenance; 64 source cursor states and 2 MiB retained source cursors. The legacy host permits only one query/explain invocation per method, so repeated host calls cannot reset work quotas. Source-budget failures are errors, never successful partial COUNT/SUM. The replacement terminal runtime uses one **total admitted-job deadline** of `min(FLOWER_EVALUATION_TIMEOUT_MS, 10 seconds)`, starting **before its first fence/capture** and continuing through encoding, code preparation, raw authentication/provider callbacks, SQLite, fresh finish validation, readless signing and native publication. Slices, retries, replay and callback resets never renew it. SQLite has an additional **2-second / 100,000-work-unit** sub-budget clipped to the original remaining total. An earlier actual grant/lease/policy/JWT expiry wins independently. Queue/admission wait is separately bounded. Every parser/copy/crypto stage must use the same cancellation and monotonic deadline; no source root or unbounded compilation may be hidden outside admission. These declared controls remain integration work, not a claim that the terminal serving gate is open.
 
-Current hard ceilings (caller may only lower presentation limits): SQL 64 KiB; 256 parameters and 1 MiB parameter allowance; 1–1000 output rows (default 100); 1 MiB encoded response; 2-second cumulative SQL deadline; 10,000 source reads/8 MiB source allocations (including policy reads); 20,000 expanded rows; 256 KiB internal provenance; 64 source cursor states and 2 MiB retained source cursors. Only one query/explain evaluator invocation per method is allowed, so repeated host calls cannot reset work quotas. Source-budget failures are errors, never successful partial COUNT/SUM.
+SQLite's header-owner custom allocator charges before allocating/reallocating, including headers, and preserves ownership when freed on another thread/after TLS scope. Its sticky per-query cap is 16 MiB, not SQLite's global heap limit. Initialization has a separate fixed quota and fails closed if SQLite was already initialized elsewhere. The constrained VFS denies filesystem spill and dynamic-library/clock/entropy access. Provider/cursor/output bounds are separate: existing node admission reserves **16 MiB native + 32 MiB bridge + a conservative 128 MiB snapshot/frame allowance** in addition to shared guest/Rust allowances. A nominal allowance is not proof that retained roots are bounded. Guest stores share one cumulative invocation allowance.
 
-SQLite's header-owner custom allocator charges before allocating/reallocating, including headers, and preserves ownership when freed on another thread/after TLS scope. Its sticky per-query cap is 16 MiB, not SQLite's global heap limit. Initialization has a separate fixed quota and fails closed if SQLite was already initialized elsewhere. The constrained VFS denies filesystem spill and dynamic-library/clock/entropy access. Provider/cursor/output bridge bounds are separate: node admission reserves **16 MiB native + 32 MiB bridge + a conservative 128 MiB snapshot allowance** in addition to shared guest/Rust allowances. Guest stores share one cumulative invocation allowance.
+## Checks and honest evidence
 
-Cancellation uses one shared token through VM progress, scans and callback work. Dropping an admitted request cancels but does not release its worker/snapshot permits before the blocking work exits. An authenticated native registry names queries ephemerally by original+effective principal, validated purpose, partition and query ID; cancel is reauthorized through the catalog and active IDs cannot be reused until the worker exits. A query ID is not a record ID or authority capability. The application must connect live agent lease loss/halt to this cancellation path; completion still revalidates.
+The Node `testDatabase` **does not execute SQL**. It refuses native SQL with `SQL_UNAVAILABLE` and must never simulate a different SQL parser/executor or expose a terminal plan as the result. SDK unit tests cover explicit catalog registration, callback/terminal metadata, schemas/access, readless three-argument adaptation, signing declarations, mapping/index validation, bounded unions and key decoding.
 
-## Tests
-
-The existing Node `testDatabase` **does not execute SQL**. It refuses native SQL with `SQL_UNAVAILABLE`; it must never simulate a different SQL parser/executor. Declaration/SDK unit tests cover catalog opt-in, callback kind, mapping/index validation, bounded unions and key decoding. Real evaluator tests and the server-backed `bench/sql-conformance.mjs` exercise the same native engine as the server. The server harness must currently confirm the hard-gate refusal, not falsely claim end-to-end SQL queries pass. Run the native suite with `cargo test -p flower --lib --features sql`, not only `npm test`.
+Native evaluator tests and the server-backed `bench/sql-conformance.mjs` exercise the foundation rather than a mock parser. The server harness must currently confirm hard-gate refusal, not claim positive end-to-end terminal/provider conformance. Run native foundation tests with `cargo test -p flower --lib --features sql`, not only `npm test`; allocator/operator unit success is not launch success. API coverage, docs rendering/type examples and source-only packaging checks likewise do not prove Nix evaluation/build or native serving.
 
 Operational telemetry must never log SQL literals, parameters, results or raw provenance. Native errors are generic codes; hidden-row work counts belong only in privileged coarse telemetry.

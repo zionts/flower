@@ -16,7 +16,7 @@ use std::time::Duration;
 
 #[derive(Clone)]
 pub(in crate::service) struct Budget {
-    pool: Arc<Pool>,
+    pool: Owner,
     peer_token: String,
     operator_token: String,
     http_limit: usize,
@@ -96,7 +96,7 @@ fn too_large(limit: usize) -> ApiError {
 }
 
 async fn collect(
-    pool: &Arc<Pool>,
+    pool: &Owner,
     class: Class,
     limit: usize,
     body: Body,
@@ -183,7 +183,7 @@ pub(in crate::service) async fn handle(
 mod tests {
     use super::*;
 
-    fn pool() -> Arc<Pool> {
+    fn pool() -> Owner {
         Pool::new([1, 1], [1, 1], [1024, 1024], 1)
     }
 
