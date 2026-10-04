@@ -15,6 +15,7 @@ use profile::{StoragePhase, StorageTrace};
 mod lazy_flush;
 mod persistence;
 mod shared;
+mod sql_pairing;
 mod write_basis;
 pub use shared::SharedDatabase;
 #[cfg(feature = "sql")]
