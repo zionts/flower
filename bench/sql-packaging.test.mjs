@@ -11,7 +11,10 @@ test("SQL is an explicit server artifact, never a Cargo or flake default", () =>
   const features = cargo.match(/\[features\]([\s\S]*?)(?=\n\[)/)?.[1];
   assert.ok(features, "Cargo feature declarations must be present");
   assert.match(features, /^default\s*=\s*\[\s*\]\s*$/m);
-  assert.match(features, /^sql\s*=\s*\["dep:libsqlite3-sys"\]/m);
+  const sql = [...(features.match(/^sql\s*=\s*\[([^\]]*)\]/m)?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+  const expectedSql = ["dep:libsqlite3-sys", "redb/flower-resident-reads", "dep:aes-gcm", "dep:aes", "dep:ghash", "dep:polyval"];
+  if (/im\s*=\s*\{\s*path\s*=\s*"vendor\/im"/.test(cargo)) expectedSql.push("im/flower-bounded-reads");
+  assert.deepEqual([...sql].sort(), expectedSql.sort(), "every SQL-only dependency/feature is explicit and unique");
   const factory = section("      mkFlower =", "      # @flower-js/sdk");
   assert.match(factory, /\{ enableSql \? false \}:/);
   assert.match(factory, /cargoBuildFlags\s*=\s*\[\s*"--bin"\s*"flower"\s*\]\s*\+\+\s*lib\.optionals enableSql\s*\[\s*"--features"\s*"sql"\s*\]/);
@@ -34,9 +37,10 @@ test("SQL-enabled app, overlay and compile check stay separately selectable", ()
   assert.match(section("      checks = forAllSystems", "      formatter ="), /inherit \(packages\) flower flower-sql sdk;/);
 });
 
-test("server source includes the redb seam even before it exists", () => {
+test("server source includes both native capture vendor seams", () => {
   const source = section("      serverSrc =", "      sdkSrc =");
   assert.match(source, /\(lib\.fileset\.maybeMissing \.\/vendor\/redb\)/);
+  assert.match(source, /\.\/vendor\/im/);
   assert.match(source, /\.\/Cargo\.toml/);
   assert.match(source, /\.\/Cargo\.lock/);
   assert.match(source, /\.\/src/);

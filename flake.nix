@@ -120,8 +120,9 @@
           ./crates
           ./examples/goblin-pizza-rs
           ./vendor/openraft
-          # Resident-only SQL capture's narrow redb seam, once vendored.
+          # Resident-only SQL capture's narrow redb and fixed im traversal seams.
           (lib.fileset.maybeMissing ./vendor/redb)
+          ./vendor/im
           ./vendor/quickjs-ng/quickjs.wasm
           ./runtime/engine.js
         ];

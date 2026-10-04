@@ -10,7 +10,7 @@ license = "MIT"
 [features]
 default = []
 # Experimental: disabled until SQL integration/authority/resource launch gates pass.
-sql = ["dep:libsqlite3-sys", "redb/flower-resident-reads", "im/flower-bounded-reads"]
+sql = ["dep:libsqlite3-sys", "redb/flower-resident-reads", "im/flower-bounded-reads", "dep:aes-gcm", "dep:aes", "dep:ghash", "dep:polyval"]
 
 [dependencies]
 anyhow = "1"
@@ -33,6 +33,13 @@ hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "s
 im = "15.1"
 # Native read-only SQL: the allocator is configured before SQLite's first use.
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"], optional = true }
+# SQL-only mounted AES: direct schedule-cleanup feature unification is required.
+# aes-gcm's zeroize feature alone does not cover every pinned owner; the bounded
+# SQL module also scrubs the entire dead mapped cipher representation.
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "zeroize"], optional = true }
+aes = { version = "=0.8.4", default-features = false, features = ["zeroize"], optional = true }
+ghash = { version = "=0.5.1", default-features = false, features = ["zeroize"], optional = true }
+polyval = { version = "=0.6.2", default-features = false, features = ["zeroize"], optional = true }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 # Backup objects (src/consensus/backup/format.rs).
 zstd = { version = "0.14", default-features = false }
