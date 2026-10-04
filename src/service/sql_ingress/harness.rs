@@ -6,4 +6,8 @@ static ALLOCATOR: allocation_probe::Allocator = allocation_probe::Allocator;
 #[path = "../sql_ingress.rs"]
 mod sql_ingress;
 
-mod metadata_reference { include!(env!("SQL_INGRESS_REFERENCE")); }
+mod evaluator {
+    pub(crate) mod metadata_reference {
+        include!(env!("SQL_INGRESS_REFERENCE"));
+    }
+}
