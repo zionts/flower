@@ -96,10 +96,12 @@ fn ensure_construction_bytes(bytes: usize) -> Result<(), ApiError> {
             .map_err(unavailable)?
             .rust_memory_bytes
     {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "EVALUATION_BUDGET",
-            "staged plan construction exceeds the Rust memory budget".into(),
+        return Err(evaluation_error(
+            evaluator::rust_engine::EngineError::new(
+                "EVALUATION_BUDGET",
+                "staged plan construction exceeds the Rust memory budget",
+            )
+            .into(),
         ));
     }
     Ok(())

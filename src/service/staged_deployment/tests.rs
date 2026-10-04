@@ -150,7 +150,90 @@ fn native_plan_bound_covers_policy_operands_references_and_added_indexes() {
     assert!(native + admission::input_bytes(&plan) < bound);
     assert!(bound < evaluator::config::Settings::default().rust_memory_bytes);
     let error = ensure_construction_bytes(usize::MAX).unwrap_err();
-    assert_eq!(error.code, "EVALUATION_BUDGET");
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error.code, "EVALUATION_FAILED");
+    assert_eq!(error.body()["error"]["code"], "EVALUATION_FAILED");
+    assert_eq!(
+        error.body()["error"]["failure"]["code"],
+        "EVALUATION_BUDGET"
+    );
+    assert_eq!(
+        error.body()["error"]["message"],
+        "EVALUATION_BUDGET: staged plan construction exceeds the Rust memory budget"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn construction_budget_failure_preserves_engine_envelope_before_commit() {
+    let code = bundle(false, false, "return ctx.query(query).length;");
+    let (_directory, app) = super::super::tests::application(code.clone()).await;
+    // A source-only oversized existing schema forces the native-builder
+    // preflight, without changing any process/global budget or customer data.
+    let indexes: Vec<_> = (0..10_000)
+        .map(|n| json!({"collection":format!("oversized-{n:05}-{}", "x".repeat(128)),"fields":["kind"]}))
+        .collect();
+    let initial = app.consensus.read_for_writer().await.unwrap();
+    app.consensus
+        .commit(Commit {
+            internal: true,
+            request_id: String::new(),
+            fingerprint: String::new(),
+            expected_revision: initial.revision,
+            puts: BTreeMap::from([("schema".into(), json!({"indexes":indexes,"aggregates":{}}))]),
+            deletes: vec![],
+            result: Value::Null,
+        })
+        .await
+        .unwrap();
+    let survivor = Arc::new(
+        app.admission
+            .retain(admission::Class::Control, 100)
+            .unwrap(),
+    );
+    let before = app.consensus.read_for_writer().await.unwrap();
+    let metrics = app.admission.metrics();
+    let error = administer(&app, stage_input("construction-budget", code))
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error.body()["error"]["code"], "EVALUATION_FAILED");
+    assert_eq!(
+        error.body()["error"]["failure"]["code"],
+        "EVALUATION_BUDGET"
+    );
+    assert_eq!(
+        error.body()["error"]["failure"]["message"],
+        "staged plan construction exceeds the Rust memory budget"
+    );
+    let after = app.consensus.read_for_writer().await.unwrap();
+    assert_eq!(
+        after.revision, before.revision,
+        "budget refusal must not commit"
+    );
+    assert!(after.data["schema"] == before.data["schema"]);
+    assert!(after.data["bundle"] == before.data["bundle"]);
+    assert!(!after.data.contains_key(PLAN));
+    assert!(!after.data.contains_key(staging::JOB));
+    for index in 0..3 {
+        let current = app.admission.metrics();
+        assert_eq!(
+            current["classes"][index]["inputBudgetBytes"],
+            metrics["classes"][index]["inputBudgetBytes"]
+        );
+        assert_eq!(
+            current["classes"][index]["retainedInputBytes"],
+            metrics["classes"][index]["retainedInputBytes"]
+        );
+        assert_eq!(current["classes"][index]["active"], 0);
+        assert_eq!(current["classes"][index]["queued"], 0);
+    }
+    assert_eq!(metrics["classes"][1]["inputBudgetBytes"], 16 * 1024 * 1024);
+    drop(survivor);
+    assert_eq!(
+        app.admission.metrics()["classes"][1]["retainedInputBytes"],
+        0
+    );
+    app.consensus.shutdown().await.unwrap();
 }
 
 #[test]
