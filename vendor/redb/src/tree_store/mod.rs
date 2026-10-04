@@ -7,6 +7,13 @@ mod btree_mutator;
 mod extract_if;
 mod multimap_btree;
 mod page_store;
+#[cfg(feature = "flower-resident-reads")]
+pub(crate) mod resident_cursor;
+#[cfg(feature = "flower-resident-reads")]
+pub use resident_cursor::{
+    RESIDENT_COMPONENT_CAPACITY, RESIDENT_KEY_CAPACITY, ResidentKey, ResidentRange,
+    ResidentRangeBounds, ResidentRangeScratch,
+};
 mod table_tree;
 mod table_tree_base;
 

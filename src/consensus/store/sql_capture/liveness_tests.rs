@@ -207,12 +207,8 @@ async fn fixture(scoped: bool, rows: usize) -> Fixture {
         let backing = data.backing().expect("persisted native backing");
         // Resident baseline setup, not capture prefetch/recovery: raw warming
         // neither parses JSON nor leaves a read owner in the controller.
-        for raw in backing
-            .capture_raw_range(Bound::Included(""), Bound::Unbounded)
-            .unwrap()
-        {
-            let raw = raw.unwrap();
-            assert!(!raw.value.value().is_empty());
+        for raw in backing.range(Bound::Included(""), Bound::Unbounded) {
+            assert!(!raw.key.is_empty());
         }
     }
     Fixture {

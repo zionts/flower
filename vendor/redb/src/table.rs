@@ -962,6 +962,71 @@ impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
     }
 }
 
+/// Flower's exact byte-key resident-only API. It borrows the already opened
+/// table/transaction and never opens/clones them. All returned guards/cursors
+/// must drop before both the active TLS scope and mutation exclusion end.
+#[cfg(feature = "flower-resident-reads")]
+impl ReadOnlyTable<&'static [u8], &'static [u8]> {
+    /// Allocation-free point read, requiring an active resident TLS scope.
+    pub fn resident_get(&self, key: &[u8]) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
+        crate::resident::require_active()?;
+        if key.len() > crate::RESIDENT_COMPONENT_CAPACITY {
+            return Err(crate::resident::fault(
+                crate::ResidentReadFault::InvalidRequest,
+            ));
+        }
+        crate::tree_store::resident_cursor::get(&self.tree, key, false)
+    }
+
+    /// Forward range using preconstructed fixed bounds and reusable inline path.
+    pub fn resident_range<'a>(
+        &'a self,
+        bounds: &'a crate::ResidentRangeBounds,
+        scratch: &'a mut crate::ResidentRangeScratch,
+    ) -> Result<crate::ResidentRange<'a, &'static [u8]>> {
+        crate::ResidentRange::new(&self.tree, bounds, scratch, false)
+    }
+}
+
+#[cfg(feature = "flower-resident-reads")]
+impl ReadOnlyTable<(&'static [u8], &'static [u8]), &'static [u8]> {
+    /// Allocation-free pair point read. This convenience method uses an inline
+    /// `ResidentKey` on its native stack; admit that storage, or build a key before
+    /// exclusion and use `resident_get_pair_encoded` instead.
+    pub fn resident_get_pair(
+        &self,
+        partition: &[u8],
+        key: &[u8],
+    ) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
+        crate::resident::require_active()?;
+        let encoded = crate::ResidentKey::pair(partition, key)?;
+        self.resident_get_pair_encoded(&encoded)
+    }
+
+    /// Pair point read with an explicitly preconstructed/pre-touched request.
+    pub fn resident_get_pair_encoded(
+        &self,
+        key: &crate::ResidentKey,
+    ) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
+        crate::resident::require_active()?;
+        if !key.is_paired() {
+            return Err(crate::resident::fault(
+                crate::ResidentReadFault::InvalidRequest,
+            ));
+        }
+        crate::tree_store::resident_cursor::get(&self.tree, key.as_bytes(), true)
+    }
+
+    /// Range restricted to one partition, with second-component bounds.
+    pub fn resident_partition_range<'a>(
+        &'a self,
+        bounds: &'a crate::ResidentRangeBounds,
+        scratch: &'a mut crate::ResidentRangeScratch,
+    ) -> Result<crate::ResidentRange<'a, (&'static [u8], &'static [u8])>> {
+        crate::ResidentRange::new(&self.tree, bounds, scratch, true)
+    }
+}
+
 impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for ReadOnlyTable<K, V> {
     fn stats(&self) -> Result<TableStats> {
         let tree_stats = self.tree.stats()?;

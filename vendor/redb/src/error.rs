@@ -75,6 +75,9 @@ pub enum StorageError {
     /// The key does not sort strictly between the entries adjacent to the cursor
     #[cfg(feature = "experimental_cursor")]
     UnorderedKey,
+    /// A fixed, allocation-free Flower resident-only refusal.
+    #[cfg(feature = "flower-resident-reads")]
+    Resident(crate::ResidentReadFault),
     Io(io::Error),
     /// The backend does not support a required storage operation.
     Unsupported,
@@ -111,6 +114,8 @@ impl From<StorageError> for Error {
             StorageError::ValueTooLarge(x) => Error::ValueTooLarge(x),
             #[cfg(feature = "experimental_cursor")]
             StorageError::UnorderedKey => Error::UnorderedKey,
+            #[cfg(feature = "flower-resident-reads")]
+            StorageError::Resident(x) => Error::Resident(x),
             StorageError::Io(x) => Error::Io(x),
             StorageError::Unsupported => Error::Unsupported,
             StorageError::PreviousIo => Error::PreviousIo,
@@ -140,6 +145,8 @@ impl Display for StorageError {
                     "The key does not sort strictly between the entries adjacent to the cursor"
                 )
             }
+            #[cfg(feature = "flower-resident-reads")]
+            StorageError::Resident(err) => err.fmt(f),
             StorageError::Io(err) => {
                 write!(f, "I/O error: {err}")
             }
@@ -703,6 +710,9 @@ pub enum Error {
     // Tables cannot be opened for writing multiple times, since they could retrieve immutable &
     // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
     TableAlreadyOpen(String, &'static panic::Location<'static>),
+    /// A fixed, allocation-free Flower resident-only refusal.
+    #[cfg(feature = "flower-resident-reads")]
+    Resident(crate::ResidentReadFault),
     Io(io::Error),
     /// The backend does not support a required storage operation.
     Unsupported,
@@ -803,6 +813,8 @@ impl Display for Error {
             Error::TableAlreadyOpen(name, location) => {
                 write!(f, "Table '{name}' already opened at: {location}")
             }
+            #[cfg(feature = "flower-resident-reads")]
+            Error::Resident(err) => err.fmt(f),
             Error::Io(err) => {
                 write!(f, "I/O error: {err}")
             }

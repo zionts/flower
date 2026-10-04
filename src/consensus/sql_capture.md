@@ -399,3 +399,100 @@ redb cursor paths and im overlay traversal allocate too. Their input bounds are
 known but no enforced native scratch allocator capability is provided here.
 Controller integration, hard native allocation accounting and real terminal
 SQL admission/execution/authorization/delivery remain required separately.
+
+## Fixed native reader stage — October 4, 2026
+
+The preceding scratch ledger describes the first primitive, not the final
+reader paths. This stage replaces those concrete under-exclusion heap paths:
+
+- Exact redb 4.3 resident byte/pair point APIs encode pair keys into fixed
+  8,202-byte storage (actual max encoded length 8,195), not `K::as_bytes` Vec.
+- Resident ranges borrow prebuilt `ResidentRangeBounds` and a single inline
+  128-parent/one-leaf `ResidentRangeScratch`, with no heap bounds/cursor paths or
+  transaction/table clones. All descriptor/bounds/scratch preparation and
+  write-touching precede the capture permit. Current pair point convenience
+  uses a bounded inline key local; account its transient native stack too.
+- Exact `im` 15.1.0 is vendored with retained MPL source/notices and an additive
+  default-off `flower-bounded-reads` feature. Inclusive `get_next_bounded` uses
+  one borrowed parent candidate, checked 128 visits, no Vec/recursion/root/value
+  clone. Strict overlay continuation uses a fixed 4,097-byte UTF-8 key-plus-NUL
+  buffer. Normal OrdMap methods/writers/format are unchanged. The new path
+  avoids upstream `get_next`'s confirmed exhausted-child/parent fallback bug.
+- Fixed JSON output streams borrowed Values into the admitted buffer with
+  fixed SqlCaptureError failures, rather than serde/io error boxes. Number
+  `Display` uses locked serde_json's exact same itoa/zmij stack token as Serialize
+  into a checked 32-byte temporary; controls/UTF8 match CompactFormatter. The
+  depth/node/text preflight remains before serialization. Deep JSON call frames
+  still require finite admitted execution-stack provisioning.
+- Resident refusal is direct `StorageError::Resident`, not boxed io::Error;
+  bad-depth/order/header/tuple/address/cache-length paths use fixed failures.
+  Invalid scoped phase/epoch checks use scalar metadata, not anyhow formatting.
+- Capture-local publication/source borrows now live INSIDE the resident closure.
+  Cursor/entry/page/source references end before TLS reset AND before physical
+  exclusion releases. Returned SQL input still contains only owned bytes/scalars.
+
+Two independently reproduced lookahead defects are fixed: filling a permitted
+row slice stops BEFORE probing its possibly cold/oversized successor, and
+examined work is charged BEFORE every overlay/native lookup rather than after
+Peekable prefetch. End/miss probes also consume work. Continuation always names
+only consumed keys; completeness may need one later bounded slice. A 128-work
+slice with 129 tombstones cannot inspect the 129th. Actual warmed-leaf/cold-child
+boundary and final-row regressions are part of the new evidence.
+
+### Allocation evidence and explicit remaining accounting
+
+The single **test-only** crate System allocator probe (`cfg(test,sql)`) counts
+alloc, alloc_zeroed and realloc only while actual redb resident TLS is active.
+Its independent positive control exercises all three operations and an explicit
+TLS general `measure` interface is shared with native SQL component tests. It
+never denies/quota-nulls an allocation or changes the production/bin allocator.
+
+Combined real Flower scope probes report all three counters zero for plain
+hot copy/cold refusal, paired point/range with nonempty overlay/tombstones,
+selector enrollment, certified copy, rebase, final validation and changed-source
+refusal. Counted native backends perform no capture reads/writes. Exact vendor
+redb debug/release differential probes also report zero native Rust allocations
+and backend read/write/sync over 11,051 leaves, cold/contention/depth/corruption
+faults, bound variants and encoded tuple boundaries; 151 vendored units passed.
+Exact im debug/release differential probes report zero allocations/clones over
+20,002 queries, multilevel scans, removals/rebalancing, Unicode/NUL/4KiB keys;
+7 bounded-node units passed. The generic scope/escape test proves immutable old
+bytes across ordinary writes and successful old transaction close after guards
+and table drop, not a compiler-enforced SQL retention theorem.
+
+Measured x86-64 object sizes (debug/release): ResidentKey 8,216/8,216 B,
+ResidentRangeBounds 16,440/16,440 B, ResidentRangeScratch 6,200/5,168 B,
+cursor 32/32 B, each guard 104/96 B. `SqlCaptureScratch::reservation_bytes()`
+reports this build's actual combined bounds/path object size. These are fixed
+objects, **not total native stack high-water or process RSS**. Caller admission
+must include simultaneously live buffer/slot/continuation/certificate objects,
+partition binding/epoch copies, native encoding/query/guard temporaries and an
+actual finitely provisioned worker stack; a zero-heap counter is not permission
+to invent a stack estimate. No native stack/accounting or whole runtime launch
+waiver is made by this stage.
+
+Busy now has a root-free actual-mutation notification seam:
+`Consensus::sql_capture_progress()` returns `OwnedNotified` owning only Notify,
+not Store/Database. Pin and `enable()` BEFORE trying capture, then on Busy await
+that actual mutation-completion event under the original deadline/cancellation.
+A capture refusal/release does NOT self-notify; contention without a real storage
+completion can be returned Busy rather than retried. Paced uses its returned
+wake deadline. Source error/changed/decode/work refusal discards the attempt and
+its partial frame; never reset/re-adopt a certificate to retain stale partials.
+
+The terminal hard total is min(operator configured timeout, 10 seconds), with
+SQLite's 2-second/100k sub-budget clipped to remaining time and earlier authority
+expiry winning. Storage liveness fixtures' 30-second hang watchdog is NOT that
+serving budget. Busy-host debug 10k runs have ranged from 2.2–9.0 seconds with
+314 fsync/control/vote rounds, before callbacks/SQLite/signing. An actual terminal
+positive inside the configured original hard deadline is still required; do
+not silently extend the total to make a fixture pass.
+
+Actual live `ctx.history()` uses only database/incarnation from `$flower.retention`
+plus semantic `HISTORY_MARKER`; `$flower.history` in the first liveness fixture
+is archive metadata, not that complete live-host identity proof. The approved
+narrow typed HistoryIdentity source/selector and forbidden general raw-accounting
+coverage are a subsequent stage, not implicitly solved here. Atomic registry
+routing/startup warmth and real terminal authorization/execution/delivery also
+remain separate gates. Full Records snapshot admission stays None/default SQL
+stays disabled until the integrated gates actually pass.

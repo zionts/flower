@@ -1043,6 +1043,16 @@ impl<K: Key, V: Value> Btree<K, V> {
         &self.transaction_guard
     }
 
+    #[cfg(feature = "flower-resident-reads")]
+    pub(super) fn resident_cached_root(&self) -> Option<&PageImpl> {
+        self.cached_root.as_ref()
+    }
+
+    #[cfg(feature = "flower-resident-reads")]
+    pub(super) fn resident_resolver(&self) -> &PageResolver {
+        &self.mem
+    }
+
     pub(crate) fn hint(&self) -> PageHint {
         self.hint
     }

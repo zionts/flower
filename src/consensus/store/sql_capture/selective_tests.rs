@@ -425,3 +425,313 @@ async fn sql_capture_selective_raw_points_stay_valid_through_actual_rebase() {
     assert_eq!(copied.buffer.records().len(), 1);
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn sql_capture_selective_escaped_collection_names_cannot_cover_another_collection() {
+    for name in ["", "quotes\" and\\slash", "東京🌸\n", "rows\",\"evil"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(1, dir.path().into()).await.unwrap();
+        let encoded = serde_json::to_string(name).unwrap();
+        let key = format!("source:[{encoded},\"one\"]");
+        let lower = format!("source:[{encoded},");
+        let upper = format!("source:[{encoded}-");
+        store
+            .apply([entry(
+                1,
+                0,
+                &[
+                    (&key, json!({"n":1})),
+                    ("source:[\"other\",\"one\"]", json!({"n":2})),
+                ],
+                &[],
+            )])
+            .await
+            .unwrap();
+        store.inner.persistence.drain().await.unwrap();
+        let fence = store.sql_capture_bind_fence(store.read_fence().unwrap(), None);
+        let mut cert = certificate(&fence);
+        admitted(|| {
+            store.sql_capture_certify(
+                None,
+                &fence,
+                &mut cert,
+                &[SqlCaptureDependency::Collection(name)],
+            )
+        })
+        .await
+        .unwrap();
+        let request = SqlCaptureRequest {
+            selection: SqlCaptureSelection::Range {
+                lower: &lower,
+                upper: Some(&upper),
+                after: None,
+            },
+            max_records: 32,
+            max_examined: 128,
+        };
+        let copied =
+            admitted(|| store.sql_capture_certified_slice(None, &fence, &cert, request, buffer()))
+                .await
+                .unwrap();
+        assert!(copied.buffer.complete());
+        assert_eq!(copied.buffer.records().len(), 1);
+        let row = copied.buffer.records().next().unwrap();
+        assert_eq!(&copied.buffer.bytes()[row.key.clone()], key.as_bytes());
+        assert_eq!(
+            store
+                .sql_capture_certified_slice(
+                    None,
+                    &fence,
+                    &cert,
+                    keys(&["source:[\"other\",\"one\"]"]),
+                    buffer()
+                )
+                .unwrap_err(),
+            SqlCaptureError::InvalidRequest
+        );
+        let invalid_after = SqlCaptureRequest {
+            selection: SqlCaptureSelection::Range {
+                lower: &lower,
+                upper: Some(&upper),
+                after: Some(&upper),
+            },
+            max_records: 32,
+            max_examined: 128,
+        };
+        assert_eq!(
+            store
+                .sql_capture_certified_slice(None, &fence, &cert, invalid_after, buffer())
+                .unwrap_err(),
+            SqlCaptureError::InvalidRequest
+        );
+        store.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sql_capture_selective_rejects_frozen_and_retired_partition_binding() {
+    use crate::consensus::{PartitionCommand, PartitionTransfer};
+    for retired in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(1, dir.path().into()).await.unwrap();
+        let binding = PartitionBinding {
+            partition: "selected".into(),
+            epoch: 1,
+        };
+        for (index, control) in [
+            PartitionCommand::Create {
+                partition: "selected".into(),
+                epoch: 1,
+                operation: "init".into(),
+            },
+            PartitionCommand::Activate {
+                partition: "selected".into(),
+                epoch: 1,
+                operation: "init".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = store
+                .apply([Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(3, 1), index as u64 + 1),
+                    payload: EntryPayload::Normal(RaftCommand::PartitionControl {
+                        partition_control: control,
+                        leader_id: None,
+                    }),
+                }])
+                .await
+                .unwrap();
+            assert!(matches!(result.as_slice(), [ApplyResult::Partition(_)]));
+        }
+        store.inner.persistence.drain().await.unwrap();
+        let fence = store.sql_capture_bind_fence(store.read_fence().unwrap(), Some(&binding));
+        let mut cert = certificate(&fence);
+        admitted(|| {
+            store.sql_capture_certify(
+                Some(&binding),
+                &fence,
+                &mut cert,
+                &[SqlCaptureDependency::Collection("rows")],
+            )
+        })
+        .await
+        .unwrap();
+        let control = if retired {
+            PartitionCommand::Discard {
+                partition: "selected".into(),
+                epoch: 1,
+                operation: "drop".into(),
+            }
+        } else {
+            PartitionCommand::Freeze {
+                transfer: PartitionTransfer {
+                    partition: "selected".into(),
+                    operation: "move".into(),
+                    source: "a".into(),
+                    destination: "b".into(),
+                    source_epoch: 1,
+                    epoch: 2,
+                },
+                expected_revision: 0,
+            }
+        };
+        let result = store
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(3, 1), 3),
+                payload: EntryPayload::Normal(RaftCommand::PartitionControl {
+                    partition_control: control,
+                    leader_id: None,
+                }),
+            }])
+            .await
+            .unwrap();
+        assert!(matches!(result.as_slice(), [ApplyResult::Partition(_)]));
+        store.inner.persistence.drain().await.unwrap();
+        let fresh = store.sql_capture_bind_fence(store.read_fence().unwrap(), Some(&binding));
+        assert_eq!(
+            admitted(|| store.sql_capture_validate(Some(&binding), &fresh, &cert))
+                .await
+                .unwrap_err(),
+            SqlCaptureError::SnapshotChanged
+        );
+        store.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sql_capture_progress_enrolls_before_actual_mutation_without_retaining_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(1, dir.path().into()).await.unwrap();
+    store
+        .apply([entry(1, 0, &[("value", json!(1))], &[])])
+        .await
+        .unwrap();
+    store.inner.persistence.drain().await.unwrap();
+    let fence = store.sql_capture_bind_fence(store.read_fence().unwrap(), None);
+    let notified = store.sql_capture_progress();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let permit = store.inner.shared.mutation_permit();
+    assert_eq!(
+        store
+            .sql_capture_slice(None, &fence, None, keys(&["value"]), buffer())
+            .unwrap_err(),
+        SqlCaptureError::Busy
+    );
+    drop(permit);
+    // Completion happened BEFORE polling the wait; enrollment prevents loss.
+    notified.await;
+    let pending = store.sql_capture_progress();
+    tokio::pin!(pending);
+    pending.as_mut().enable();
+    let copied =
+        admitted(|| store.sql_capture_slice(None, &fence, None, keys(&["value"]), buffer()))
+            .await
+            .unwrap();
+    assert_eq!(copied.buffer.records().len(), 1);
+    assert!(
+        futures_util::poll!(pending.as_mut()).is_pending(),
+        "capture cannot self-signal Busy retry"
+    );
+    let witness = Arc::downgrade(&store.inner);
+    store.close().await.unwrap();
+    drop(store);
+    assert!(
+        witness.upgrade().is_none(),
+        "pending Notify must not own Store/source"
+    );
+}
+
+#[tokio::test]
+async fn sql_capture_combined_certificate_copy_validate_and_rebase_have_zero_heap_inside_scope() {
+    use crate::consensus::sql_capture::allocation_probe::{self, Counts};
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(1, dir.path().into()).await.unwrap();
+    store
+        .apply([entry(
+            1,
+            0,
+            &[
+                (
+                    "source:[\"rows\",\"a\"]",
+                    json!({"text":"東京🌸\n","n":1.0}),
+                ),
+                ("bundle", json!({"javascript":"x"})),
+            ],
+            &[],
+        )])
+        .await
+        .unwrap();
+    store.inner.persistence.drain().await.unwrap();
+    let fence = store.sql_capture_bind_fence(store.read_fence().unwrap(), None);
+    let mut cert = certificate(&fence);
+    let deps = [
+        SqlCaptureDependency::Collection("rows"),
+        SqlCaptureDependency::Point("bundle"),
+    ];
+    let result = admitted(|| {
+        let (result, counts) =
+            allocation_probe::run(|| store.sql_capture_certify(None, &fence, &mut cert, &deps));
+        assert_eq!(counts, Counts::default());
+        result
+    })
+    .await;
+    result.unwrap();
+    for phase in 0..2 {
+        if phase == 1 {
+            store
+                .apply([entry(2, 1, &[("noise", json!(2))], &[])])
+                .await
+                .unwrap();
+            store.inner.persistence.drain().await.unwrap();
+        }
+        admitted(|| {
+            let (result, counts) = allocation_probe::run(|| {
+                store.sql_capture_certified_slice(
+                    None,
+                    &fence,
+                    &cert,
+                    keys(&["bundle", "source:[\"rows\",\"a\"]"]),
+                    buffer(),
+                )
+            });
+            assert_eq!(counts, Counts::default());
+            result
+        })
+        .await
+        .unwrap();
+        admitted(|| {
+            let (result, counts) =
+                allocation_probe::run(|| store.sql_capture_validate(None, &fence, &cert));
+            assert_eq!(counts, Counts::default());
+            result
+        })
+        .await
+        .unwrap();
+    }
+    let mut writer = store.clone();
+    writer
+        .apply([entry(
+            3,
+            2,
+            &[("source:[\"rows\",\"a\"]", json!({"n":2}))],
+            &[],
+        )])
+        .await
+        .unwrap();
+    store.inner.persistence.drain().await.unwrap();
+    assert_eq!(
+        admitted(|| {
+            let (result, counts) =
+                allocation_probe::run(|| store.sql_capture_validate(None, &fence, &cert));
+            assert_eq!(counts, Counts::default());
+            result
+        })
+        .await
+        .unwrap_err(),
+        SqlCaptureError::SnapshotChanged
+    );
+    store.close().await.unwrap();
+}

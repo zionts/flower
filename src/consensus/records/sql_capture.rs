@@ -31,10 +31,25 @@ impl Records {
             header.try_into().map_err(|_| SqlCaptureError::Storage)?,
         )))
     }
+    #[cfg(test)]
     pub(crate) fn sql_capture_raw(
         &self,
         request: &SqlCaptureRequest<'_>,
         output: &mut SqlCaptureBuffer,
+    ) -> Result<(), SqlCaptureError> {
+        let mut scratch = SqlCaptureScratch::for_partition(
+            self.backing
+                .as_ref()
+                .and_then(|b| b.capture_raw_partition()),
+            request,
+        )?;
+        self.sql_capture_prepared(request, output, &mut scratch)
+    }
+    pub(crate) fn sql_capture_prepared(
+        &self,
+        request: &SqlCaptureRequest<'_>,
+        output: &mut SqlCaptureBuffer,
+        scratch: &mut SqlCaptureScratch,
     ) -> Result<(), SqlCaptureError> {
         request.validate()?;
         if !self.has_valid_depth() || !self.has_valid_source_ids() {
@@ -144,49 +159,77 @@ impl Records {
                 upper,
                 after,
             } => {
-                let lo = after.map_or(Bound::Included(lower), Bound::Excluded);
-                let hi = upper.map_or(Bound::Unbounded, Bound::Excluded);
-                // Bound allocations are capped by request.validate; no source keys
-                // or payloads are allocated by the backing's raw iterator.
-                let mut tree = self
-                    .map
-                    .range::<_, String>((lo.map(str::to_owned), hi.map(str::to_owned)))
-                    .peekable();
+                let mut query = [0u8; SQL_CAPTURE_MAX_KEY_BYTES + 1];
+                let mut query_len = after.map_or(lower.len(), |key| key.len() + 1);
+                if let Some(after) = after {
+                    query[..after.len()].copy_from_slice(after.as_bytes());
+                } else {
+                    query[..lower.len()].copy_from_slice(lower.as_bytes());
+                }
+                let mut tree = None;
+                let mut need_tree = !self.map.is_empty();
+                let mut tree_done = !need_tree;
                 let mut stored = match &self.backing {
-                    Some(backing) => backing.capture_raw_range(lo, hi)?,
+                    Some(backing) => backing.capture_raw_range(scratch)?,
                     None => RawRange::Empty,
                 };
-                let mut disk = stored.next().transpose()?;
-                if disk.is_some() {
-                    output.examined += 1;
-                }
+                let mut disk = None;
+                let mut need_disk = !matches!(&stored, RawRange::Empty);
+                let mut disk_done = !need_disk;
                 loop {
+                    // Never probe a successor after filling the permitted row
+                    // slice. It may be cold/oversized and is not this slice's work.
                     if output.count >= request.max_records {
                         output.complete = false;
                         break;
                     }
-                    if tree.peek().is_none() && disk.is_none() {
+                    if need_tree {
+                        if output.examined >= request.max_examined {
+                            if output.continuation().is_none() {
+                                return Err(SqlCaptureError::WorkLimit);
+                            }
+                            output.complete = false;
+                            break;
+                        }
+                        output.examined += 1; // charged BEFORE lookup/prefetch
+                        let key = std::str::from_utf8(&query[..query_len])
+                            .map_err(|_| SqlCaptureError::Storage)?;
+                        tree = self
+                            .map
+                            .get_next_bounded(key)
+                            .map_err(|_| SqlCaptureError::WorkLimit)?
+                            .filter(|(key, _)| upper.is_none_or(|upper| key.as_str() < upper));
+                        tree_done = tree.is_none();
+                        need_tree = false;
+                    }
+                    if need_disk {
+                        if output.examined >= request.max_examined {
+                            if output.continuation().is_none() {
+                                return Err(SqlCaptureError::WorkLimit);
+                            }
+                            output.complete = false;
+                            break;
+                        }
+                        output.examined += 1; // misses/end probes also consume work
+                        disk = stored.next().transpose()?;
+                        disk_done = disk.is_none();
+                        need_disk = false;
+                    }
+                    if tree_done && disk_done {
                         output.complete = true;
                         break;
                     }
-                    let order = match (tree.peek(), disk.as_ref()) {
+                    let order = match (tree.as_ref(), disk.as_ref()) {
                         (Some((key, _)), Some(raw)) => key.as_str().cmp(raw.key()?),
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
                         (None, None) => unreachable!(),
                     };
-                    if order != std::cmp::Ordering::Greater
-                        && output.examined >= request.max_examined
-                    {
-                        if output.continuation().is_none() {
-                            return Err(SqlCaptureError::WorkLimit);
-                        }
-                        output.complete = false;
-                        break;
-                    }
                     if order != std::cmp::Ordering::Greater {
-                        let (key, entry) = tree.next().expect("peeked overlay");
-                        output.examined += 1;
+                        let (key, entry) = tree.take().expect("loaded overlay");
+                        if key.len() > SQL_CAPTURE_MAX_KEY_BYTES {
+                            return Err(SqlCaptureError::Oversized);
+                        }
                         if let Some(value) = &entry.value {
                             match output.value(key, entry.version, value) {
                                 Err(SqlCaptureError::Oversized) if output.count > 0 => {
@@ -197,8 +240,12 @@ impl Records {
                             }
                         }
                         output.set_continuation(key)?;
+                        query[..key.len()].copy_from_slice(key.as_bytes());
+                        query[key.len()] = 0;
+                        query_len = key.len() + 1;
+                        need_tree = true;
                     } else {
-                        let raw = disk.as_ref().expect("peeked stored record");
+                        let raw = disk.as_ref().expect("loaded stored record");
                         let key = raw.key()?;
                         let (version, body, json_bytes) = stored_parts(raw.value.value())?;
                         match output.record(key, Some(version), Some(body), json_bytes) {
@@ -211,16 +258,10 @@ impl Records {
                         output.set_continuation(key)?;
                     }
                     if order != std::cmp::Ordering::Less {
-                        // Every stored entry inspected is charged, even when an
-                        // overlay tombstone shadows it. No unbounded Merge::next.
-                        if output.examined >= request.max_examined {
-                            output.complete = false;
-                            break;
-                        }
-                        disk = stored.next().transpose()?;
-                        if disk.is_some() {
-                            output.examined += 1;
-                        }
+                        // Drop the consumed/shadowed pending page guards before
+                        // any successor read. Next iteration first checks quotas.
+                        drop(disk.take());
+                        need_disk = true;
                     }
                 }
             }

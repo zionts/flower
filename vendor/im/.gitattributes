@@ -1,0 +1,2 @@
+# Preserve the exact upstream CRLF source and do not flag CR as trailing space.
+src/hash/map.rs -text whitespace=cr-at-eol

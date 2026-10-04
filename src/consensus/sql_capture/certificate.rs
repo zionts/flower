@@ -107,12 +107,11 @@ impl SqlCaptureCertificate {
                     let prefix = b"collection:";
                     encoded[..prefix.len()].copy_from_slice(prefix);
                     let mut used = 0;
-                    let mut writer = SliceWriter {
+                    fixed_json::FixedJsonWriter {
                         bytes: &mut encoded[prefix.len()..],
                         used: &mut used,
-                    };
-                    serde_json::to_writer(&mut writer, name)
-                        .map_err(|_| SqlCaptureError::Oversized)?;
+                    }
+                    .string(name)?;
                     (true, prefix.len() + used)
                 }
             };

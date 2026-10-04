@@ -1,0 +1,34 @@
+# Unit-test the exact vendored source without the uncached redb-2.6 backward-
+# compatibility dev dependency. All selected dependencies are already in Flower.
+[package]
+name = "flower-redb-resident-unit-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+build = "../build.rs"
+
+[workspace]
+
+[lib]
+name = "redb"
+path = "../src/lib.rs"
+
+[features]
+default = ["std", "flower-resident-reads"]
+std = []
+flower-resident-reads = ["std"]
+cache_metrics = []
+experimental-api-5 = []
+experimental-multiprocess = ["std", "experimental-api-5"]
+experimental_cursor = ["experimental-api-5"]
+logging = ["dep:log"]
+
+[dependencies]
+libc = "0.2.174"
+log = { version = "0.4.17", optional = true }
+chrono_v0_4 = { version = "0.4.41", optional = true, package = "chrono" }
+uuid = { version = "1.17.0", optional = true }
+
+[dev-dependencies]
+rand = "0.10.1"
+tempfile = "3.5.0"

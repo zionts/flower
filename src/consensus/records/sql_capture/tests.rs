@@ -435,3 +435,325 @@ fn sql_capture_version_identity_exhaustion_never_wraps_or_renews_old_blocks() {
     assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     assert_eq!(reserve_version_block(&counter, 1), None);
 }
+
+#[test]
+fn sql_capture_combined_native_scope_has_zero_heap_for_paired_overlay_range_and_faults() {
+    use crate::consensus::sql_capture::allocation_probe::{self, Counts};
+    let (db, _dir, reads, writes) = database(8 * 1024 * 1024);
+    let tx = db.begin_write().unwrap();
+    for n in 0..96 {
+        let key = format!("source:[\"rows\",\"{n:03}\"]");
+        tx.open_table(PAIR)
+            .unwrap()
+            .insert(
+                (b"scope".as_slice(), key.as_bytes()),
+                super::super::super::backing::encode(100 + n, format!("{{\"n\":{n}}}").as_bytes())
+                    .as_slice(),
+            )
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    let reader = db.begin_read().unwrap();
+    let table = Arc::new(reader.open_table(PAIR).unwrap());
+    for row in table
+        .range((b"scope".as_slice(), b"".as_slice())..)
+        .unwrap()
+    {
+        drop(row.unwrap());
+    }
+    let mut records = Records::backed(Arc::new(Backing::pair(table.clone(), "scope".into())));
+    records.insert(
+        "source:[\"rows\",\"020-overlay\"]".into(),
+        serde_json::json!({"n":1.0,"text":"東京🌸\n\u{0000}\\\""}),
+    );
+    records.remove("source:[\"rows\",\"010\"]");
+    let request = SqlCaptureRequest {
+        selection: SqlCaptureSelection::Range {
+            lower: "source:[\"rows\",",
+            upper: Some("source:[\"rows\"-"),
+            after: None,
+        },
+        max_records: 32,
+        max_examined: 128,
+    };
+    let mut scratch = SqlCaptureScratch::for_partition(Some("scope"), &request).unwrap();
+    let mut output = output();
+    let before = (
+        reads.load(Ordering::Relaxed),
+        writes.load(Ordering::Relaxed),
+    );
+    let (result, counts) = allocation_probe::run(|| {
+        redb::with_resident_reads(32 * 1024 * 1024, || {
+            records.sql_capture_prepared(&request, &mut output, &mut scratch)
+        })
+    });
+    result.unwrap();
+    assert_eq!(counts, Counts::default());
+    assert_eq!(output.records().len(), 32);
+    assert_eq!(
+        before,
+        (
+            reads.load(Ordering::Relaxed),
+            writes.load(Ordering::Relaxed)
+        )
+    );
+    let (version, counts) = allocation_probe::run(|| {
+        redb::with_resident_reads(32 * 1024 * 1024, || {
+            records.sql_capture_version("source:[\"rows\",\"095\"]")
+        })
+    });
+    assert!(version.unwrap().is_some());
+    assert_eq!(counts, Counts::default());
+    let (error, counts) = allocation_probe::run(|| {
+        redb::with_resident_reads(1, || {
+            records.sql_capture_version("source:[\"rows\",\"095\"]")
+        })
+    });
+    assert_eq!(error.unwrap_err(), SqlCaptureError::WorkLimit);
+    assert_eq!(counts, Counts::default());
+    drop(records);
+    drop(table);
+    reader.close().unwrap();
+}
+
+#[test]
+fn sql_capture_combined_native_scope_has_zero_heap_for_plain_copy_and_cold_refusal() {
+    use crate::consensus::sql_capture::allocation_probe::{self, Counts};
+    const PLAIN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("plain-probe");
+    for cache in [0, 8 * 1024 * 1024] {
+        let (db, _dir, reads, writes) = database(cache);
+        let tx = db.begin_write().unwrap();
+        for n in 0..128 {
+            tx.open_table(PLAIN)
+                .unwrap()
+                .insert(
+                    format!("key-{n:03}").as_bytes(),
+                    super::super::super::backing::encode(
+                        1000 + n,
+                        format!("{{\"n\":{n},\"pad\":\"{}\"}}", "x".repeat(512)).as_bytes(),
+                    )
+                    .as_slice(),
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let reader = db.begin_read().unwrap();
+        let table = reader.open_table(PLAIN).unwrap();
+        if cache > 0 {
+            drop(table.get(b"key-000".as_slice()).unwrap());
+        }
+        let records = Records::backed(Arc::new(Backing::plain(table)));
+        let mut output = output();
+        let request = keys(&["key-000"]);
+        let mut scratch = SqlCaptureScratch::for_partition(None, &request).unwrap();
+        let before = (
+            reads.load(Ordering::Relaxed),
+            writes.load(Ordering::Relaxed),
+        );
+        let (result, counts) = allocation_probe::run(|| {
+            redb::with_resident_reads(32 * 1024 * 1024, || {
+                records.sql_capture_prepared(&request, &mut output, &mut scratch)
+            })
+        });
+        if cache == 0 {
+            assert_eq!(result.unwrap_err(), SqlCaptureError::ColdPage);
+        } else {
+            result.unwrap();
+            assert_eq!(output.records().len(), 1);
+        }
+        assert_eq!(counts, Counts::default());
+        assert_eq!(
+            before,
+            (
+                reads.load(Ordering::Relaxed),
+                writes.load(Ordering::Relaxed)
+            )
+        );
+        drop(records);
+        reader.close().unwrap();
+    }
+}
+
+#[test]
+fn sql_capture_row_and_work_caps_stop_before_unneeded_successor_inspection() {
+    // Oversized successor must not turn a completed permitted row into error.
+    let mut records = Records::new();
+    records.insert("a".into(), serde_json::json!(1));
+    records.insert(
+        "b".into(),
+        serde_json::json!("x".repeat(SQL_CAPTURE_MAX_BYTES)),
+    );
+    let request = SqlCaptureRequest {
+        selection: SqlCaptureSelection::Range {
+            lower: "",
+            upper: None,
+            after: None,
+        },
+        max_records: 1,
+        max_examined: 128,
+    };
+    let mut output = output();
+    records.sql_capture_raw(&request, &mut output).unwrap();
+    assert_eq!(output.records().len(), 1);
+    assert_eq!(output.continuation(), Some("a"));
+    assert_eq!(output.examined(), 1);
+    assert!(!output.complete());
+    // 129 overlay tombstones: exactly 128 charged lookups, not a 129th Peek.
+    let mut records = Records::new();
+    records.keep_deletions();
+    for n in 0..129 {
+        let key = format!("k{n:03}");
+        records.insert(key.clone(), serde_json::json!(1));
+        records.remove(&key);
+    }
+    let mut output = super::tests::output();
+    let request = SqlCaptureRequest {
+        selection: SqlCaptureSelection::Range {
+            lower: "",
+            upper: None,
+            after: None,
+        },
+        max_records: 32,
+        max_examined: 128,
+    };
+    records.sql_capture_raw(&request, &mut output).unwrap();
+    assert_eq!(output.examined(), 128);
+    assert_eq!(output.continuation(), Some("k127"));
+    assert_eq!(output.records().len(), 0);
+    assert!(!output.complete());
+}
+
+#[test]
+fn sql_capture_resident_generic_scope_escape_is_immutable_pinned_data_not_mutable_aliasing() {
+    let (db, _dir, _reads, _writes) = database(8 * 1024 * 1024);
+    let tx = db.begin_write().unwrap();
+    tx.open_table(PAIR)
+        .unwrap()
+        .insert((b"a".as_slice(), b"key".as_slice()), b"old".as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+    let reader = db.begin_read().unwrap();
+    let table = reader.open_table(PAIR).unwrap();
+    drop(table.get((b"a".as_slice(), b"key".as_slice())).unwrap());
+    let escaped = redb::with_resident_reads(32 * 1024 * 1024, || {
+        table.resident_get_pair(b"a", b"key").unwrap().unwrap()
+    });
+    assert!(!redb::resident_scope_active());
+    let tx = db.begin_write().unwrap();
+    tx.open_table(PAIR)
+        .unwrap()
+        .insert((b"a".as_slice(), b"key".as_slice()), b"new".as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(escaped.value(), b"old");
+    drop(escaped);
+    drop(table);
+    reader.close().unwrap();
+    let reader = db.begin_read().unwrap();
+    assert_eq!(
+        reader
+            .open_table(PAIR)
+            .unwrap()
+            .get((b"a".as_slice(), b"key".as_slice()))
+            .unwrap()
+            .unwrap()
+            .value(),
+        b"new"
+    );
+    reader.close().unwrap();
+}
+
+#[test]
+fn sql_capture_full_row_slice_does_not_probe_a_cold_native_successor() {
+    const PLAIN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("cold-successor");
+    let (db, _dir, reads, writes) = database(8192);
+    let tx = db.begin_write().unwrap();
+    for n in 0u64..128 {
+        // Uncompressed native JSON body, not packed repetitive text, to force
+        // numerous actual leaves. Version header is the normal storage format.
+        let json = format!("{{\"n\":{n},\"pad\":\"{}\"}}", "x".repeat(1024));
+        let mut body = n.to_le_bytes().to_vec();
+        body.extend_from_slice(json.as_bytes());
+        tx.open_table(PLAIN)
+            .unwrap()
+            .insert(format!("k{n:04}").as_bytes(), body.as_slice())
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    // Reopen to remove unrelated commit-cache occupancy: setup warms only
+    // the root path and first leaf, while subsequent leaves remain truly cold.
+    drop(db);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(_dir.path().join("db.redb"))
+        .unwrap();
+    let db = Database::builder()
+        .set_cache_size(64 * 1024)
+        .create_with_backend(Counted {
+            file: redb::backends::FileBackend::new(file).unwrap(),
+            reads: reads.clone(),
+            writes: writes.clone(),
+        })
+        .unwrap();
+    let reader = db.begin_read().unwrap();
+    let table = reader.open_table(PLAIN).unwrap();
+    // Warm one leaf near the first child. Find the last key of that warmed
+    // resident leaf using resident lookups only; the next key must be cold.
+    drop(table.get(b"k0000".as_slice()).unwrap());
+    let mut last = None;
+    let mut cold = None;
+    for n in 0..128 {
+        let key = format!("k{n:04}");
+        match redb::with_resident_reads(32 * 1024 * 1024, || table.resident_get(key.as_bytes())) {
+            Ok(Some(_)) => last = Some(key),
+            Err(error)
+                if matches!(
+                    redb::resident_read_fault(&error),
+                    Some(redb::ResidentReadFault::ColdPage { .. })
+                ) =>
+            {
+                cold = Some(key);
+                break;
+            }
+            _ => {
+                panic!("unexpected native fixture result (neither resident key nor cold successor)")
+            }
+        }
+    }
+    let last = last.expect("warmed leaf has key");
+    let cold = cold.expect("fixture has actually cold successor");
+    assert!(cold > last);
+    let records = Records::backed(Arc::new(Backing::plain(table)));
+    let request = SqlCaptureRequest {
+        selection: SqlCaptureSelection::Range {
+            lower: &last,
+            upper: None,
+            after: None,
+        },
+        max_records: 1,
+        max_examined: 128,
+    };
+    let mut scratch = SqlCaptureScratch::for_partition(None, &request).unwrap();
+    let mut out = output();
+    let before = (
+        reads.load(Ordering::Relaxed),
+        writes.load(Ordering::Relaxed),
+    );
+    redb::with_resident_reads(32 * 1024 * 1024, || {
+        records.sql_capture_prepared(&request, &mut out, &mut scratch)
+    })
+    .unwrap();
+    assert_eq!(out.records().len(), 1);
+    assert_eq!(out.continuation(), Some(last.as_str()));
+    assert!(!out.complete());
+    assert_eq!(
+        before,
+        (
+            reads.load(Ordering::Relaxed),
+            writes.load(Ordering::Relaxed)
+        )
+    );
+    drop(records);
+    reader.close().unwrap();
+}
