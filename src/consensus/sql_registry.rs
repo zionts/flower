@@ -18,8 +18,8 @@ mod stamp;
 pub(crate) use stamp::SourceStamp;
 
 pub(crate) use pool::{
-    RegistryAdmission, RegistryDirectoryLimits, RegistryPool, RegistryPoolLayout,
-    RegistryPoolLimits,
+    RegistryAdmission, RegistryDirectoryLimits, RegistryDirectoryPlan, RegistryPool,
+    RegistryPoolLayout, RegistryPoolLimits,
 };
 pub(in crate::consensus) use pool::{RegistryCell, RegistryStaging};
 

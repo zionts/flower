@@ -1761,3 +1761,5 @@ impl Consensus {
         self.store.clone().try_get_log_entries(..).await.unwrap()
     }
 }
+
+mod schema_barrier;

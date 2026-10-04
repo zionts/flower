@@ -170,8 +170,23 @@ pub struct CompactBatch {
     pub items: Vec<BatchItem>,
 }
 
+/// Actual raw namespace metadata keys, shared by BOTH native compaction paths.
+/// A source collection called schema/bundle is not this raw record key. No
+/// caller deployment flag, substring or missing CURRENT record is authority.
+pub(crate) fn source_sensitive_key(key: &str) -> bool {
+    matches!(key, "bundle" | "schema" | "httpMethods" | "terminalMethods")
+}
+
 impl CompactBatch {
     pub fn new(commits: Vec<Commit>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !commits.iter().any(|commit| commit
+                .puts
+                .keys()
+                .chain(commit.deletes.iter())
+                .any(|key| source_sensitive_key(key))),
+            "source metadata changes require ordered individual commits, not last-write-wins compaction"
+        );
         let expected_revision = commits
             .first()
             .context("a consensus group requires at least one application commit")?
@@ -214,6 +229,17 @@ impl CompactBatch {
     /// Validate decoded commands too: a Raft proposal is not permission to
     /// bypass atomicity through malformed metadata or revision overflow.
     fn validate(&self) -> anyhow::Result<u64> {
+        // Decoded/direct construction cannot bypass the original-commit
+        // metadata barrier. Refuse before staging/receipts/mutation, without
+        // weakening the independent original ABI17 deadline validation below.
+        anyhow::ensure!(
+            !self
+                .puts
+                .keys()
+                .chain(self.deletes.iter())
+                .any(|key| source_sensitive_key(key)),
+            "source metadata changes require ordered individual commits, not last-write-wins compaction"
+        );
         anyhow::ensure!(
             self.items.iter().all(|item| item
                 .sql_commit_before

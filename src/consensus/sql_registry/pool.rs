@@ -797,3 +797,7 @@ unsafe impl Sync for RegistryCell {}
 #[cfg(test)]
 #[path = "pool/tests.rs"]
 mod tests;
+
+#[path = "pool/derived.rs"]
+mod derived;
+pub(crate) use derived::RegistryDirectoryPlan;
