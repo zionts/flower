@@ -186,6 +186,7 @@ fn certificates_track_collection_and_index_phantoms_but_skip_unrelated_buckets()
         aggregate_versions: Default::default(),
         references: Vec::new(),
         sql: Vec::new(),
+        protected_sources: Vec::new(),
         indexes: vec![indexes::IndexSpec {
             collection: "items".into(),
             fields: vec!["group".into()],
@@ -304,6 +305,7 @@ fn writes_that_invalidate_a_certificate_touch_what_it_observed() {
         aggregate_versions: Default::default(),
         references: Vec::new(),
         sql: Vec::new(),
+        protected_sources: Vec::new(),
         indexes: vec![indexes::IndexSpec {
             collection: "items".into(),
             fields: vec!["group".into()],

@@ -499,6 +499,8 @@ test("claimMany takes up to max in order and cancels the jobs admit refuses", as
     db.now += 1;
   }
   assert.deepEqual(db.mutate("claimEven", { owner: "w", max: 2 }), ["two", "four"]);
+  assert.deepEqual(["two", "four"].map((id) => db.query("jobs.get", { id })!.lease!.token), [1, 2],
+    "legacy one-argument admission remains valid; refusals do not spend fencing tokens");
   assert.deepEqual(db.query("scan", null), [["", "eight", "pending"], ["", "four", "leased"], ["", "six", "pending"], ["", "two", "leased"]], "refused jobs are gone");
   const claimed = db.mutate("jobs.claim", { owner: "w", max: 3 })!;
   assert.deepEqual([claimed.id, claimed.more?.map((claim) => claim.id)], ["six", ["eight"]], "several claims come back as the first, carrying the rest");

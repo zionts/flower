@@ -29,6 +29,7 @@ fn install(data: &mut Records, fixture: &Fixture) {
             aggregate_versions: Default::default(),
             references: Vec::new(),
             sql: Vec::new(),
+            protected_sources: Vec::new(),
             indexes: vec![spec()],
             aggregates: BTreeMap::new(),
         }),
