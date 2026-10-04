@@ -10,6 +10,9 @@
 mod control;
 #[path = "sql_frame/json.rs"]
 mod json;
+#[cfg(test)]
+#[path = "sql_frame/mapping_tests.rs"]
+mod mapping_tests;
 #[path = "sql_frame/slab.rs"]
 mod slab;
 

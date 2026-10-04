@@ -233,25 +233,16 @@ impl CaptureArena {
         Ok(())
     }
     #[cfg(test)]
-    pub(super) fn mapped_regions(&self) -> [(usize, usize); 8] {
+    pub(super) fn mapped_regions(&self) -> [super::mapping_tests::Region; 8] {
         [
-            (self.raw.as_ptr() as usize, self.raw.mapped_bytes()),
-            (self.support.as_ptr() as usize, self.support.mapped_bytes()),
-            (self.decoded.as_ptr() as usize, self.decoded.mapped_bytes()),
-            (self.nodes.as_ptr() as usize, self.nodes.mapped_bytes()),
-            (
-                self.documents.as_ptr() as usize,
-                self.documents.mapped_bytes(),
-            ),
-            (
-                self.object_keys.as_ptr() as usize,
-                self.object_keys.mapped_bytes(),
-            ),
-            (self.keys.as_ptr() as usize, self.keys.mapped_bytes()),
-            (
-                self.key_bytes.as_ptr() as usize,
-                self.key_bytes.mapped_bytes(),
-            ),
+            self.raw.region(),
+            self.support.region(),
+            self.decoded.region(),
+            self.nodes.region(),
+            self.documents.region(),
+            self.object_keys.region(),
+            self.keys.region(),
+            self.key_bytes.region(),
         ]
     }
     #[cfg(test)]

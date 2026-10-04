@@ -48,6 +48,8 @@ pub(super) struct Slab<T: Copy> {
     data: NonNull<T>,
     len: usize,
     bytes: usize,
+    #[cfg(test)]
+    mapping_id: u64,
 }
 impl<T: Copy + Default> Slab<T> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -59,6 +61,8 @@ impl<T: Copy + Default> Slab<T> {
                 data: NonNull::dangling(),
                 len,
                 bytes,
+                #[cfg(test)]
+                mapping_id: 0,
             });
         }
         let mapped = unsafe {
@@ -80,7 +84,13 @@ impl<T: Copy + Default> Slab<T> {
             unsafe { libc::munmap(mapped, bytes) };
             return Err(FrameError::Capacity);
         };
-        let slab = Self { data, len, bytes };
+        let slab = Self {
+            data,
+            len,
+            bytes,
+            #[cfg(test)]
+            mapping_id: super::mapping_tests::next_id(),
+        };
         // Own the mapping before initialization, so a cancellation error really
         // unmaps the partially initialized region through Copy-only Drop.
         // Explicit volatile writes force all pages (including padding/tail) to
@@ -110,6 +120,14 @@ impl<T: Copy> Slab<T> {
     pub(super) fn mapped_bytes(&self) -> usize {
         self.bytes
     }
+    #[cfg(test)]
+    pub(super) fn region(&self) -> super::mapping_tests::Region {
+        super::mapping_tests::Region {
+            id: self.mapping_id,
+            address: self.data.as_ptr() as usize,
+            bytes: self.bytes,
+        }
+    }
 }
 impl<T: Copy> Deref for Slab<T> {
     type Target = [T];
@@ -129,7 +147,11 @@ impl<T: Copy> Drop for Slab<T> {
         if self.bytes != 0 {
             // T:Copy cannot have a destructor. This mapping uniquely belongs to
             // this slab; no borrowed slice can outlive its owner.
-            unsafe { libc::munmap(self.data.as_ptr().cast(), self.bytes) };
+            let result = unsafe { libc::munmap(self.data.as_ptr().cast(), self.bytes) };
+            #[cfg(test)]
+            super::mapping_tests::released(self.region(), result);
+            #[cfg(not(test))]
+            let _ = result;
         }
     }
 }

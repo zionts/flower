@@ -1072,31 +1072,89 @@ fn seal_really_unmaps_all_raw_support_parser_key_witness_slabs() {
         .unwrap();
     builder.insert_tagged_row(table, id, control()).unwrap();
     let regions = builder.capture.mapped_regions();
-    for (address, bytes) in regions {
-        if bytes != 0 {
+    for region in regions {
+        if region.bytes != 0 {
             let mut residency = 0u8;
             assert_eq!(
-                unsafe { libc::mincore(address as *mut libc::c_void, 1, &mut residency) },
+                unsafe { libc::mincore(region.address as *mut libc::c_void, 1, &mut residency) },
                 0
             );
             assert_ne!(residency & 1, 0, "capture mapping was pre-touched");
+            assert_ne!(region.id, 0);
         }
     }
+    let observation = mapping_tests::Observation::begin();
     let frame = builder.seal(control()).unwrap();
-    for (address, bytes) in regions {
-        if bytes != 0 {
-            let mut residency = 0u8;
-            assert_eq!(
-                unsafe { libc::mincore(address as *mut libc::c_void, 1, &mut residency) },
-                -1
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ENOMEM)
-            );
-        }
+    let (releases, count) = observation.releases();
+    assert_eq!(
+        count,
+        regions.iter().filter(|region| region.bytes != 0).count()
+    );
+    for region in regions.into_iter().filter(|region| region.bytes != 0) {
+        let matching = releases[..count]
+            .iter()
+            .filter(|release| release.region.id == region.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "each original mapping owner releases once"
+        );
+        assert_eq!(matching[0].region, region);
+        assert_eq!(
+            matching[0].result, 0,
+            "the actual original munmap must succeed"
+        );
+        assert_eq!(matching[0].errno, 0);
     }
+    // mincore after seal cannot identify the former owner: another parallel
+    // test can already have reused that address. Owner-specific syscall
+    // evidence above proves release independently of that race.
     assert_eq!(frame.table(0).unwrap().rows, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_mapping_release_evidence_survives_immediate_virtual_address_reuse() {
+    let owned = slab::Slab::<u8>::new(4096, control()).unwrap();
+    let original = owned.region();
+    let observation = mapping_tests::Observation::begin();
+    drop(owned);
+    let (releases, count) = observation.releases();
+    assert_eq!(count, 1);
+    assert_eq!(releases[0].region, original);
+    assert_eq!(releases[0].result, 0);
+    // Never MAP_FIXED: it could destroy a mapping created by another test.
+    // NOREPLACE either creates our new distinct owner at the former address,
+    // or proves a concurrent owner already occupies that released address.
+    let replacement = unsafe {
+        libc::mmap(
+            original.address as *mut _,
+            original.bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    if replacement == libc::MAP_FAILED {
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EEXIST)
+        );
+    } else {
+        assert_eq!(replacement as usize, original.address);
+        let mut residency = 0;
+        assert_eq!(
+            unsafe { libc::mincore(replacement, 1, &mut residency) },
+            0,
+            "mincore sees the NEW owner despite the proved original release"
+        );
+        assert_eq!(unsafe { libc::munmap(replacement, original.bytes) }, 0);
+    }
+    let (after, after_count) = observation.releases();
+    assert_eq!(after_count, 1);
+    assert_eq!(after[0].region.id, original.id);
 }
 
 #[test]
