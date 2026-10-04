@@ -5,6 +5,7 @@
 //! The associated native lease is stored inline in the same exact layout and
 //! released only AFTER munmap on the last pool-or-cell owner. Ordinary source
 //! Snapshots, Records, Backings and transactions never enter this module.
+use super::directory::{Directory, DirectoryError, DirectoryLayout};
 use super::{MAX_REGISTRY_BYTES, RegistryError, RegistryIdentity, RegistryNamespace};
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
@@ -50,6 +51,15 @@ impl RegistryPoolLimits {
     }
 }
 
+/// Explicit CURRENT-only directory dimensions inside THIS SAME mapping. No
+/// implicit per-name cap or default key room. Native startup must supply the
+/// exact remaining budget after cancellation/control/owner admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegistryDirectoryLimits {
+    pub(crate) heads: usize,
+    pub(crate) key_bytes: usize,
+}
+
 /// Exact object layout and actual system-page-rounded extent. A lower byte
 /// limit can reduce usable cells; requested cells are never reported as usable
 /// unless their control+inline lease+fixed slots fit that mapping.
@@ -63,22 +73,47 @@ pub(crate) struct RegistryPoolLayout {
     pub(crate) slot_header_bytes: usize,
     pub(crate) payload_bytes: usize,
     pub(crate) page_bytes: usize,
+    pub(crate) directory_bytes: usize,
+    pub(crate) heads: usize,
+    pub(crate) key_bytes: usize,
+    directory_offset: Option<usize>,
+    directory_layout: Option<DirectoryLayout>,
     lease_offset: usize,
     slots_offset: usize,
 }
 impl RegistryPoolLayout {
     fn for_lease<L>(limits: RegistryPoolLimits) -> Result<Self, RegistryError> {
+        Self::combined::<L>(limits, None)
+    }
+    fn combined<L>(
+        limits: RegistryPoolLimits,
+        directory: Option<RegistryDirectoryLimits>,
+    ) -> Result<Self, RegistryError> {
         if !limits.valid() {
             return Err(RegistryError::Invalid);
         }
+        let directory_layout = directory
+            .map(|directory| {
+                DirectoryLayout::new(directory.heads, directory.key_bytes).map_err(directory_error)
+            })
+            .transpose()?;
         let page = page_size()?;
         for cells in (1..=limits.cells).rev() {
             let (control, lease_offset) = Layout::new::<PoolControl>()
                 .extend(Layout::new::<L>())
                 .map_err(|_| RegistryError::Capacity)?;
-            let (layout, slots_offset) = control
+            let (mut layout, slots_offset) = control
                 .extend(Layout::array::<RegistrySlot>(cells).map_err(|_| RegistryError::Capacity)?)
                 .map_err(|_| RegistryError::Capacity)?;
+            let directory_offset = if let Some(directory) = directory_layout {
+                let (combined, offset) = layout
+                    .extend(directory.object_layout())
+                    .map_err(|_| RegistryError::Capacity)?;
+                layout = combined;
+                Some(offset)
+            } else {
+                None
+            };
             if layout.align() > page {
                 return Err(RegistryError::Unsupported);
             }
@@ -97,6 +132,11 @@ impl RegistryPoolLayout {
                     slot_header_bytes: std::mem::size_of::<RegistrySlot>() - MAX_REGISTRY_BYTES,
                     payload_bytes: MAX_REGISTRY_BYTES,
                     page_bytes: page,
+                    directory_bytes: directory_layout.map_or(0, |directory| directory.bytes),
+                    heads: directory_layout.map_or(0, |directory| directory.heads),
+                    key_bytes: directory_layout.map_or(0, |directory| directory.key_bytes),
+                    directory_offset,
+                    directory_layout,
                     lease_offset,
                     slots_offset,
                 });
@@ -105,10 +145,18 @@ impl RegistryPoolLayout {
         Err(RegistryError::Capacity)
     }
 }
+fn directory_error(error: DirectoryError) -> RegistryError {
+    match error {
+        DirectoryError::Busy => RegistryError::Busy,
+        DirectoryError::Capacity => RegistryError::Capacity,
+        _ => RegistryError::Invalid,
+    }
+}
 
 #[repr(C)]
 struct PoolControl {
     owners: AtomicUsize,
+    handles: AtomicUsize,
     next_slot: AtomicUsize,
     next_namespace: AtomicU64,
     stage_gate: AtomicBool,
@@ -117,6 +165,8 @@ struct PoolControl {
     slots_offset: usize,
     lease_offset: usize,
     mapped_bytes: usize,
+    directory_offset: Option<usize>,
+    directory_layout: Option<DirectoryLayout>,
     release: unsafe fn(NonNull<PoolControl>),
 }
 
@@ -200,25 +250,69 @@ impl RegistryPool {
         RegistryPoolLayout::for_lease::<A::Lease>(limits)
     }
 
+    pub(crate) fn reservation_layout_with_directory<A: RegistryAdmission>(
+        limits: RegistryPoolLimits,
+        directory: RegistryDirectoryLimits,
+    ) -> Result<RegistryPoolLayout, RegistryError> {
+        RegistryPoolLayout::combined::<A::Lease>(limits, Some(directory))
+    }
+
+    pub(crate) fn admit_with_directory<A: RegistryAdmission>(
+        admission: &A,
+        limits: RegistryPoolLimits,
+        directory: RegistryDirectoryLimits,
+        check: impl FnMut() -> Result<(), RegistryError>,
+    ) -> Result<Self, RegistryError> {
+        let layout = Self::reservation_layout_with_directory::<A>(limits, directory)?;
+        Self::admit_layout(admission, layout, check)
+    }
+
     /// No Store or source reference is accepted. Construction/pretouch must
     /// finish at node startup BEFORE any source publication can use this pool.
     /// A cancellation/check error unmaps BEFORE releasing the provided lease.
     pub(crate) fn admit<A: RegistryAdmission>(
         admission: &A,
         limits: RegistryPoolLimits,
+        check: impl FnMut() -> Result<(), RegistryError>,
+    ) -> Result<Self, RegistryError> {
+        let layout = Self::reservation_layout::<A>(limits)?;
+        Self::admit_layout(admission, layout, check)
+    }
+
+    fn admit_layout<A: RegistryAdmission>(
+        admission: &A,
+        layout: RegistryPoolLayout,
         mut check: impl FnMut() -> Result<(), RegistryError>,
     ) -> Result<Self, RegistryError> {
         check()?;
-        let layout = Self::reservation_layout::<A>(limits)?;
         let lease = admission.try_reserve(layout.mapped_bytes, layout.cells)?;
         // Declaration order matters on early return/unwind: mapping before
         // lease, including a partially pre-touched cancellation failure.
         let mapping = Mapping::new(layout.mapped_bytes)?;
         mapping.touch(&mut check)?;
         let control = mapping.pointer.cast::<PoolControl>();
+        if let (Some(offset), Some(directory_layout)) =
+            (layout.directory_offset, layout.directory_layout)
+        {
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    mapping.pointer.as_ptr().add(offset),
+                    directory_layout.bytes,
+                )
+            };
+            let directory =
+                Directory::initialize(bytes, directory_layout).map_err(directory_error)?;
+            // Initialized and empty. Mapping owns subsequent persistence of
+            // this region; no ephemeral view may run the exclusive clear Drop.
+            std::mem::forget(directory);
+        }
+        // Covers the complete pretouched directory/control initialization,
+        // not merely the earlier raw mapping touch. The lease is still local.
+        check()?;
         unsafe {
             control.as_ptr().write(PoolControl {
                 owners: AtomicUsize::new(1),
+                handles: AtomicUsize::new(1),
                 next_slot: AtomicUsize::new(0),
                 next_namespace: AtomicU64::new(1),
                 stage_gate: AtomicBool::new(false),
@@ -227,6 +321,8 @@ impl RegistryPool {
                 slots_offset: layout.slots_offset,
                 lease_offset: layout.lease_offset,
                 mapped_bytes: layout.mapped_bytes,
+                directory_offset: layout.directory_offset,
+                directory_layout: layout.directory_layout,
                 release: release_mapping::<A::Lease>,
             });
             mapping
@@ -254,10 +350,40 @@ impl RegistryPool {
 
     pub(crate) fn try_clone(&self) -> Result<Self, RegistryError> {
         retain_pool(self.control)?;
+        if self
+            .header()
+            .handles
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count > 0 && count < MAX_REFERENCES).then(|| count + 1)
+            })
+            .is_err()
+        {
+            release_pool(self.control);
+            return Err(RegistryError::Capacity);
+        }
         Ok(Self {
             control: self.control,
         })
     }
+    pub(in crate::consensus) fn owns_cell(&self, cell: &RegistryCell) -> bool {
+        // Allocation identity, not namespace authority. The source must also
+        // validate Store/install/UID/epoch/code against its actual publication.
+        self.control == cell.control
+    }
+
+    pub(in crate::consensus) fn directory(&self) -> Result<Directory<'_>, RegistryError> {
+        let header = self.header();
+        let (Some(offset), Some(layout)) = (header.directory_offset, header.directory_layout)
+        else {
+            return Err(RegistryError::Unsupported);
+        };
+        let pointer =
+            unsafe { NonNull::new_unchecked(self.control.as_ptr().cast::<u8>().add(offset)) };
+        // Exact placement/extent initialized once by admit_layout, and this
+        // borrowed Pool handle prevents teardown while the view is alive.
+        Ok(unsafe { Directory::borrow_from_pool(self, pointer, layout) })
+    }
+
     pub(crate) fn mapped_bytes(&self) -> usize {
         self.header().mapped_bytes
     }
@@ -339,6 +465,25 @@ impl RegistryPool {
 }
 impl Drop for RegistryPool {
     fn drop(&mut self) {
+        let handles = self.header().handles.fetch_sub(1, Ordering::AcqRel);
+        if handles == 0 {
+            std::process::abort();
+        }
+        if handles == 1 {
+            // The last EXTERNAL pool handle ends every borrowed directory
+            // view. Current in-map cell owners are cleared while THIS one
+            // independent pool owner is still live: no self-map refcount cycle
+            // or unmapping in the middle of directory/cell destruction.
+            if let (Some(offset), Some(layout)) = (
+                self.header().directory_offset,
+                self.header().directory_layout,
+            ) {
+                let pointer = unsafe {
+                    NonNull::new_unchecked(self.control.as_ptr().cast::<u8>().add(offset))
+                };
+                unsafe { Directory::clear_from_pool_exclusive(self, pointer, layout) };
+            }
+        }
         release_pool(self.control);
     }
 }

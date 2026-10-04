@@ -508,3 +508,363 @@ fn sql_registry_pool_staging_unwind_returns_slot_and_preserves_current_witness()
     assert_eq!(current.identity(), identity(1));
     assert!(pool.stage().is_ok());
 }
+
+#[test]
+fn sql_registry_pool_external_handle_increment_refusal_rolls_back_actual_owner() {
+    let (pool, owner) = pool(2);
+    let handles = &pool.header().handles;
+    let owners = &pool.header().owners;
+    let before = owners.load(Ordering::Acquire);
+    handles.store(MAX_REFERENCES, Ordering::Release);
+    assert!(matches!(pool.try_clone(), Err(RegistryError::Capacity)));
+    assert_eq!(owners.load(Ordering::Acquire), before);
+    assert_eq!(handles.load(Ordering::Acquire), MAX_REFERENCES);
+    handles.store(1, Ordering::Release);
+    let sibling = pool.try_clone().unwrap();
+    assert_eq!(handles.load(Ordering::Acquire), 2);
+    assert_eq!(owners.load(Ordering::Acquire), before + 1);
+    drop(sibling);
+    assert_eq!(handles.load(Ordering::Acquire), 1);
+    assert_eq!(owners.load(Ordering::Acquire), before);
+    drop(pool);
+    assert_eq!(owner.drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn sql_registry_pool_supported_zero_sized_inline_lease_has_exact_layout_and_last_drop() {
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct ZstLease;
+    impl Drop for ZstLease {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    struct FixtureAdmission;
+    impl RegistryAdmission for FixtureAdmission {
+        type Lease = ZstLease;
+        fn try_reserve(&self, bytes: usize, cells: usize) -> Result<ZstLease, RegistryError> {
+            assert!(bytes <= HARD_REGISTRY_POOL_BYTES && cells <= HARD_REGISTRY_POOL_CELLS);
+            Ok(ZstLease)
+        }
+    }
+    let before = DROPS.load(Ordering::Acquire);
+    let layout = RegistryPool::reservation_layout::<FixtureAdmission>(limits(1)).unwrap();
+    assert_eq!(layout.lease_bytes, 0);
+    let pool = RegistryPool::admit(&FixtureAdmission, limits(1), || Ok(())).unwrap();
+    let witness = cell(&pool, 1);
+    drop(pool);
+    assert_eq!(DROPS.load(Ordering::Acquire), before);
+    assert_eq!(witness.identity(), identity(1));
+    drop(witness);
+    assert_eq!(DROPS.load(Ordering::Acquire), before + 1);
+}
+
+#[test]
+fn sql_registry_pool_pretouch_panic_unmaps_and_releases_lease_without_any_owner() {
+    let owner = Owner::new(HARD_REGISTRY_POOL_BYTES, HARD_REGISTRY_POOL_CELLS);
+    let mut checks = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = RegistryPool::admit(&owner, limits(8), || {
+            checks += 1;
+            if checks == 4 {
+                panic!("expected native pretouch unwind");
+            }
+            Ok(())
+        });
+    }));
+    assert!(result.is_err());
+    assert_eq!(owner.drops.load(Ordering::Acquire), 1);
+    assert_eq!(owner.reserved_bytes.load(Ordering::Acquire), 0);
+    assert!(!owner.leased.load(Ordering::Acquire));
+    let replacement = RegistryPool::admit(&owner, limits(8), || Ok(())).unwrap();
+    assert_eq!(replacement.live_cells(), 0);
+}
+
+#[test]
+fn sql_registry_pool_combined_directory_layout_is_admitted_as_one_actual_mapping() {
+    let dims = RegistryDirectoryLimits {
+        heads: 256,
+        key_bytes: 10_000,
+    };
+    let layout = RegistryPool::reservation_layout_with_directory::<Arc<Owner>>(
+        RegistryPoolLimits::HARD,
+        dims,
+    )
+    .unwrap();
+    let dir = DirectoryLayout::new(dims.heads, dims.key_bytes).unwrap();
+    assert_eq!(layout.directory_bytes, dir.bytes);
+    assert_eq!(layout.heads, 256);
+    assert_eq!(layout.key_bytes, 10_000);
+    assert_eq!(layout.cells, 256);
+    let offset = layout.directory_offset.unwrap();
+    assert_eq!(offset % dir.alignment, 0);
+    assert!(layout.mapped_bytes >= offset + dir.bytes);
+    assert!(layout.mapped_bytes <= HARD_REGISTRY_POOL_BYTES);
+    assert_eq!(layout.mapped_bytes % layout.page_bytes, 0);
+    let lower = RegistryPool::reservation_layout_with_directory::<Arc<Owner>>(
+        RegistryPoolLimits {
+            bytes: layout.page_bytes * 16,
+            cells: 256,
+        },
+        RegistryDirectoryLimits {
+            heads: 1,
+            key_bytes: 10_000,
+        },
+    )
+    .unwrap();
+    assert_eq!(lower.cells, 1);
+    assert_eq!(lower.key_bytes, 10_000);
+    assert!(lower.mapped_bytes <= layout.page_bytes * 16);
+    println!(
+        "combined registry map={} control={} lease={} slots={} slotbytes={} directory={} heads={} keybytes={}",
+        layout.mapped_bytes,
+        layout.control_bytes,
+        layout.lease_bytes,
+        layout.cells,
+        layout.slot_bytes,
+        layout.directory_bytes,
+        layout.heads,
+        layout.key_bytes
+    );
+}
+
+#[test]
+fn sql_registry_pool_foreign_cell_with_equal_uid_and_code_is_rejected_by_actual_allocation() {
+    use crate::consensus::sql_registry::directory::{
+        DirectoryError, NativeCode, NativeKey, NativeOrigin,
+    };
+    let owner_a = Owner::new(HARD_REGISTRY_POOL_BYTES, HARD_REGISTRY_POOL_CELLS);
+    let owner_b = Owner::new(HARD_REGISTRY_POOL_BYTES, HARD_REGISTRY_POOL_CELLS);
+    let dims = RegistryDirectoryLimits {
+        heads: 2,
+        key_bytes: 32,
+    };
+    let a = RegistryPool::admit_with_directory(&owner_a, limits(2), dims, || Ok(())).unwrap();
+    let b = RegistryPool::admit_with_directory(&owner_b, limits(2), dims, || Ok(())).unwrap();
+    owner_a.remember(&a);
+    owner_b.remember(&b);
+    let origin = NativeOrigin {
+        store: 1,
+        installation: 0,
+        epoch: 0,
+        key: NativeKey::Root,
+    };
+    let code = NativeCode {
+        registry: 1,
+        bundle: 2,
+        schema: 3,
+    };
+    let directory = a.directory().unwrap();
+    let token = directory
+        .register_native(origin, code, || Ok(a.issue_namespace(None).unwrap().uid))
+        .unwrap();
+    let namespace_b = b.issue_namespace(None).unwrap();
+    assert_eq!(
+        namespace_b.uid,
+        token.uid(),
+        "different pools can issue equal numeric UIDs"
+    );
+    let foreign = b
+        .stage()
+        .unwrap()
+        .seal(
+            RegistryIdentity {
+                namespace: namespace_b,
+                ..identity(1)
+            },
+            b"{}",
+        )
+        .unwrap();
+    assert!(!a.owns_cell(&foreign));
+    let (result, operations, bytes) =
+        allocation_probe::measure(|| directory.attach_current_native(origin, token, code, foreign));
+    assert_eq!(result, Err(DirectoryError::CurrentUnavailable));
+    assert_eq!((operations, bytes), (0, 0));
+    assert_eq!(a.live_cells(), 0);
+    assert_eq!(b.live_cells(), 0);
+    assert!(matches!(
+        directory.select_current_native(origin, token, code),
+        Err(DirectoryError::CurrentUnavailable)
+    ));
+    let own = a
+        .stage()
+        .unwrap()
+        .seal(
+            RegistryIdentity {
+                namespace: RegistryNamespace {
+                    uid: token.uid(),
+                    epoch: 0,
+                },
+                ..identity(1)
+            },
+            b"{}",
+        )
+        .unwrap();
+    directory
+        .attach_current_native(origin, token, code, own)
+        .unwrap();
+    assert_eq!(
+        directory
+            .select_current_native(origin, token, code)
+            .unwrap()
+            .raw_json(),
+        b"{}"
+    );
+    drop(directory);
+    drop(a);
+    drop(b);
+    assert_eq!(owner_a.drops.load(Ordering::Acquire), 1);
+    assert_eq!(owner_b.drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn sql_registry_pool_concurrent_last_external_handles_clear_current_once_and_preserve_witness() {
+    use crate::consensus::sql_registry::directory::{NativeCode, NativeKey, NativeOrigin};
+    let owner = Owner::new(HARD_REGISTRY_POOL_BYTES, HARD_REGISTRY_POOL_CELLS);
+    let pool = RegistryPool::admit_with_directory(
+        &owner,
+        limits(2),
+        RegistryDirectoryLimits {
+            heads: 2,
+            key_bytes: 32,
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    owner.remember(&pool);
+    let origin = NativeOrigin {
+        store: 1,
+        installation: 0,
+        epoch: 0,
+        key: NativeKey::Root,
+    };
+    let code = NativeCode {
+        registry: 1,
+        bundle: 2,
+        schema: 3,
+    };
+    let directory = pool.directory().unwrap();
+    let token = directory
+        .register_native(origin, code, || Ok(pool.issue_namespace(None).unwrap().uid))
+        .unwrap();
+    let current = pool
+        .stage()
+        .unwrap()
+        .seal(
+            RegistryIdentity {
+                namespace: RegistryNamespace {
+                    uid: token.uid(),
+                    epoch: 0,
+                },
+                ..identity(1)
+            },
+            b"{}",
+        )
+        .unwrap();
+    directory
+        .attach_current_native(origin, token, code, current)
+        .unwrap();
+    let witness = directory
+        .select_current_native(origin, token, code)
+        .unwrap();
+    drop(directory);
+    let handles: Vec<_> = (0..4).map(|_| pool.try_clone().unwrap()).collect();
+    let barrier = Arc::new(std::sync::Barrier::new(5));
+    let readers: Vec<_> = handles
+        .into_iter()
+        .map(|handle| {
+            let barrier = barrier.clone();
+            let local = witness.try_clone().unwrap();
+            std::thread::spawn(move || {
+                barrier.wait();
+                drop(handle);
+                for _ in 0..100 {
+                    let copy = local.try_clone().unwrap();
+                    assert_eq!(copy.raw_json(), b"{}");
+                    drop(copy);
+                }
+                drop(local);
+            })
+        })
+        .collect();
+    barrier.wait();
+    drop(pool);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(
+        owner.drops.load(Ordering::Acquire),
+        0,
+        "surviving strong witness still owns actual map"
+    );
+    assert_eq!(witness.raw_json(), b"{}");
+    drop(witness);
+    assert_eq!(owner.drops.load(Ordering::Acquire), 1);
+    #[cfg(target_os = "linux")]
+    assert!(owner.unmapped_before_release.load(Ordering::Acquire));
+}
+
+#[test]
+fn sql_registry_bootstrap_once_only_in_isolated_startup_process() {
+    use crate::consensus::sql_registry::{
+        bootstrap_required_layout, install_source_registry, source_registry,
+    };
+    const CHILD: &str = "FLOWER_TEST_REGISTRY_BOOTSTRAP_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("sql_registry_bootstrap_once_only_in_isolated_startup_process")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated bootstrap test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // A separate process supplies a fresh startup; no global reset exists.
+    assert!(matches!(source_registry(), Err(RegistryError::Unsupported)));
+    let owner = Owner::new(HARD_REGISTRY_POOL_BYTES, HARD_REGISTRY_POOL_CELLS);
+    let dims = RegistryDirectoryLimits {
+        heads: 2,
+        key_bytes: 32,
+    };
+    let rejected = RegistryPool::admit_with_directory(&owner, limits(2), dims, || Ok(())).unwrap();
+    let actual = bootstrap_required_layout().unwrap();
+    let mut wrong = actual;
+    wrong.object_bytes += 1;
+    let (error, rejected) = unsafe { install_source_registry(rejected, wrong) }
+        .err()
+        .unwrap();
+    assert_eq!(error, RegistryError::Invalid);
+    drop(rejected);
+    assert!(matches!(source_registry(), Err(RegistryError::Unsupported)));
+    assert_eq!(owner.drops.load(Ordering::Acquire), 1);
+    let accepted = RegistryPool::admit_with_directory(&owner, limits(2), dims, || Ok(())).unwrap();
+    // This is a fixture's explicit attestation, NOT real native node backing.
+    let (_, operations, bytes) = allocation_probe::measure(|| unsafe {
+        assert!(install_source_registry(accepted, actual).is_ok());
+    });
+    assert_eq!((operations, bytes), (0, 0));
+    let global = source_registry().unwrap();
+    assert_eq!(global.capacity(), 2);
+    assert!(global.directory().is_ok());
+    let second_owner = Owner::new(HARD_REGISTRY_POOL_BYTES, HARD_REGISTRY_POOL_CELLS);
+    let second =
+        RegistryPool::admit_with_directory(&second_owner, limits(2), dims, || Ok(())).unwrap();
+    let (error, second) = unsafe { install_source_registry(second, actual) }
+        .err()
+        .unwrap();
+    assert_eq!(error, RegistryError::Invalid);
+    drop(second);
+    assert_eq!(second_owner.drops.load(Ordering::Acquire), 1);
+    assert_eq!(
+        owner.drops.load(Ordering::Acquire),
+        1,
+        "accepted process-global owner has no early credit"
+    );
+    assert_eq!(source_registry().unwrap().control, global.control);
+}

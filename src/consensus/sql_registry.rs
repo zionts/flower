@@ -5,10 +5,19 @@
 //! caller owns a real process-global native budget. Native construction must
 //! supply one shared node owner and approved finite limits before Store opens.
 //! No default, per-Store pool or implicit spare capacity is provided here.
+#[path = "sql_registry/bootstrap.rs"]
+mod bootstrap;
+#[path = "sql_registry/directory.rs"]
+pub(in crate::consensus) mod directory;
+pub(in crate::consensus) use bootstrap::source_registry;
+pub(crate) use bootstrap::{StaticRegion, bootstrap_required_layout, install_source_registry};
 #[path = "sql_registry/pool.rs"]
 mod pool;
 
-pub(crate) use pool::{RegistryAdmission, RegistryPool, RegistryPoolLayout, RegistryPoolLimits};
+pub(crate) use pool::{
+    RegistryAdmission, RegistryDirectoryLimits, RegistryPool, RegistryPoolLayout,
+    RegistryPoolLimits,
+};
 pub(in crate::consensus) use pool::{RegistryCell, RegistryStaging};
 
 pub(crate) const MAX_REGISTRY_BYTES: usize = 32 * 1024;
