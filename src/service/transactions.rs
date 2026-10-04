@@ -599,6 +599,7 @@ async fn persist_in_term(
     term: Option<u64>,
 ) -> Result<(), ApiError> {
     let mut command = Commit {
+        sql_commit_before: None,
         internal: true,
         request_id: String::new(),
         fingerprint: String::new(),
@@ -723,6 +724,7 @@ fn ensure_commit_capacity(state: &Snapshot, command: &mut Commit) -> Result<(), 
 
 fn metadata_command(reference: &Reference, record: &Coordinator) -> Commit {
     Commit {
+        sql_commit_before: None,
         internal: true,
         request_id: String::new(),
         fingerprint: String::new(),
@@ -982,6 +984,7 @@ async fn prepare_with_budget(
     check_command_budget(
         app,
         &Commit {
+            sql_commit_before: None,
             internal: true,
             request_id: String::new(),
             fingerprint: String::new(),
@@ -1205,6 +1208,7 @@ async fn finish_coordinator(
         current.complete = true;
         let result = final_value(&current)?;
         let mut command = Commit {
+            sql_commit_before: None,
             internal: false,
             request_id: reference.request_id.clone(),
             fingerprint: reference.fingerprint.clone(),
@@ -1421,6 +1425,7 @@ pub(super) async fn execute(app: Arc<App>, input: Value) -> Result<Value, ApiErr
             candidate.complete = true;
             let result = final_value(&candidate)?;
             let command = Commit {
+                sql_commit_before: None,
                 internal: false,
                 request_id: reference.request_id.clone(),
                 fingerprint: reference.fingerprint.clone(),

@@ -172,3 +172,60 @@ The Node `testDatabase` **does not execute SQL**. It refuses native SQL with `SQ
 Native evaluator tests and the server-backed `bench/sql-conformance.mjs` exercise the foundation rather than a mock parser. The server harness must currently confirm hard-gate refusal, not claim positive end-to-end terminal/provider conformance. Run native foundation tests with `cargo test -p flower --lib --features sql`, not only `npm test`; allocator/operator unit success is not launch success. API coverage, docs rendering/type examples and source-only packaging checks likewise do not prove Nix evaluation/build or native serving.
 
 Operational telemetry must never log SQL literals, parameters, results or raw provenance. Native errors are generic codes; hidden-row work counts belong only in privileged coarse telemetry.
+
+## Native mutation commit-time fence (separate from SQL serving)
+
+`MutationContext.requireCommitBefore(absoluteMs)` (Rust `Ctx::require_commit_before`;
+host opcode 17) narrows an ordinary trusted mutation's authorization deadline.
+It is present in default builds too: turning off query execution must not disable
+checks on a previously issued artifact. This does **not** enable the held native
+SQL query/capture/signing route or prove its resource/migration gates.
+
+The application must verify actual signed proof, current authority and source
+policy before declaring the earliest safe-integer absolute expiry. It must bind
+**both** worker-result/early-held persistence and the later tool completion/log
+append. For a live worker result, use the minimum of proof expiry, the current
+worker-holding lease, actual grant/oversight/policy/JWT changes and applicable
+original protocol deadlines. A guessed job deadline cannot replace an earlier
+permission expiry. A later legitimate completion of an already-completed job
+must not be refused merely because its historical, no-longer-live lease expired.
+Required guard absence is a static refusal before effects, never a legacy shim.
+Read-only policy wrappers may forward certified future changes to their trusted
+mutation owner; they must not publish the mutation capability to SQL callbacks.
+
+The native deadline is sticky/min-only and independent of read certification.
+Known native access and authorization expiries narrow it; unknown required
+witnesses refuse. A guarded authorization refresh cannot discard a tighter
+same-principal validity. An expired/refused prepared artifact is not retried at
+an old speculative wave clock. Serial and compact batches keep the guard; an
+expired final batch discards its whole private overlay and invalidates successors
+before rows, clocks, results, request receipts or sensitive Raft payloads persist.
+A fresh application transaction emits exactly one static refusal, without the
+rejected result, proof or error body.
+
+**Exact temporal contract:** native freshness is checked after the writer's
+commit barrier and again inside the exclusively ordered Raft core, after all
+queuing, metadata and exact envelope-size validation, immediately before log-ID
+assignment/append. A private no-root scalar basis was paired with the actual
+initial snapshot selection and preserved through private overlays; it checks
+native store/scope identity, installation/history, current expected revision,
+original leader and the complete applied prior ordered prefix. The shared
+service clock is sampled last, under the same publication guard. Replicas check
+the logged native leader/time/position witness, not replica-local wall clocks.
+
+A proposal authorized while valid may finish replication/fsync/application or
+return its acknowledgement **after** expiry. This is not a physical durability
+by-deadline promise. Later reads/consumption independently recheck current rights
+and deny revoked/expired permission. Commit timeout/lost acknowledgement means
+unknown outcome; replay preserves an earlier authorized receipt, not an invented
+abort or renewed artifact. Nothing silently moves the admission point back to
+earlier computation to evade a delayed pre-proposal expiry.
+
+The native regressions retain the six original ordinary-mutation controls and
+use the same real consensus/redb/QuickJS fixtures for guarded serial now/clock,
+timed authorization, speculative and two-request inline compact expiry cases.
+They cross a real 1.5-second expiry without editing its row, revision or stored
+clock, and inspect the actual Raft log. Additional ordered-core queue,
+post-valid-decision real storage delay, restart/replay and current native read
+checks exercise the stated boundary. Node TestDatabase tests only model trusted
+declarations; they are not native commit proof or a SQL-serving positive.

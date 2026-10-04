@@ -126,6 +126,7 @@ fn wire_budget_includes_maximum_append_envelope_and_snapshot_segments() {
     );
 
     let mut command = RaftCommand::Single(Commit {
+        sql_commit_before: None,
         internal: false,
         request_id: "one".into(),
         fingerprint: "hash".into(),
@@ -250,6 +251,7 @@ fn admission_counts_exact_wire_bytes_without_allocating_the_encoding() {
 #[test]
 fn command_admission_counts_single_fenced_and_compact_serialization_exactly() {
     let command = |index| Commit {
+        sql_commit_before: None,
         internal: index % 2 != 0,
         request_id: format!("request-{index}\n🌸"),
         fingerprint: "fingerprint\\\"".into(),

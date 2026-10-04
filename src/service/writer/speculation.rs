@@ -56,6 +56,18 @@ impl Candidate {
         state: &Snapshot,
         pending: &PendingInput,
     ) -> Result<bool, ApiError> {
+        // Expiry is an error, not a certificate conflict eligible for an old-
+        // wave-clock rerun. It holds even if optional read tracking was lost.
+        pending.check_fence(app, state)?;
+        if self
+            .prepared
+            .command
+            .as_ref()
+            .and_then(|command| command.sql_commit_before)
+            .is_some_and(|before| app.clock.sample(state).map_or(true, |now| now >= before))
+        {
+            return Err(sql_commit_expired());
+        }
         let Some(certificate) = &self.certificate else {
             return Ok(false);
         };
@@ -82,6 +94,12 @@ impl Candidate {
             .as_ref()
             .is_some_and(|access| access.holds(app, state))
         {
+            // A same-principal refresh can have a tighter temporal bound or an
+            // uncertified dependency. Guarded results require the WHOLE fresh
+            // Access via serial preparation, not principal equality alone.
+            if pending.fence().is_some() {
+                return Ok(false);
+            }
             let principal =
                 authorization::authorize_admitted(app, state, input, &self.admission).await?;
             if principal != self.principal {

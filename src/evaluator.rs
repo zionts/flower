@@ -70,6 +70,9 @@ pub struct Evaluation {
     pub query_certificate: Option<DependencyCertificate>,
     #[serde(skip)]
     pub mutation_certificate: Option<MutationCertificate>,
+    /// Trusted mutation-only attenuation; not a public argument or read certificate.
+    #[serde(skip)]
+    pub(crate) sql_commit_before: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1000,11 +1003,12 @@ const CELL_RUNNER: &str = r#"
     // be prepared in the trusted image and cannot retain mutations into any
     // subsequent cell.
     const derivedContext = Object.freeze({...readers});
-    const methodContext = Object.freeze({...readers, ...writers});
+    const methodContext = Object.freeze({...readers, ...writers, requireCommitBefore: (time) => host(17, time)});
+    const queryContext = Object.freeze({...readers, ...writers});
     const readlessContext = Object.freeze({principal:readers.principal,clock:readers.clock,history:readers.history,codeVersion:readers.codeVersion});
     // Published before the bundle initializes, so the SDK can bind contexts
     // into the initialization snapshot instead of in every callback.
-    Object.defineProperty(globalThis, '__flowerContexts', {value: Object.freeze([derivedContext, methodContext, readlessContext])});
+    Object.defineProperty(globalThis, '__flowerContexts', {value: Object.freeze([derivedContext, methodContext, readlessContext, queryContext])});
     const run = (kind, name, args) => {
         const definitions = typeof __flowerBundle !== 'undefined' && __flowerBundle.default.definitions;
         if (!definitions || !Object.hasOwn(definitions, name) || typeof definitions[name].compute !== 'function')
@@ -1018,8 +1022,8 @@ const CELL_RUNNER: &str = r#"
             throw Object.assign(new Error('Terminal SQL cannot enter an ordinary invocation'), {code:'SQL_TERMINAL_UNAVAILABLE'});
         if (kind === 6 || kind === 7) return definitions[name].compute(readlessContext, args);
         if (kind >= 3) return definitions[name].compute(derivedContext, args);
-        if (kind === 0) return definitions[name].compute(methodContext, args);
-        return definitions[name].compute(methodContext, args, elevate);
+        if (kind === 0) return definitions[name].compute(queryContext, args);
+        return definitions[name].compute(kind === 1 ? methodContext : queryContext, args, elevate);
     };
     const describe = (kind, e) => {
         const message = String(e && e.message || e);

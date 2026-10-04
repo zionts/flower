@@ -9,36 +9,46 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// Wall time supplies epoch meaning; elapsed time and the observed floor prevent
 /// local clock corrections from moving time backwards within this process.
-pub(super) struct Clock {
+#[derive(Clone, Debug)]
+pub(crate) struct Clock {
+    inner: std::sync::Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
     started: Instant,
     epoch_ms: u64,
     observed: AtomicU64,
 }
 
 impl Clock {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            started: Instant::now(),
-            epoch_ms: wall_ms(),
-            observed: AtomicU64::new(0),
+            inner: std::sync::Arc::new(Inner {
+                started: Instant::now(),
+                epoch_ms: wall_ms(),
+                observed: AtomicU64::new(0),
+            }),
         }
     }
 
-    pub(super) fn sample(&self, state: &Snapshot) -> anyhow::Result<u64> {
+    pub(crate) fn sample(&self, state: &Snapshot) -> anyhow::Result<u64> {
         self.sample_after(committed(state))
     }
 
     /// A sample no earlier than a snapshot's committed clock, taken later.
-    pub(super) fn sample_after(&self, committed: u64) -> anyhow::Result<u64> {
-        let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    pub(crate) fn sample_after(&self, committed: u64) -> anyhow::Result<u64> {
+        let elapsed_ms =
+            u64::try_from(self.inner.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let sampled = wall_ms()
-            .max(self.epoch_ms.saturating_add(elapsed_ms))
+            .max(self.inner.epoch_ms.saturating_add(elapsed_ms))
             .max(committed);
         anyhow::ensure!(
             sampled <= MAX_SAFE_INTEGER,
             "server clock exceeds the safe integer range"
         );
         Ok(self
+            .inner
             .observed
             .fetch_max(sampled, Ordering::Relaxed)
             .max(sampled))

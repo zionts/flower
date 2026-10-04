@@ -127,6 +127,27 @@ malformed arguments; unknown operations and resource failures trap instead.
 | 14 | definer | true or false | null | mutations |
 | 15 | sql | operation, catalog name, input, purpose | typed result | legacy one-shot query only; permanently HOLD, not the terminal route |
 | 16 | codeVersion | none | trusted code/schema SHA-256 or null | queries and mutations |
+| 17 | requireCommitBefore | absolute safe-integer milliseconds | null | ordinary mutations only; attenuation, never a read/definer grant |
+
+`requireCommitBefore` is an **ordinary mutation-only attenuation**, available
+independently of the optional SQL artifact feature. Its single argument must be
+an absolute, nonnegative safe-integer millisecond deadline. Repeated declarations
+only narrow it. The trusted deployed application must first verify the signed
+artifact, live lease and current policies; caller purpose/arguments cannot grant
+or renew a capability through this operation. Queries, transaction planners,
+SQL authority/provider/plan/finalizer callbacks and derived code cannot use it.
+A missing host primitive has no compatibility fallback.
+
+The native fence survives optional certificate loss, serial conversion and
+atomic compaction. Known temporal policy/authorization flips narrow it; unknown
+required authority refuses. Native candidate validation and the final ordered
+Raft-core decision sample the real shared service clock. Original native scope,
+installation/history/revision and leadership provenance plus the entire prior
+ordered prefix must hold at that decision, before any sensitive log entry exists.
+Replicas replay a scalar term/time/position witness deterministically, without
+consulting their own clocks. This authorizes **ordered proposal**, not completion
+of later quorum replication or fsync before expiry. A timeout remains an unknown
+outcome, not an abort; already-authorized in-flight bytes are not clawed back.
 
 The ordinary-profile labels "all"/"methods" do not grant source operations to
 terminal callback kinds 6/7. Their readless contracts are described below;

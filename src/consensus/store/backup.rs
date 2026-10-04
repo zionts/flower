@@ -498,6 +498,7 @@ mod tests {
             log_id: LogId::new(CommittedLeaderId::new(2, 1), index),
             payload: EntryPayload::Normal(
                 Commit {
+                    sql_commit_before: None,
                     internal: false,
                     request_id: format!("request-{index}"),
                     fingerprint: format!("fingerprint-{index}"),

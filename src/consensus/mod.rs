@@ -58,6 +58,7 @@ pub use receipts::Receipts;
 pub(crate) use records::HISTORY_MARKER;
 pub use records::Records;
 pub(crate) use records::{next_version, versions_after, versions_high_water};
+pub(crate) use store::NativeWriteBasis;
 pub use store::{SharedDatabase, SnapshotData, Storage};
 
 /// Application state at one committed, atomically published revision.
@@ -102,6 +103,9 @@ pub struct Commit {
         deserialize_with = "json_payload::value"
     )]
     pub result: Value,
+    /// Native mutation attenuation, never accepted from public method input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sql_commit_before: Option<u64>,
 }
 
 impl Commit {
@@ -131,6 +135,8 @@ pub struct BatchItem {
         deserialize_with = "json_payload::value"
     )]
     pub result: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sql_commit_before: Option<u64>,
 }
 
 /// One atomic state transition with an ordered revision and retry receipt for
@@ -173,6 +179,7 @@ impl CompactBatch {
                 batch.puts.insert(key, value);
             }
             batch.items.push(BatchItem {
+                sql_commit_before: commit.sql_commit_before,
                 internal: commit.internal,
                 request_id: commit.request_id,
                 fingerprint: commit.fingerprint,
@@ -187,6 +194,12 @@ impl CompactBatch {
     /// Validate decoded commands too: a Raft proposal is not permission to
     /// bypass atomicity through malformed metadata or revision overflow.
     fn validate(&self) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            self.items.iter().all(|item| item
+                .sql_commit_before
+                .is_none_or(|time| time <= crate::sql_commit::MAX_SAFE_MS)),
+            "SQL commit deadline is invalid"
+        );
         if self.items.is_empty() {
             bail!("conflict: an atomic batch must not be empty");
         }
@@ -213,6 +226,10 @@ impl CompactBatch {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum RaftCommand {
+    Sql {
+        sql_admission: crate::sql_commit::Admission,
+        command: Box<RaftCommand>,
+    },
     Scoped {
         partition: String,
         epoch: u64,
@@ -266,6 +283,29 @@ impl RaftCommand {
         // untagged variant. Non-object encodings retain the old derived-struct
         // fallback (including positional sequences), rather than gaining a new
         // acceptance rule from this optimization.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Sql<'a> {
+            sql_admission: crate::sql_commit::Admission,
+            #[serde(borrow)]
+            command: &'a serde_json::value::RawValue,
+        }
+        if fields.has(Fields::SQL) && raw.get().trim_start().starts_with('{') {
+            // Fail closed; malformed new admission cannot fall through into a
+            // legacy Single/Scoped command that ignores unknown outer fields.
+            let Sql {
+                sql_admission,
+                command,
+            } = serde_json::from_str(raw.get())?;
+            let command = Self::decode_raw(command, Fields::inspect(command))?;
+            if !matches!(command, Self::Single(_) | Self::Batch { .. }) {
+                return Err(serde::de::Error::custom("invalid SQL admission command"));
+            }
+            return Ok(Self::Sql {
+                sql_admission,
+                command: Box::new(command),
+            });
+        }
         #[derive(Deserialize)]
         struct Scoped<'a> {
             partition: String,
@@ -411,12 +451,25 @@ pub enum ApplyResult {
     Partition(PartitionInfo),
 }
 
-openraft::declare_raft_types!(
-    pub TypeConfig:
-        D = RaftCommand,
-        R = ApplyResult,
-        SnapshotData = SnapshotData,
-);
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TypeConfig;
+impl openraft::RaftTypeConfig for TypeConfig {
+    type D = RaftCommand;
+    type R = ApplyResult;
+    type NodeId = u64;
+    type Node = BasicNode;
+    type Entry = openraft::Entry<Self>;
+    type SnapshotData = SnapshotData;
+    type Responder = openraft::impls::OneshotResponder<Self>;
+    type AsyncRuntime = openraft::TokioRuntime;
+    fn admit_client_write(
+        data: &mut RaftCommand,
+        leader: CommittedLeaderId<u64>,
+        previous: Option<openraft::LogId<u64>>,
+    ) -> Result<(), String> {
+        crate::sql_commit::admit(data, leader, previous)
+    }
+}
 
 type FlowerRaft = openraft::Raft<TypeConfig>;
 
@@ -700,6 +753,26 @@ impl Consensus {
         self.selected_snapshot(None, true).await
     }
 
+    /// Actual selection paired with a private no-root native write basis.
+    pub(crate) async fn read_for_writer_with_basis(
+        &self,
+        ids: Option<&[String]>,
+    ) -> anyhow::Result<(Snapshot, Arc<NativeWriteBasis>)> {
+        let term = self.metrics().current_term;
+        self.read_barrier().await?;
+        let selected = self.store.snapshot_for_writer_with_basis(
+            self.partition.as_ref(),
+            ids,
+            CommittedLeaderId::new(term, self.id),
+        )?;
+        let after = self.metrics();
+        ensure!(
+            after.current_term == term && after.current_leader == Some(self.id),
+            "SQL write baseline leadership changed"
+        );
+        Ok(selected)
+    }
+
     /// Capture a fresh writer baseline and the stable leadership term that
     /// authorized it. Call this before observing remote state, then submit
     /// dependent preparation with commit_in_term; a process-local lock cannot
@@ -769,8 +842,36 @@ impl Consensus {
         .await
     }
 
+    pub(crate) async fn commit_with_clock(
+        &self,
+        commit: Commit,
+        clock: crate::service::clock::Clock,
+        basis: Arc<NativeWriteBasis>,
+    ) -> anyhow::Result<CommitResult> {
+        self.commit_command_with_clock(commit.into(), Some(clock), Some(basis))
+            .await
+    }
     async fn commit_command(&self, command: RaftCommand) -> anyhow::Result<CommitResult> {
-        let command = self.scope_command(command);
+        self.commit_command_with_clock(command, None, None).await
+    }
+    async fn commit_command_with_clock(
+        &self,
+        command: RaftCommand,
+        clock: Option<crate::service::clock::Clock>,
+        basis: Option<Arc<NativeWriteBasis>>,
+    ) -> anyhow::Result<CommitResult> {
+        if let Some(basis) = &basis {
+            ensure!(
+                basis.belongs_to(&self.store, self.partition.as_ref()),
+                "SQL write basis belongs to another native context"
+            );
+        }
+        let command = self.scope_command(crate::sql_commit::wrap(
+            command,
+            clock,
+            basis,
+            self.limits.transaction_max_bytes,
+        )?);
         // A single command must fit the transport even when replication falls
         // back to one entry per RPC after receiving a payload-size rejection.
         if encoded_json_len(&command)? > self.limits.transaction_max_bytes {
@@ -815,9 +916,38 @@ impl Consensus {
         self.submit_compact(batch).await
     }
 
+    pub(crate) async fn commit_compact_with_clock(
+        &self,
+        batch: CompactBatch,
+        clock: crate::service::clock::Clock,
+        basis: Arc<NativeWriteBasis>,
+    ) -> anyhow::Result<Vec<ApplyResult>> {
+        batch.validate()?;
+        self.submit_compact_with_clock(batch, Some(clock), Some(basis))
+            .await
+    }
     async fn submit_compact(&self, batch: CompactBatch) -> anyhow::Result<Vec<ApplyResult>> {
+        self.submit_compact_with_clock(batch, None, None).await
+    }
+    async fn submit_compact_with_clock(
+        &self,
+        batch: CompactBatch,
+        clock: Option<crate::service::clock::Clock>,
+        basis: Option<Arc<NativeWriteBasis>>,
+    ) -> anyhow::Result<Vec<ApplyResult>> {
+        if let Some(basis) = &basis {
+            ensure!(
+                basis.belongs_to(&self.store, self.partition.as_ref()),
+                "SQL write basis belongs to another native context"
+            );
+        }
         let count = batch.items.len();
-        let command = self.scope_command(RaftCommand::Batch { batch });
+        let command = self.scope_command(crate::sql_commit::wrap(
+            RaftCommand::Batch { batch },
+            clock,
+            basis,
+            self.limits.transaction_max_bytes,
+        )?);
         if encoded_json_len(&command)? > self.limits.transaction_max_bytes {
             bail!(
                 "transaction group exceeds FLOWER_TRANSACTION_MAX_BYTES ({})",

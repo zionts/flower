@@ -74,11 +74,16 @@ struct Waiter {
     input: Input,
     send: oneshot::Sender<Permit>,
 }
-pub(super) struct Input {
+pub(crate) struct Input {
     pool: Weak<Pool>,
     class: Class,
     bytes: usize,
 }
+pub(crate) struct StrongInput {
+    _input: Input,
+    _pool: Arc<Pool>,
+}
+
 struct Active {
     pool: Weak<Pool>,
     class: Class,
@@ -214,6 +219,16 @@ impl Pool {
     pub(super) fn retained(&self) -> (usize, usize) {
         let state = self.state.lock().expect("admission mutex");
         (state.classes[0].input, self.input[0])
+    }
+    pub(super) fn retain_strong(
+        self: &Arc<Self>,
+        class: Class,
+        bytes: usize,
+    ) -> Result<StrongInput, ApiError> {
+        Ok(StrongInput {
+            _input: self.retain(class, bytes)?,
+            _pool: self.clone(),
+        })
     }
     pub(super) fn retain(self: &Arc<Self>, class: Class, bytes: usize) -> Result<Input, ApiError> {
         let mut state = self.state.lock().expect("admission mutex");
@@ -493,5 +508,21 @@ mod tests {
         drop(admitted);
         assert_eq!(pool.metrics()["classes"][0]["active"], 0);
         assert_eq!(pool.metrics()["classes"][0]["retainedInputBytes"], 0);
+    }
+    #[test]
+    fn strong_metadata_lease_keeps_pool_and_charge_until_final_owner_drop() {
+        let pool = pool();
+        let weak = Arc::downgrade(&pool);
+        let retained = pool.retain_strong(Class::User, 123).unwrap();
+        assert_eq!(pool.retained().0, 123);
+        drop(pool);
+        let surviving = weak
+            .upgrade()
+            .expect("queued metadata must keep actual budget owner alive");
+        assert_eq!(surviving.retained().0, 123);
+        drop(retained);
+        assert_eq!(surviving.retained().0, 0);
+        drop(surviving);
+        assert!(weak.upgrade().is_none());
     }
 }

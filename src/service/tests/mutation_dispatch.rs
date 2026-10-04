@@ -32,6 +32,7 @@ async fn metadata(app: &App, puts: BTreeMap<String, Value>) {
     let state = app.consensus.read().await.unwrap();
     app.consensus
         .commit(Commit {
+            sql_commit_before: None,
             internal: true,
             request_id: format!("test-metadata-{}", state.revision),
             fingerprint: "test-metadata".into(),

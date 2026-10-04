@@ -167,6 +167,7 @@ mod tests {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
                 payload: openraft::EntryPayload::Normal(
                     Commit {
+                        sql_commit_before: None,
                         internal: false,
                         request_id: "large".into(),
                         fingerprint: "large".into(),
