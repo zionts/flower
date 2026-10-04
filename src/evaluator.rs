@@ -17,7 +17,7 @@ pub(crate) mod sql_bridge;
 pub(crate) mod sql_control;
 #[cfg(feature = "sql")]
 pub(crate) mod sql_frame;
-mod sql_registry;
+pub(crate) mod sql_registry;
 #[cfg(feature = "sql")]
 pub(crate) mod sqlite;
 pub(crate) mod staging;
@@ -40,11 +40,12 @@ pub(crate) mod metadata_reference {
     pub(crate) use super::HttpMethod;
     use std::collections::BTreeMap;
 
-    pub(crate) fn registry(http: &BTreeMap<String, HttpMethod>) -> anyhow::Result<serde_json::Value> {
+    pub(crate) fn registry(
+        http: &BTreeMap<String, HttpMethod>,
+    ) -> anyhow::Result<serde_json::Value> {
         super::sql_registry::build(http)
     }
 }
-
 
 use std::{
     collections::BTreeMap,

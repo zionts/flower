@@ -1,6 +1,6 @@
+use super::sqlite::{QueryOptions, SqlCell};
 use super::*;
 use crate::allocation_probe::measure;
-use crate::sqlite::{QueryOptions, SqlCell};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
