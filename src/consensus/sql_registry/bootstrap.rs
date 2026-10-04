@@ -24,27 +24,33 @@ impl StaticRegion {
     pub(crate) fn covered_bytes(self) -> usize {
         self.page_end - self.page_start
     }
+
+    /// A source-owned actual static object, never caller-reported size/address.
+    /// The node still books the UNIQUE union of all actual covered page spans.
+    pub(in crate::consensus) fn of<T>(object: &'static T) -> Result<Self, RegistryError> {
+        let page = page_size()?;
+        let address = std::ptr::from_ref(object) as usize;
+        let object_bytes = std::mem::size_of::<T>();
+        let end = address
+            .checked_add(object_bytes)
+            .ok_or(RegistryError::Capacity)?;
+        let page_end = end
+            .checked_add(page - 1)
+            .map(|end| end / page * page)
+            .ok_or(RegistryError::Capacity)?;
+        Ok(StaticRegion {
+            object_start: address,
+            object_bytes,
+            object_align: std::mem::align_of::<T>(),
+            page_start: address / page * page,
+            page_end,
+            page_bytes: page,
+        })
+    }
 }
 
 pub(crate) fn bootstrap_required_layout() -> Result<StaticRegion, RegistryError> {
-    let page = page_size()?;
-    let address = std::ptr::addr_of!(SOURCE_REGISTRY) as usize;
-    let object_bytes = std::mem::size_of::<OnceLock<RegistryPool>>();
-    let end = address
-        .checked_add(object_bytes)
-        .ok_or(RegistryError::Capacity)?;
-    let page_end = end
-        .checked_add(page - 1)
-        .map(|end| end / page * page)
-        .ok_or(RegistryError::Capacity)?;
-    Ok(StaticRegion {
-        object_start: address,
-        object_bytes,
-        object_align: std::mem::align_of::<OnceLock<RegistryPool>>(),
-        page_start: address / page * page,
-        page_end,
-        page_bytes: page,
-    })
+    StaticRegion::of(&SOURCE_REGISTRY)
 }
 
 /// Installs the native-provided combined pool once. A duplicate refuses and

@@ -173,3 +173,34 @@ async fn sql_source_actual_publication_failure_marks_only_affected_store_before_
     assert!(healthy.check_availability(None).is_ok());
     assert!(PublicationGuard::acquire(&failed.inner).is_err());
 }
+
+#[tokio::test]
+async fn sql_source_actual_writer_basis_refuses_fatal_before_clone_and_before_final_clock() {
+    fixture::bootstrap().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(1, directory.path().into()).await.unwrap();
+    let leader = openraft::CommittedLeaderId::new(3, 1);
+    let (_, basis) = store
+        .snapshot_for_writer_with_basis(None, None, leader)
+        .unwrap();
+    assert_eq!(basis.decide(0, leader, None, || Ok(7)), Ok(7));
+    drop(PublicationGuard::acquire(&store.inner).unwrap());
+    assert!(
+        store
+            .snapshot_for_writer_with_basis(None, None, leader)
+            .is_err()
+    );
+    let sampled = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        basis
+            .decide(0, leader, None, || {
+                sampled.store(true, Ordering::Relaxed);
+                Ok(7)
+            })
+            .is_err()
+    );
+    assert!(
+        !sampled.load(Ordering::Relaxed),
+        "fatal source must not reach the final clock/authorization decision"
+    );
+}

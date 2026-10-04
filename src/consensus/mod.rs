@@ -30,6 +30,14 @@ pub use sql_capture::{
 pub mod retention;
 mod snapshot_policy;
 mod store;
+/// Actual source issuer static page span for the single native startup union.
+/// Not a grant/reservation and not a resettable counter or namespace authority.
+#[cfg(feature = "sql")]
+pub(crate) fn sql_source_identity_static_region()
+-> Result<sql_registry::StaticRegion, sql_registry::RegistryError> {
+    store::Store::identity_static_region()
+}
+
 mod timing;
 
 #[cfg(test)]

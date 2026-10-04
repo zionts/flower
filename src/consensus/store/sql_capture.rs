@@ -4,6 +4,40 @@ use super::*;
 use crate::consensus::sql_capture::*;
 
 static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+/// Native startup must include THIS actual counter's pages in the SAME unique
+/// node baseline union. It need not share a page with the OnceLock bootstrap;
+/// never assume sizeof8 or disjoint4096 are themselves backed reservations.
+pub(super) fn identity_static_region() -> Result<
+    crate::consensus::sql_registry::StaticRegion,
+    crate::consensus::sql_registry::RegistryError,
+> {
+    crate::consensus::sql_registry::StaticRegion::of(&NEXT_IDENTITY)
+}
+impl Store {
+    pub(in crate::consensus) fn identity_static_region() -> Result<
+        crate::consensus::sql_registry::StaticRegion,
+        crate::consensus::sql_registry::RegistryError,
+    > {
+        identity_static_region()
+    }
+}
+#[cfg(test)]
+#[test]
+fn sql_capture_actual_identity_counter_region_uses_real_object_address_and_pages() {
+    let region = identity_static_region().unwrap();
+    assert_eq!(
+        region.object_start,
+        std::ptr::addr_of!(NEXT_IDENTITY) as usize
+    );
+    assert_eq!(region.object_bytes, std::mem::size_of::<AtomicU64>());
+    assert_eq!(region.object_align, std::mem::align_of::<AtomicU64>());
+    assert!(region.page_start <= region.object_start);
+    assert!(region.page_end >= region.object_start + region.object_bytes);
+    assert_eq!(region.page_start % region.page_bytes, 0);
+    assert_eq!(region.page_end % region.page_bytes, 0);
+    assert_eq!(region, identity_static_region().unwrap());
+}
+
 pub(super) fn next_identity() -> anyhow::Result<u64> {
     reserve_identity(&NEXT_IDENTITY)
         .ok_or_else(|| anyhow::anyhow!("SQL capture store identity exhausted"))
