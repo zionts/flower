@@ -21,7 +21,9 @@ pub use shared::SharedDatabase;
 mod sql_capture;
 #[cfg(feature = "sql")]
 mod sql_registry_meta;
-#[cfg(feature = "sql")]
+
+// Always-built generic deny-only source TCB; no SQL activation.
+mod source_identity;
 mod sql_source;
 pub(crate) use write_basis::NativeWriteBasis;
 
@@ -417,7 +419,6 @@ impl PendingWrites {
 }
 
 struct Inner {
-    #[cfg(feature = "sql")]
     capture_identity: u64,
     id: u64,
     shared: Arc<SharedDatabase>,
@@ -462,7 +463,6 @@ struct Inner {
     backup: Arc<backup::Hooks>,
 }
 
-#[cfg(feature = "sql")]
 impl Drop for Inner {
     fn drop(&mut self) {
         // All real blocking/background work owns this Inner strongly. A
@@ -482,7 +482,7 @@ struct OpenedStore {
     directory: PathBuf,
     snapshot_accounting: Arc<super::snapshot_policy::Accounting>,
     current_snapshot: Option<SnapshotMeta<u64, BasicNode>>,
-    #[cfg(feature = "sql")]
+
     source_startup: sql_source::PreparingStore,
 }
 
@@ -545,23 +545,17 @@ impl Store {
     pub(super) async fn open(id: u64, storage: Storage) -> anyhow::Result<Self> {
         // Explicit one-process TEST fixture only. Production requires the real
         // provided native global before any disk startup or Store exposure.
-        #[cfg(all(test, feature = "sql"))]
+        #[cfg(test)]
         sql_source::test_bootstrap()?;
-        #[cfg(feature = "sql")]
+
         let source_startup = sql_source::PreparingStore::begin()?;
-        Self::open_started(
-            id,
-            storage,
-            #[cfg(feature = "sql")]
-            source_startup,
-        )
-        .await
+        Self::open_started(id, storage, source_startup).await
     }
 
     async fn open_started(
         id: u64,
         storage: Storage,
-        #[cfg(feature = "sql")] source_startup: sql_source::PreparingStore,
+        source_startup: sql_source::PreparingStore,
     ) -> anyhow::Result<Self> {
         let opened = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let (shared, prefix, directory) = match storage {
@@ -707,7 +701,7 @@ impl Store {
                 directory,
                 snapshot_accounting,
                 current_snapshot,
-                #[cfg(feature = "sql")]
+
                 source_startup,
             })
         })
@@ -720,7 +714,7 @@ impl Store {
             directory,
             snapshot_accounting,
             current_snapshot,
-            #[cfg(feature = "sql")]
+
             source_startup,
         } = opened;
         let lazy = Arc::new(lazy_flush::LazyFlush::default());
@@ -734,7 +728,7 @@ impl Store {
                 io: Arc::new(Mutex::new(())),
                 appending: Arc::new(PublishedLock::new(Vec::new())),
                 pending: Arc::default(),
-                #[cfg(feature = "sql")]
+
                 capture_identity: source_startup.identity(),
                 snapshot_installation: AtomicU64::new(0),
                 current_snapshot: PublishedLock::new(current_snapshot),
@@ -752,7 +746,7 @@ impl Store {
             }),
             raft_lifetime: None,
         };
-        #[cfg(feature = "sql")]
+
         source_startup.finish(&store.inner)?;
         lazy_flush::spawn(
             Arc::downgrade(&store.inner),
@@ -828,7 +822,7 @@ impl Store {
         binding: Option<&PartitionBinding>,
     ) -> anyhow::Result<()> {
         let published = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         if let Some(binding) = binding {
             partitions::active(published.partitions.get(&binding.partition), binding)?;
@@ -846,7 +840,7 @@ impl Store {
     /// requested receipt allocation from the same published data revision.
     pub(super) async fn snapshot_for(&self, request_id: Option<&str>) -> anyhow::Result<Snapshot> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         Ok(Snapshot {
             revision: state.revision,
@@ -863,7 +857,7 @@ impl Store {
     /// publication as query data, including blank/membership/rejected entries.
     pub(super) fn read_fence(&self) -> anyhow::Result<super::read::ReadFence> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         Ok(super::read::ReadFence {
             applied: state
@@ -876,7 +870,7 @@ impl Store {
     /// Fence readiness without cloning/pinning either persistent root.
     pub(super) fn has_applied_fence(&self, fence: &super::read::ReadFence) -> anyhow::Result<bool> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(false);
@@ -901,7 +895,7 @@ impl Store {
         fence: &super::read::ReadFence,
     ) -> anyhow::Result<Option<Snapshot>> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(None);
@@ -931,7 +925,7 @@ impl Store {
         request_ids: &[String],
     ) -> anyhow::Result<Snapshot> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         Ok(Snapshot {
             revision: state.revision,
@@ -948,7 +942,7 @@ impl Store {
     /// arbitrarily old request IDs that can arrive in later pipeline groups.
     pub(super) async fn snapshot_for_writer(&self) -> anyhow::Result<Snapshot> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         Ok(Snapshot {
             revision: state.revision,
@@ -959,7 +953,7 @@ impl Store {
 
     pub(super) fn partition_infos(&self) -> anyhow::Result<Vec<PartitionInfo>> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         Ok(state
             .partitions
@@ -970,7 +964,7 @@ impl Store {
 
     pub(super) fn partition_info(&self, id: &str) -> anyhow::Result<PartitionInfo> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         state
             .partitions
@@ -981,7 +975,7 @@ impl Store {
 
     pub(super) fn partition_state(&self, id: &str) -> anyhow::Result<PartitionState> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         state
             .partitions
@@ -997,7 +991,7 @@ impl Store {
         all: bool,
     ) -> anyhow::Result<Snapshot> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         let snapshot = partitions::active(state.partitions.get(&binding.partition), binding)?;
         let requests = if all {
@@ -1026,7 +1020,7 @@ impl Store {
         binding: Option<&PartitionBinding>,
     ) -> anyhow::Result<Option<Snapshot>> {
         let state = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
+
         sql_source::require_ready(&self.inner)?;
         let Some(applied) = state.last_applied else {
             return Ok(None);
@@ -2007,10 +2001,8 @@ impl RaftStateMachine<TypeConfig> for Store {
             // Arm fail-stop under the actual SAME Published write lock before
             // changing live state. A partial mutation, allocation panic or queue
             // submission unwind marks only this Store Fatal before unlocking.
-            #[cfg(feature = "sql")]
+
             let mut publication = sql_source::PublicationGuard::acquire(source)?;
-            #[cfg(not(feature = "sql"))]
-            let mut publication = source.published.write().expect("published state lock");
             for (_, mut write) in partition_writes {
                 write.stamp(sequence);
                 guard.partitions.insert(write.state);
@@ -2035,10 +2027,8 @@ impl RaftStateMachine<TypeConfig> for Store {
             // Queue under the guard: whoever next observes this state, even
             // after this future is cancelled, also finds its write submitted.
             persistence.submit(weak, holders, write);
-            #[cfg(feature = "sql")]
+
             publication.complete();
-            #[cfg(not(feature = "sql"))]
-            drop(publication);
             // The detached old roots are released outside Pubwrite.
             drop(previous);
             profile.phase(StoragePhase::Publish);

@@ -45,6 +45,23 @@ enum Table {
     Run(Arc<Run>),
 }
 
+impl Backing {
+    /// Borrow the actual already-held backing, without a root/table/transaction
+    /// clone or payload access. The caller supplies one original resident scope
+    /// and native exclusion; this is representation, never lifetime authority.
+    pub(crate) fn lifetime_presence_view(
+        &self,
+    ) -> super::records::lifetime_presence::LifetimeBackingView<'_> {
+        use super::records::lifetime_presence::LifetimeBackingView;
+        match &self.table {
+            Table::Empty => LifetimeBackingView::Empty,
+            Table::Plain(table) => LifetimeBackingView::Plain(table),
+            Table::Pair(table, namespace) => LifetimeBackingView::Pair(table, namespace),
+            Table::Run(_) => LifetimeBackingView::Run,
+        }
+    }
+}
+
 impl fmt::Debug for Backing {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

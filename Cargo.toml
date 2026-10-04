@@ -10,7 +10,7 @@ license = "MIT"
 [features]
 default = []
 # Experimental: disabled until SQL integration/authority/resource launch gates pass.
-sql = ["dep:libsqlite3-sys", "redb/flower-resident-reads", "im/flower-bounded-reads", "dep:aes-gcm", "dep:aes", "dep:ghash", "dep:polyval"]
+sql = ["dep:libsqlite3-sys", "dep:aes-gcm", "dep:aes", "dep:ghash", "dep:polyval"]
 
 [dependencies]
 anyhow = "1"
@@ -30,7 +30,8 @@ clap = { version = "4", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-executor = { version = "0.3", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
-im = "15.1"
+# Generic deny-only native lifetime reads remain available with SQL serving OFF.
+im = { version = "15.1", features = ["flower-bounded-reads"] }
 # Native read-only SQL: the allocator is configured before SQLite's first use.
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"], optional = true }
 # SQL-only mounted AES: direct schedule-cleanup feature unification is required.
@@ -47,7 +48,7 @@ openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "experimental_metrics_bound_instruments"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "http-json", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics", "internal-logs"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "internal-logs", "experimental_metrics_bound_instruments"] }
-redb = "4.3"
+redb = { version = "4.3", features = ["flower-resident-reads"] }
 reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value", "unbounded_depth"] }

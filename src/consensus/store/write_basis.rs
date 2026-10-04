@@ -56,7 +56,6 @@ impl NativeWriteBasis {
         }
         let origin = self.origin.upgrade().ok_or_else(changed)?;
         let guard = origin.published.read().map_err(|_| changed())?;
-        #[cfg(feature = "sql")]
         sql_source::require_ready(&origin).map_err(|_| changed())?;
         if guard.installation != self.installation || guard.last_applied != previous {
             return Err(changed());
@@ -93,7 +92,6 @@ impl Store {
         leader: openraft::CommittedLeaderId<u64>,
     ) -> anyhow::Result<(Snapshot, Arc<NativeWriteBasis>)> {
         let guard = self.inner.published.read().expect("published state lock");
-        #[cfg(feature = "sql")]
         sql_source::require_ready(&self.inner)?;
         let (revision, data, requests) = match binding {
             None => (guard.revision, &guard.data, &guard.requests),

@@ -17,7 +17,7 @@ mod receipts;
 mod records;
 #[cfg(feature = "sql")]
 pub(crate) mod sql_capture;
-#[cfg(feature = "sql")]
+// Generic deny-only source control remains enforced with SQL serving OFF.
 pub(crate) mod sql_registry;
 #[cfg(feature = "sql")]
 pub use sql_capture::{
@@ -32,7 +32,6 @@ mod snapshot_policy;
 mod store;
 /// Actual source issuer static page span for the single native startup union.
 /// Not a grant/reservation and not a resettable counter or namespace authority.
-#[cfg(feature = "sql")]
 pub(crate) fn sql_source_identity_static_region()
 -> Result<sql_registry::StaticRegion, sql_registry::RegistryError> {
     store::Store::identity_static_region()

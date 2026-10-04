@@ -1,4 +1,5 @@
-//! Current-only registry storage, with no serving/source roots.
+//! Always-built bounded deny-only source control and CURRENT registry storage.
+//! It has no serving/source roots and does not activate optional SQL execution.
 //!
 //! This primitive is NOT wired into Store publication, persistence or routing.
 //! Its mandatory provided admission lease is an interface, NOT evidence that a

@@ -1,4 +1,5 @@
-//! The actual Store lifetime owns one mapped source-status slot.
+//! Always-built deny-only native source TCB: actual Store lifetime owns one
+//! mapped source-status slot. Compiling this does not enable SQL serving.
 //!
 //! No source roots or namespace/cell owners are added to Store/Inner/Snapshot.
 //! Startup transfers an armed scalar guard through the real blocking worker;
@@ -19,8 +20,8 @@ pub(super) enum SourceError {
 impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Bootstrap => f.write_str("SQL source bootstrap unavailable"),
-            Self::Directory(_) => f.write_str("SQL source lifetime unavailable"),
+            Self::Bootstrap => f.write_str("native source bootstrap unavailable"),
+            Self::Directory(_) => f.write_str("native source lifetime unavailable"),
         }
     }
 }
@@ -42,7 +43,7 @@ pub(super) struct PreparingStore {
 impl PreparingStore {
     pub(super) fn begin() -> anyhow::Result<Self> {
         let pool = pool()?;
-        let identity = sql_capture::next_identity()?;
+        let identity = source_identity::next_identity()?;
         pool.directory()
             .map_err(|_| SourceError::Bootstrap)?
             .prepare_store_native(identity)

@@ -10,6 +10,8 @@
 
 #[cfg(feature = "sql")]
 mod sql_capture;
+// Raw key-only lifetime denial does not depend on SQL routing/catalogue flags.
+pub(crate) mod lifetime_presence;
 
 use std::borrow::Cow;
 use std::cell::Cell;

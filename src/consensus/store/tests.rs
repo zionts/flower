@@ -889,9 +889,7 @@ fn open_pausing_store(
 }
 
 fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
-    #[cfg(feature = "sql")]
     sql_source::test_bootstrap().unwrap();
-    #[cfg(feature = "sql")]
     let source_startup = sql_source::PreparingStore::begin().unwrap();
     let transaction = db.begin_write().unwrap();
     transaction.open_table(LOGS).unwrap();
@@ -912,7 +910,6 @@ fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
             tables: Tables::new(""),
             snapshot_directory: directory.to_path_buf(),
             io: Arc::new(Mutex::new(())),
-            #[cfg(feature = "sql")]
             capture_identity: source_startup.identity(),
             snapshot_installation: AtomicU64::new(0),
             current_snapshot: PublishedLock::new(current_snapshot),
@@ -930,7 +927,6 @@ fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
         }),
         raft_lifetime: None,
     };
-    #[cfg(feature = "sql")]
     source_startup.finish(&store.inner).unwrap();
     store
 }
@@ -1986,7 +1982,6 @@ async fn cancelled_apply_keeps_actual_inner_until_blocking_publication_and_sourc
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(1, directory.path().into()).await.unwrap();
     let weak = Arc::downgrade(&store.inner);
-    #[cfg(feature = "sql")]
     let source_identity = store.inner.capture_identity;
     let published = store.inner.published.clone();
     let mut changes = store.changes();
@@ -2008,7 +2003,6 @@ async fn cancelled_apply_keeps_actual_inner_until_blocking_publication_and_sourc
         weak.upgrade().is_some(),
         "actual blocking publisher must own Inner, not only Weak/components"
     );
-    #[cfg(feature = "sql")]
     assert_eq!(
         super::super::sql_registry::source_registry()
             .unwrap()
@@ -2036,7 +2030,6 @@ async fn cancelled_apply_keeps_actual_inner_until_blocking_publication_and_sourc
         Err(tokio::sync::broadcast::error::RecvError::Closed)
     ));
     assert!(weak.upgrade().is_none(), "no leaked strong source lifetime");
-    #[cfg(feature = "sql")]
     {
         let pool = super::super::sql_registry::source_registry().unwrap();
         // One bounded explicit reclaim, not a status polling loop. Old IDs are
