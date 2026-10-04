@@ -218,16 +218,35 @@ fn schema(app: &Map<String, Value>, definitions: &BTreeMap<&str, Definition>) ->
         (Vec::new(), BTreeSet::new(), BTreeSet::new());
     let mut policies = BTreeMap::new();
     let mut declared_references = Vec::new();
+    let mut protected_sources = BTreeSet::new();
+    let mut protected_source_bytes = 0usize;
     for value in collections {
         let collection = object(Some(value), "Collection declaration")?;
         let name = text(collection, "name");
         let Some(name) = name.filter(|name| {
-            only(collection, &["name", "indexes", "access", "references"])
-                && !name.is_empty()
+            only(
+                collection,
+                &["name", "indexes", "access", "references", "nativeLifetime"],
+            ) && !name.is_empty()
                 && declared.insert(*name)
         }) else {
             bail!("Invalid or duplicate collection declaration");
         };
+        match collection.get("nativeLifetime") {
+            None => {}
+            Some(Value::String(lifetime)) if lifetime == "protected" => {
+                protected_source_bytes = protected_source_bytes
+                    .checked_add(name.len())
+                    .ok_or_else(|| anyhow!("Protected source selectors exceed their bound"))?;
+                ensure!(
+                    protected_sources.len() < Schema::MAX_PROTECTED_SOURCES
+                        && protected_source_bytes <= Schema::MAX_PROTECTED_SOURCE_BYTES,
+                    "Protected source selectors exceed their bound"
+                );
+                protected_sources.insert(name.to_owned());
+            }
+            Some(_) => bail!("Collection nativeLifetime must be the literal protected"),
+        }
         if let Some(access) = collection.get("access") {
             let policy = serde_json::from_value::<Policy>(access.clone())
                 .map_err(|error| error.to_string())
@@ -371,6 +390,7 @@ fn schema(app: &Map<String, Value>, definitions: &BTreeMap<&str, Definition>) ->
         policies,
         derived_access,
         references: declared_references,
+        protected_sources: protected_sources.into_iter().collect(),
     })
 }
 
@@ -678,6 +698,181 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_lifetime_selectors_are_explicit_sorted_and_independent_of_sql() {
+        let raw = json!({
+            "definitions":{}, "http":{},
+            "collections":[
+                {"name":"zPhysical", "indexes":{}, "nativeLifetime":"protected"},
+                {"name":"sqlCustodies", "indexes":{}},
+                {"name":"arbitraryPhysical", "indexes":{}, "nativeLifetime":"protected"}
+            ]
+        });
+        let manifest = validate(&raw).unwrap();
+        assert_eq!(
+            manifest.schema.protected_sources,
+            ["arbitraryPhysical", "zPhysical"]
+        );
+        assert!(manifest.schema.sql.is_empty());
+        assert!(manifest.schema.policies.is_empty());
+        let encoded = serde_json::to_value(&manifest.schema).unwrap();
+        assert_eq!(
+            encoded["protected_sources"],
+            json!(["arbitraryPhysical", "zPhysical"])
+        );
+        let reparsed = super::super::rust_engine::staged_schema(Some(&encoded)).unwrap();
+        assert_eq!(reparsed, manifest.schema);
+        assert!(
+            validate(&json!({"definitions":{},"http":{},"collections":[
+                {"name":"nativeBlobReceipts","indexes":{}},
+                {"name":"nativeSealReceipts","indexes":{}},
+                {"name":"modelCustodies","indexes":{}}
+            ]}))
+            .unwrap()
+            .schema
+            .protected_sources
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_lifetime_rejects_nonliteral_flags_and_unknown_properties() {
+        let base = json!({"definitions":{}, "http":{}, "collections":[
+            {"name":"custom", "indexes":{}, "nativeLifetime":"protected"}
+        ]});
+        for flag in [
+            Value::Null,
+            json!(false),
+            json!(true),
+            json!(0),
+            json!("false"),
+            json!("unprotected"),
+            json!("Protected"),
+            json!(""),
+            json!({"protected":true}),
+            json!(["protected"]),
+        ] {
+            let mut raw = base.clone();
+            raw["collections"][0]["nativeLifetime"] = flag;
+            assert!(validate(&raw).is_err(), "accepted {raw}");
+        }
+        for field in [
+            "protectLifetime",
+            "protected_sources",
+            "unknown",
+            "__proto__",
+        ] {
+            let mut raw = base.clone();
+            raw["collections"][0][field] = json!("protected");
+            assert!(validate(&raw).is_err(), "accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn native_lifetime_duplicate_collection_declarations_never_choose_a_winner() {
+        for flags in [
+            (Some("protected"), None),
+            (None, Some("protected")),
+            (Some("protected"), Some("protected")),
+            (None, None),
+        ] {
+            let mut raw = json!({"definitions":{}, "http":{}, "collections":[
+                {"name":"custom", "indexes":{}}, {"name":"custom", "indexes":{}}
+            ]});
+            for (index, flag) in [flags.0, flags.1].into_iter().enumerate() {
+                if let Some(flag) = flag {
+                    raw["collections"][index]["nativeLifetime"] = json!(flag);
+                }
+            }
+            assert!(validate(&raw).is_err(), "accepted duplicate {raw}");
+        }
+    }
+
+    #[test]
+    fn native_lifetime_selector_descriptor_bounds_are_closed() {
+        let collections: Vec<_> = (0..Schema::MAX_PROTECTED_SOURCES)
+            .map(|index| {
+                json!({"name":format!("source{index}"), "indexes":{}, "nativeLifetime":"protected"})
+            })
+            .collect();
+        let mut raw = json!({"definitions":{}, "http":{}, "collections":collections});
+        assert_eq!(
+            validate(&raw).unwrap().schema.protected_sources.len(),
+            Schema::MAX_PROTECTED_SOURCES
+        );
+        raw["collections"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"overflow", "indexes":{}, "nativeLifetime":"protected"}));
+        assert!(validate(&raw).is_err());
+        raw["collections"] = json!([
+            {"name":"x".repeat(Schema::MAX_PROTECTED_SOURCE_BYTES), "indexes":{}, "nativeLifetime":"protected"}
+        ]);
+        assert!(validate(&raw).is_ok());
+        raw["collections"][0]["name"] = json!("x".repeat(Schema::MAX_PROTECTED_SOURCE_BYTES + 1));
+        assert!(validate(&raw).is_err());
+        // The limit counts actual UTF-8 selector bytes, not characters.
+        raw["collections"][0]["name"] = json!("é".repeat(Schema::MAX_PROTECTED_SOURCE_BYTES / 2));
+        assert!(validate(&raw).is_ok());
+        raw["collections"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"other", "indexes":{}, "nativeLifetime":"protected"}));
+        assert!(validate(&raw).is_err());
+    }
+
+    fn deploy_lifetime_declaration(collection: &str) -> Result<super::super::Evaluation> {
+        let javascript = format!(
+            "var __flowerBundle = {{default: {{definitions: {{}}, http: {{}}, collections: [{collection}]}}}};"
+        );
+        super::super::evaluate(
+            BTreeMap::<String, Value>::new(),
+            json!({"requestId":"lifetime-deploy", "bundle":{
+                "hash":super::super::hash(javascript.as_bytes()), "javascript":javascript
+            }}),
+        )
+    }
+
+    #[test]
+    fn native_lifetime_only_deployment_retains_schema_but_ordinary_empty_does_not() {
+        let protected =
+            deploy_lifetime_declaration("{name:'custom', indexes:{}, nativeLifetime:'protected'}")
+                .unwrap();
+        assert_eq!(
+            protected.puts["schema"]["protected_sources"],
+            json!(["custom"])
+        );
+        assert!(!protected.deletes.iter().any(|id| id == "schema"));
+        let ordinary = deploy_lifetime_declaration("{name:'custom', indexes:{}}").unwrap();
+        assert!(!ordinary.puts.contains_key("schema"));
+        assert!(
+            super::super::rust_engine::staged_schema(None)
+                .unwrap()
+                .protected_sources
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_lifetime_guest_accessors_and_nonplain_prototypes_cannot_declare_flags() {
+        for declaration in [
+            "{name:'custom', indexes:{}, get nativeLifetime(){return 'protected'}}",
+            "Object.assign(Object.create({nativeLifetime:'protected'}), {name:'custom', indexes:{}})",
+            "Object.assign(Object.create({}), {name:'custom', indexes:{}, nativeLifetime:'protected'})",
+            "{name:'custom', indexes:{}, nativeLifetime:new String('protected')}",
+        ] {
+            assert!(
+                deploy_lifetime_declaration(declaration).is_err(),
+                "accepted {declaration}"
+            );
+        }
+        let valid = deploy_lifetime_declaration(
+            "Object.assign(Object.create(null), {name:'custom', indexes:{}, nativeLifetime:'protected'})",
+        )
+        .unwrap();
+        assert_eq!(valid.puts["schema"]["protected_sources"], json!(["custom"]));
+    }
 
     #[test]
     fn terminal_sql_metadata_is_query_only_and_requires_registered_readless_capabilities() {
