@@ -74,6 +74,29 @@ export default app;</code></pre></div>
 <li>A trigger's collection is declared for you.</li>
 </ul>
 </section>
+<section id="retaining-deleted-rows">
+<h2>Retain deleted rows separately</h2>
+<p>A <code>retainDeleted</code> hook captures every successful removal with the full final stored row, including fields hidden from the deleting caller. Register it alongside ordinary triggers. Its writes join the same transaction and run with the application's rights, but the initiating delete still has to pass the caller's policy.</p>
+<div class="code-block"><div class="code-head"><span>An operator-only deletion history</span><button type="button" class="copy-button" aria-label="Copy An operator-only deletion history">Copy</button></div><pre tabindex="0"><code class="language-ts">import { collection, define, retainDeleted, type DeletedRow } from "@flower-js/sdk";
+
+type Cart = { openedAt: number };
+const carts = collection&lt;Cart&gt;("carts");
+const deletedCarts = collection&lt;DeletedRow&lt;Cart, string&gt;[]&gt;("deletedCarts")
+  .access(({ principal }) =&gt; ({ read: principal.subject.eq("operator"), write: false }));
+const retain = retainDeleted("carts.retain", carts, (ctx, deleted) =&gt; {
+  // A per-key history preserves repeated deletion/recreation of the same cart.
+  ctx.set(deletedCarts, deleted.key, [...(ctx.get(deletedCarts, deleted.key) ?? []), deleted]);
+});
+export default define({ collections: [deletedCarts], triggers: [retain] });</code></pre></div>
+<ul>
+<li>The event is <code>{ collection, key, value, deletedAt }</code>: a decoded key, the value immediately before deletion, and the invocation's server time in epoch milliseconds. <code>ctx.principal()</code> still identifies the initiating caller.</li>
+<li>Retention is not a tombstone in the source collection. Deleted rows disappear from ordinary reads, scans, indexes, aggregates and foreign keys. Choose your own archival layout, using a history or a fresh deletion ID rather than overwriting previous removals.</li>
+<li>Updating then deleting captures the updated payload. Deletion/recreation and transient rows created then deleted are retained; ordinary triggers still observe only net changes. Missing or policy-skipped deletes produce nothing.</li>
+<li><code>ctx.delete(carts, key, { permanent: true })</code> deliberately skips retention for this removal and declared foreign-key cascade descendants. It keeps ordinary triggers and all access and reference checks. Custom application cascades must explicitly pass options themselves.</li>
+<li>Only one retention hook per collection name is allowed. A fresh reference by name cannot skip it. Callback errors roll back the whole mutation, and callback writes participate in the usual 32-round trigger limit.</li>
+<li>No restore or public permanent-delete endpoint is added. If the application needs one, authorize it explicitly; restoring a row through <code>ctx.set</code> must satisfy its normal foreign keys.</li>
+</ul>
+</section>
 <section id="built-in">
 <h2>Built-in components</h2>
 <div class="table-wrap"><table><caption class="sr-only">Components included in the SDK</caption><thead><tr><th>Helper</th><th>What it adds to <code>define({ uses })</code></th></tr></thead><tbody>
