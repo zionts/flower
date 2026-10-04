@@ -60,6 +60,9 @@ impl Store {
     }
 }
 
+mod history;
+#[cfg(test)]
+mod history_tests;
 mod selective;
 
 #[cfg(test)]

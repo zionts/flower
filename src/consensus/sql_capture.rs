@@ -7,6 +7,8 @@
 pub(crate) mod allocation_probe;
 mod certificate;
 mod fixed_json;
+mod history;
+pub use history::SqlCapturedHistoryIdentity;
 mod scratch;
 pub use certificate::{
     SQL_CAPTURE_MAX_DEPENDENCIES, SQL_CAPTURE_MAX_DEPENDENCY_BYTES, SqlCaptureCertificate,

@@ -23,7 +23,7 @@ pub use sql_capture::{
     SQL_CAPTURE_MAX_METADATA_BYTES, SQL_CAPTURE_MAX_RECORDS, SqlCaptureBuffer,
     SqlCaptureCertificate, SqlCaptureDependency, SqlCaptureEncoding, SqlCaptureEpoch,
     SqlCaptureError, SqlCaptureFence, SqlCaptureRequest, SqlCaptureScratch, SqlCaptureSelection,
-    SqlCapturedRecord, SqlCapturedSlice,
+    SqlCapturedHistoryIdentity, SqlCapturedRecord, SqlCapturedSlice,
 };
 pub mod retention;
 mod snapshot_policy;

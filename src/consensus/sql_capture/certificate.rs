@@ -12,12 +12,15 @@ pub const SQL_CAPTURE_MAX_DEPENDENCY_BYTES: usize =
 pub enum SqlCaptureDependency<'a> {
     Point(&'a str),
     Collection(&'a str),
+    /// Live host database/incarnation only, never raw retention accounting.
+    HistoryIdentity,
 }
 
 #[derive(Clone, Debug)]
 struct Check {
     key: Range<usize>,
     collection: bool,
+    history: bool,
     stamped: bool,
     version: Option<u64>,
 }
@@ -92,6 +95,7 @@ impl SqlCaptureCertificate {
             // Encoding and descriptor processing happen BEFORE exclusion/root
             // ownership. Fixed scratch also caps escaping work/serialized size.
             let mut encoded = [0u8; SQL_CAPTURE_MAX_KEY_BYTES];
+            let history = matches!(addition, SqlCaptureDependency::HistoryIdentity);
             let (collection, len) = match addition {
                 SqlCaptureDependency::Point(key) => {
                     if key.len() > encoded.len() {
@@ -99,6 +103,11 @@ impl SqlCaptureCertificate {
                     }
                     encoded[..key.len()].copy_from_slice(key.as_bytes());
                     (false, key.len())
+                }
+                SqlCaptureDependency::HistoryIdentity => {
+                    let marker = super::super::records::HISTORY_MARKER.as_bytes();
+                    encoded[..marker.len()].copy_from_slice(marker);
+                    (false, marker.len())
                 }
                 SqlCaptureDependency::Collection(name) => {
                     if name.len() > SQL_CAPTURE_MAX_KEY_BYTES {
@@ -117,7 +126,9 @@ impl SqlCaptureCertificate {
             };
             let bytes = &encoded[..len];
             if self.checks[..self.count].iter().flatten().any(|check| {
-                check.collection == collection && &self.keys[check.key.clone()] == bytes
+                check.collection == collection
+                    && check.history == history
+                    && &self.keys[check.key.clone()] == bytes
             }) {
                 continue;
             }
@@ -133,6 +144,7 @@ impl SqlCaptureCertificate {
             self.checks[self.count] = Some(Check {
                 key: self.used..end,
                 collection,
+                history,
                 stamped: false,
                 version: None,
             });
@@ -151,7 +163,7 @@ impl SqlCaptureCertificate {
         for check in self.checks[..self.count].iter_mut().flatten() {
             let key =
                 std::str::from_utf8(&self.keys[check.key.clone()]).expect("copied UTF8 selector");
-            let actual = if check.collection {
+            let actual = if check.collection || check.history {
                 data.generation(key)
             } else {
                 data.sql_capture_version(key)?
@@ -179,7 +191,7 @@ impl SqlCaptureCertificate {
             }
             let key =
                 std::str::from_utf8(&self.keys[check.key.clone()]).expect("copied UTF8 selector");
-            let actual = if check.collection {
+            let actual = if check.collection || check.history {
                 data.generation(key)
             } else {
                 data.sql_capture_version(key)?
@@ -190,9 +202,16 @@ impl SqlCaptureCertificate {
         }
         Ok(())
     }
+    pub(in crate::consensus) fn has_history_identity(&self) -> bool {
+        !self.invalid
+            && self.checks[..self.count]
+                .iter()
+                .flatten()
+                .any(|check| check.stamped && check.history)
+    }
     fn point_covered(&self, key: &str) -> bool {
         self.checks[..self.count].iter().flatten().any(|check| {
-            if !check.stamped {
+            if !check.stamped || check.history {
                 return false;
             }
             let selector =

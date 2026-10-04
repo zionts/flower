@@ -236,6 +236,21 @@ impl Consensus {
         )
     }
 
+    /// Capture complete bounded native retention input for the trusted identity
+    /// decoder ONLY. HistoryIdentity does not authorize generic Keys/KeyChunk or
+    /// callback raw retention/accounting lookup. Native projection must retain
+    /// only validated database/incarnation, then discard/unmap raw support.
+    #[cfg(feature = "sql")]
+    pub fn sql_capture_history_identity(
+        &self,
+        fence: &super::SqlCaptureFence,
+        certificate: &super::SqlCaptureCertificate,
+        buffer: super::SqlCaptureBuffer,
+    ) -> Result<super::SqlCapturedHistoryIdentity, super::SqlCaptureError> {
+        self.store
+            .sql_capture_history_identity(self.partition.as_ref(), fence, certificate, buffer)
+    }
+
     /// ONE final common coexistence revision, not the first slice or later
     /// delivery revision. The controller freezes this sourceRevision at seal,
     /// verifies range/chunk completeness, then drops capture/support/callbacks.

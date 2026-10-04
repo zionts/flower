@@ -94,14 +94,24 @@ impl Backing {
     ) -> Result<RawRange<'a>, SqlCaptureError> {
         match &self.table {
             Table::Empty => Ok(RawRange::Empty),
-            Table::Plain(table) => table
-                .resident_range(&scratch.bounds, &mut scratch.range)
-                .map(RawRange::Plain)
-                .map_err(capture_error),
-            Table::Pair(table, _) => table
-                .resident_partition_range(&scratch.bounds, &mut scratch.range)
-                .map(RawRange::Pair)
-                .map_err(capture_error),
+            Table::Plain(table) => {
+                if !scratch.matches_partition(None) {
+                    return Err(SqlCaptureError::SnapshotChanged);
+                }
+                table
+                    .resident_range(&scratch.bounds, &mut scratch.range)
+                    .map(RawRange::Plain)
+                    .map_err(capture_error)
+            }
+            Table::Pair(table, partition) => {
+                if !scratch.matches_partition(Some(partition)) {
+                    return Err(SqlCaptureError::SnapshotChanged);
+                }
+                table
+                    .resident_partition_range(&scratch.bounds, &mut scratch.range)
+                    .map(RawRange::Pair)
+                    .map_err(capture_error)
+            }
             Table::Run(_) => Err(SqlCaptureError::UnsupportedBacking),
         }
     }
