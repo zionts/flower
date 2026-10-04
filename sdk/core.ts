@@ -344,9 +344,13 @@ export interface SetOptions<T = Json> {
    */
   readonly clear?: readonly FieldOf<T>[];
 }
+export interface DeleteOptions {
+  /** Skip retainDeleted callbacks for this deletion and its foreign-key cascades. */
+  readonly permanent?: boolean;
+}
 export interface MutationContext extends QueryContext {
   set<T, K extends Json>(collection: Collection<T, K, any>, key: K, value: T, options?: SetOptions<NoInfer<T>>): void;
-  delete<T, K extends Json>(collection: Collection<T, K, any>, key: K): void;
+  delete<T, K extends Json>(collection: Collection<T, K, any>, key: K, options?: DeleteOptions): void;
   materialize<V>(derived: Derived<null, V>): void;
   materialize<A, V>(derived: Derived<A, V>, args: A): void;
   unmaterialize<V>(derived: Derived<null, V>): void;
@@ -612,6 +616,37 @@ export function trigger<T, K extends Json>(name: string, source: Collection<T, K
   if (!collectionInfos.has(source)) throw new TypeError("A trigger requires a collection");
   if (typeof run !== "function") throw new TypeError("A trigger requires a function");
   return Object.freeze({ kind: "trigger" as const, name, source, run });
+}
+
+/** The complete stored row immediately before an effective deletion. */
+export interface DeletedRow<T = Json, K = string> {
+  readonly collection: string;
+  readonly key: K;
+  readonly value: T;
+  /** Server time in epoch milliseconds, from the deleting invocation. */
+  readonly deletedAt: number;
+}
+const retentions = new WeakMap<Trigger, (ctx: MutationContext, deleted: DeletedRow<any, any>) => void>();
+/** SDK internals: retention hooks observe successful deletes, independently of net row changes. */
+export function retentionOf(each: Trigger): ((ctx: MutationContext, deleted: DeletedRow<any, any>) => void) | undefined {
+  return retentions.get(each);
+}
+/**
+ * Retain each row removed from source in the same transaction, with the application's
+ * rights. The callback receives the full final stored value, including hidden fields.
+ * Register the returned trigger in define({ triggers }) or a component. Store retained
+ * rows separately and protect them with access rules; this helper exposes no restore API.
+ * Ordinary triggers still observe net changes. Deletes followed by recreation, and rows
+ * created then deleted in one mutation, are retained too. Missing or policy-skipped deletes
+ * do nothing. delete(source, key, { permanent: true }) skips retention, also for FK cascades.
+ */
+export function retainDeleted<T, K extends Json>(name: string, source: Collection<T, K, any>,
+  retain: (ctx: MutationContext, deleted: DeletedRow<T, K>) => void): Trigger<T, K> {
+  if (typeof retain !== "function") throw new TypeError("retainDeleted requires a retain function");
+  // Retention is dispatched from successful deletion events, not this net-change callback.
+  const each = trigger(name, source, () => {});
+  retentions.set(each, retain);
+  return each;
 }
 
 export type Usable = Component | { readonly component: Component };
