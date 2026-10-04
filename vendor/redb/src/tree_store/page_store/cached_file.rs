@@ -642,7 +642,9 @@ impl PagedCachedFile {
                 .try_lock()
                 .map_err(|_| fault(ResidentReadFault::Contended))?;
             if let Some(cached) = lock.get(offset) {
-                debug_assert_eq!(cached.len(), len);
+                if cached.len() != len {
+                    return Err(fault(ResidentReadFault::Corrupt));
+                }
                 return Ok(cached.clone());
             }
         }
@@ -652,7 +654,9 @@ impl PagedCachedFile {
                 .try_read()
                 .map_err(|_| fault(ResidentReadFault::Contended))?;
             if let Some(cached) = lock.get(offset) {
-                debug_assert_eq!(cached.len(), len);
+                if cached.len() != len {
+                    return Err(fault(ResidentReadFault::Corrupt));
+                }
                 return Ok(cached.clone());
             }
         }
@@ -663,7 +667,9 @@ impl PagedCachedFile {
                 .try_lock()
                 .map_err(|_| fault(ResidentReadFault::Contended))?;
             if let Some(cached) = lock.get(offset) {
-                debug_assert_eq!(cached.len(), len);
+                if cached.len() != len {
+                    return Err(fault(ResidentReadFault::Corrupt));
+                }
                 return Ok(cached.clone());
             }
         }
@@ -1306,5 +1312,99 @@ mod test {
                 [i; 128].as_slice()
             );
         }
+    }
+
+    #[cfg(feature = "flower-resident-reads")]
+    #[test]
+    fn resident_cache_contention_cold_budget_extent_and_backend_latch_probes() {
+        use crate::resident::test_support::probe;
+        use crate::{ResidentReadFault, resident_read_fault, with_resident_reads};
+        let (backend, writes) = CountingBackend::new(1024);
+        let file = PagedCachedFile::new(Box::new(backend), 128, 1024);
+        let warm = file.read(0, 128, PageHint::Clean).unwrap();
+        let original_writes = writes.load(Ordering::SeqCst);
+        let resident = |offset, len, hint| file.read(offset, len, hint);
+        let reason = |error: crate::StorageError| resident_read_fault(&error).unwrap();
+        probe(|| {
+            with_resident_reads(usize::MAX, || {
+                assert_eq!(&*resident(0, 128, PageHint::Clean).unwrap(), &*warm);
+                assert_eq!(
+                    reason(resident(0, 64, PageHint::Clean).err().unwrap()),
+                    ResidentReadFault::Corrupt
+                );
+                assert!(matches!(
+                    reason(resident(256, 128, PageHint::Clean).err().unwrap()),
+                    ResidentReadFault::ColdPage { .. }
+                ));
+            })
+        });
+        // Same-thread held guards deterministically prove try-lock, not waiting.
+        let cache_lock = file.read_cache[0].write().unwrap();
+        probe(|| {
+            with_resident_reads(usize::MAX, || {
+                assert_eq!(
+                    reason(resident(0, 128, PageHint::Clean).err().unwrap()),
+                    ResidentReadFault::Contended
+                );
+            })
+        });
+        drop(cache_lock);
+        let write_lock = file.write_buffer_stripe(0).lock().unwrap();
+        probe(|| {
+            with_resident_reads(usize::MAX, || {
+                assert_eq!(
+                    reason(resident(0, 128, PageHint::None).err().unwrap()),
+                    ResidentReadFault::Contended
+                );
+            })
+        });
+        drop(write_lock);
+        probe(|| {
+            with_resident_reads(256, || {
+                drop(resident(0, 128, PageHint::Clean).unwrap());
+                with_resident_reads(0, || drop(resident(0, 128, PageHint::Clean).unwrap()));
+                with_resident_reads(usize::MAX, || {
+                    assert_eq!(
+                        reason(resident(0, 128, PageHint::Clean).err().unwrap()),
+                        ResidentReadFault::Budget
+                    );
+                });
+            })
+        });
+        assert_eq!(writes.load(Ordering::SeqCst), original_writes);
+        assert_eq!(&*file.read(0, 128, PageHint::Clean).unwrap(), &*warm);
+
+        // Genuine backend failures still latch: the resident change must not
+        // reinterpret an ordinary I/O failure as a cache refusal.
+        #[derive(Debug)]
+        struct Failing;
+        impl crate::StorageBackend for Failing {
+            fn len(&self) -> std::io::Result<u64> {
+                Ok(1024)
+            }
+            fn set_len(&self, _: u64) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn sync_data(&self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn write(&self, _: u64, _: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn read(&self, _: u64, _: &mut [u8]) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::Other))
+            }
+        }
+        let failed = PagedCachedFile::new(Box::new(Failing), 128, 1024);
+        let first = failed.read(0, 128, PageHint::Clean).err().unwrap();
+        assert!(matches!(first, crate::StorageError::Io(_)));
+        assert_eq!(resident_read_fault(&first), None);
+        probe(|| {
+            with_resident_reads(usize::MAX, || {
+                let later = failed.read(0, 128, PageHint::Clean).err().unwrap();
+                assert!(matches!(later, crate::StorageError::PreviousIo));
+                assert_eq!(resident_read_fault(&later), None);
+            })
+        });
     }
 }

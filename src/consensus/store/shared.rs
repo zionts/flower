@@ -164,6 +164,11 @@ impl SharedDatabase {
         self.capture_gate.try_capture_permit()
     }
 
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    pub(crate) fn sql_capture_progress(&self) -> tokio::sync::futures::OwnedNotified {
+        self.capture_gate.mutation_progress()
+    }
+
     /// Raw write-capable access requires this database's live mutation permit.
     /// The reference cannot outlive that permit. Production readers get only
     /// begin_read; fixture-only database() intentionally bypasses exclusion.

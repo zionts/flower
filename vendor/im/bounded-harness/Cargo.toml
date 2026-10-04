@@ -1,0 +1,24 @@
+# A standalone test package, not a member of Flower's workspace. It uses only
+# versions already present in Flower's lockfile; no upstream im dev-dependencies.
+[package]
+name = "flower-im-bounded-harness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+default = ["flower-bounded-reads"]
+flower-bounded-reads = ["im/flower-bounded-reads"]
+
+[dependencies]
+im = { path = "..", version = "=15.1.0", default-features = false }
+sized-chunks = "=0.6.5"
+typenum = "=1.20.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
+
+[profile.release]
+debug = true

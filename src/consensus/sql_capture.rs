@@ -3,11 +3,16 @@
 //! The capture caller reserves and supplies its buffer before acquiring a slice.
 //! Returned values own only copied bytes and scalar epoch/offset metadata. They
 //! cannot prolong any database read transaction or persistent Records root.
+#[cfg(test)]
+pub(crate) mod allocation_probe;
 mod certificate;
+mod fixed_json;
+mod scratch;
 pub use certificate::{
     SQL_CAPTURE_MAX_DEPENDENCIES, SQL_CAPTURE_MAX_DEPENDENCY_BYTES, SqlCaptureCertificate,
     SqlCaptureDependency,
 };
+pub use scratch::SqlCaptureScratch;
 
 use super::{PartitionBinding, read::ReadFence};
 use std::{fmt, ops::Range};
@@ -306,11 +311,11 @@ impl SqlCaptureBuffer {
         }
         let key = self.append(key.as_bytes())?;
         let begin = self.used;
-        let mut writer = SliceWriter {
+        fixed_json::FixedJsonWriter {
             bytes: &mut self.bytes,
             used: &mut self.used,
-        };
-        serde_json::to_writer(&mut writer, value).map_err(|_| SqlCaptureError::Oversized)?;
+        }
+        .value(value, &mut 0, 0)?;
         let body = begin..self.used;
         self.records[self.count] = Some(SqlCapturedRecord {
             key,
@@ -386,25 +391,6 @@ fn json_bound(
     // Keep the expression above explicit about each upper bound.
     size = size.max(1);
     Ok(size)
-}
-struct SliceWriter<'a> {
-    bytes: &'a mut [u8],
-    used: &'a mut usize,
-}
-impl std::io::Write for SliceWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let end = self
-            .used
-            .checked_add(bytes.len())
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| std::io::Error::other("SQL capture buffer exhausted"))?;
-        self.bytes[*self.used..end].copy_from_slice(bytes);
-        *self.used = end;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 #[derive(Debug)]

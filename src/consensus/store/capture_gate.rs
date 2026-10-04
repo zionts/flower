@@ -30,6 +30,10 @@ struct State {
 pub(super) struct CaptureGate {
     state: Mutex<State>,
     mutations: Condvar,
+    // Waiters own only Notify, not the gate/database/source. Enroll before
+    // try-capture. Only ACTUAL mutation-job completion signals progress, never
+    // a capture refusal/release that could wake itself into Busy polling.
+    progress: Arc<tokio::sync::Notify>,
 }
 
 /// Why an immediate, nonwaiting capture attempt was declined.
@@ -101,6 +105,10 @@ impl CaptureGate {
         MutationPermit { gate: self.clone() }
     }
 
+    pub(super) fn mutation_progress(&self) -> tokio::sync::futures::OwnedNotified {
+        self.progress.clone().notified_owned()
+    }
+
     pub(super) fn try_capture_permit(
         self: &Arc<Self>,
     ) -> Result<CapturePermit, CaptureUnavailable> {
@@ -136,6 +144,8 @@ impl Drop for MutationPermit {
     fn drop(&mut self) {
         let mut state = self.gate.lock();
         state.active_mutations -= 1;
+        drop(state);
+        self.gate.progress.notify_waiters();
     }
 }
 

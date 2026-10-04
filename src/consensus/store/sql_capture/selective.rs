@@ -3,11 +3,11 @@ use super::*;
 impl Store {
     /// A single common serving publication under existing physical/logical
     /// exclusion. No root is cloned; returned metadata is pre-owned/scalar.
-    fn sql_current_capture<T>(
+    pub(super) fn sql_current_capture<T>(
         &self,
         binding: Option<&PartitionBinding>,
         fence: &SqlCaptureFence,
-        operation: impl FnOnce(&Records, u64) -> Result<T, SqlCaptureError>,
+        operation: impl FnOnce(&Records, u64, u64) -> Result<T, SqlCaptureError>,
     ) -> Result<(SqlCaptureEpoch, T), SqlCaptureError> {
         if fence.store != self.inner.capture_identity || fence.partition.as_ref() != binding {
             return Err(SqlCaptureError::SnapshotChanged);
@@ -24,50 +24,61 @@ impl Store {
                 shared::CaptureUnavailable::Busy => SqlCaptureError::Busy,
                 shared::CaptureUnavailable::NextDue(due) => SqlCaptureError::Paced(due),
             })?;
-        let published = self
-            .inner
-            .published
-            .try_read()
-            .map_err(|_| SqlCaptureError::Busy)?;
-        let applied = published
-            .last_applied
-            .ok_or(SqlCaptureError::FenceNotReady)?;
-        let proof = &fence.fence;
-        if applied.index < proof.applied.index || published.revision < proof.revision {
-            return Err(SqlCaptureError::FenceNotReady);
-        }
-        if (applied.index == proof.applied.index && applied != proof.applied)
-            || applied.leader_id < proof.applied.leader_id
-            || (applied == proof.applied && published.revision != proof.revision)
-        {
-            return Err(SqlCaptureError::SnapshotChanged);
-        }
-        let (revision, data) = match binding.as_ref() {
-            Some(binding) => {
-                let snapshot =
-                    partitions::active(published.partitions.get(&binding.partition), binding)
-                        .map_err(|_| SqlCaptureError::SnapshotChanged)?;
-                (snapshot.revision, &snapshot.data)
+        let result = redb::with_resident_reads(32 * 1024 * 1024, || {
+            // Publication/source borrows live INSIDE the resident scope, so all
+            // refs/guards end before budget reset as well as before exclusion.
+            let published = self
+                .inner
+                .published
+                .try_read()
+                .map_err(|_| SqlCaptureError::Busy)?;
+            let applied = published
+                .last_applied
+                .ok_or(SqlCaptureError::FenceNotReady)?;
+            let proof = &fence.fence;
+            if applied.index < proof.applied.index || published.revision < proof.revision {
+                return Err(SqlCaptureError::FenceNotReady);
             }
-            None => (published.revision, &published.data),
-        };
-        if !data.has_valid_depth() || !data.has_valid_source_ids() {
-            return Err(SqlCaptureError::Storage);
-        }
-        let installation = self.inner.snapshot_installation.load(Ordering::Acquire);
-        let result = redb::with_resident_reads(32 * 1024 * 1024, || operation(data, installation))?;
-        drop(published);
+            if (applied.index == proof.applied.index && applied != proof.applied)
+                || applied.leader_id < proof.applied.leader_id
+                || (applied == proof.applied && published.revision != proof.revision)
+            {
+                return Err(SqlCaptureError::SnapshotChanged);
+            }
+            let (revision, data) = match binding.as_ref() {
+                Some(binding) => {
+                    let state = published
+                        .partitions
+                        .get(&binding.partition)
+                        .filter(|state| {
+                            state.info.epoch == binding.epoch
+                                && state.info.phase == super::super::super::PartitionPhase::Active
+                        })
+                        .ok_or(SqlCaptureError::SnapshotChanged)?;
+                    (state.snapshot.revision, &state.snapshot.data)
+                }
+                None => (published.revision, &published.data),
+            };
+            if !data.has_valid_depth() || !data.has_valid_source_ids() {
+                return Err(SqlCaptureError::Storage);
+            }
+            let installation = self.inner.snapshot_installation.load(Ordering::Acquire);
+            let result = operation(data, installation, revision)?;
+            drop(published);
+            Ok((
+                SqlCaptureEpoch {
+                    store: self.inner.capture_identity,
+                    installation,
+                    revision,
+                    partition: binding,
+                },
+                result,
+            ))
+        });
         drop(capture);
-        Ok((
-            SqlCaptureEpoch {
-                store: self.inner.capture_identity,
-                installation,
-                revision,
-                partition: binding,
-            },
-            result,
-        ))
+        result
     }
+
     fn sql_certificate_origin(
         &self,
         binding: Option<&PartitionBinding>,
@@ -97,7 +108,7 @@ impl Store {
             certificate.invalid = true;
             return Err(error);
         }
-        let result = self.sql_current_capture(binding, fence, |data, installation| {
+        let result = self.sql_current_capture(binding, fence, |data, installation, _revision| {
             self.sql_certificate_origin(binding, certificate, installation)?;
             certificate.check_and_stamp(data)
         });
@@ -136,11 +147,13 @@ impl Store {
         {
             return Err(SqlCaptureError::InvalidRequest);
         }
-        let (epoch, ()) = self.sql_current_capture(binding, fence, |data, installation| {
-            self.sql_certificate_origin(binding, certificate, installation)?;
-            certificate.validate(data)?;
-            data.sql_capture_raw(&request, &mut buffer)
-        })?;
+        let mut scratch = SqlCaptureScratch::prepare(fence, &request)?;
+        let (epoch, ()) =
+            self.sql_current_capture(binding, fence, |data, installation, _revision| {
+                self.sql_certificate_origin(binding, certificate, installation)?;
+                certificate.validate(data)?;
+                data.sql_capture_prepared(&request, &mut buffer, &mut scratch)
+            })?;
         Ok(SqlCapturedSlice { epoch, buffer })
     }
     pub(crate) fn sql_capture_validate(
@@ -152,10 +165,11 @@ impl Store {
         if certificate.installation.is_none() {
             return Err(SqlCaptureError::InvalidRequest);
         }
-        let (epoch, ()) = self.sql_current_capture(binding, fence, |data, installation| {
-            self.sql_certificate_origin(binding, certificate, installation)?;
-            certificate.validate(data)
-        })?;
+        let (epoch, ()) =
+            self.sql_current_capture(binding, fence, |data, installation, _revision| {
+                self.sql_certificate_origin(binding, certificate, installation)?;
+                certificate.validate(data)
+            })?;
         Ok(epoch)
     }
 }

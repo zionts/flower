@@ -108,7 +108,12 @@ pub type Result<T = (), E = StorageError> = core::result::Result<T, E>;
 #[cfg(feature = "flower-resident-reads")]
 mod resident;
 #[cfg(feature = "flower-resident-reads")]
-pub use resident::{ResidentReadFault, resident_read_fault, with_resident_reads};
+pub use resident::{ResidentReadFault, resident_read_fault, resident_scope_active, with_resident_reads};
+#[cfg(feature = "flower-resident-reads")]
+pub use tree_store::{
+    RESIDENT_COMPONENT_CAPACITY, RESIDENT_KEY_CAPACITY, ResidentKey, ResidentRange,
+    ResidentRangeBounds, ResidentRangeScratch,
+};
 
 pub mod backends;
 mod complex_types;

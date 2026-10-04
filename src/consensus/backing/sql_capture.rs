@@ -1,27 +1,32 @@
-//! Fallible raw access used only inside an epoch-checked native capture slice.
-//! No key is allocated, value parsed, memo filled, or spool block loaded here.
+//! Resident fixed-buffer access only; no allocation, decoding, or spool I/O.
 use super::*;
-use crate::consensus::sql_capture::{SQL_CAPTURE_MAX_KEY_BYTES, SqlCaptureError};
+use crate::consensus::sql_capture::{
+    SQL_CAPTURE_MAX_KEY_BYTES, SqlCaptureError, SqlCaptureScratch,
+};
 use redb::StorageError;
 
 pub(crate) fn capture_error(error: StorageError) -> SqlCaptureError {
     match redb::resident_read_fault(&error) {
         Some(redb::ResidentReadFault::ColdPage { .. }) => SqlCaptureError::ColdPage,
         Some(redb::ResidentReadFault::Contended) => SqlCaptureError::Busy,
-        Some(redb::ResidentReadFault::Budget) => SqlCaptureError::WorkLimit,
-        None => SqlCaptureError::Storage,
+        Some(redb::ResidentReadFault::Budget | redb::ResidentReadFault::Depth) => {
+            SqlCaptureError::WorkLimit
+        }
+        Some(redb::ResidentReadFault::InvalidRequest | redb::ResidentReadFault::Inactive) => {
+            SqlCaptureError::InvalidRequest
+        }
+        Some(redb::ResidentReadFault::Corrupt) | None => SqlCaptureError::Storage,
     }
 }
-
-pub(crate) enum RawKey {
-    Plain(AccessGuard<'static, &'static [u8]>),
-    Pair(AccessGuard<'static, (&'static [u8], &'static [u8])>),
+pub(crate) enum RawKey<'a> {
+    Plain(AccessGuard<'a, &'static [u8]>),
+    Pair(AccessGuard<'a, (&'static [u8], &'static [u8])>),
 }
-pub(crate) struct RawEntry {
-    key: RawKey,
-    pub(crate) value: AccessGuard<'static, &'static [u8]>,
+pub(crate) struct RawEntry<'a> {
+    key: RawKey<'a>,
+    pub(crate) value: AccessGuard<'a, &'static [u8]>,
 }
-impl RawEntry {
+impl RawEntry<'_> {
     pub(crate) fn key(&self) -> Result<&str, SqlCaptureError> {
         let bytes = match &self.key {
             RawKey::Plain(key) => key.value(),
@@ -33,13 +38,13 @@ impl RawEntry {
         std::str::from_utf8(bytes).map_err(|_| SqlCaptureError::Storage)
     }
 }
-pub(crate) enum RawRange {
+pub(crate) enum RawRange<'a> {
     Empty,
-    Plain(redb::Range<'static, &'static [u8], &'static [u8]>),
-    Pair(redb::Range<'static, (&'static [u8], &'static [u8]), &'static [u8]>),
+    Plain(redb::ResidentRange<'a, &'static [u8]>),
+    Pair(redb::ResidentRange<'a, (&'static [u8], &'static [u8])>),
 }
-impl Iterator for RawRange {
-    type Item = Result<RawEntry, SqlCaptureError>;
+impl<'a> Iterator for RawRange<'a> {
+    type Item = Result<RawEntry<'a>, SqlCaptureError>;
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Empty => None,
@@ -63,56 +68,40 @@ impl Iterator for RawRange {
     }
 }
 impl Backing {
+    #[cfg(test)]
+    pub(crate) fn capture_raw_partition(&self) -> Option<&str> {
+        match &self.table {
+            Table::Pair(_, partition) => Some(partition),
+            _ => None,
+        }
+    }
     pub(crate) fn capture_raw_get(
         &self,
         key: &str,
-    ) -> Result<Option<AccessGuard<'static, &'static [u8]>>, SqlCaptureError> {
+    ) -> Result<Option<AccessGuard<'_, &'static [u8]>>, SqlCaptureError> {
         match &self.table {
             Table::Empty => Ok(None),
-            Table::Plain(table) => table.get(key.as_bytes()).map_err(capture_error),
-            Table::Pair(table, partition) => {
-                if partition.len() > SQL_CAPTURE_MAX_KEY_BYTES {
-                    return Err(SqlCaptureError::Oversized);
-                }
-                table
-                    .get((partition.as_bytes(), key.as_bytes()))
-                    .map_err(capture_error)
-            }
+            Table::Plain(table) => table.resident_get(key.as_bytes()).map_err(capture_error),
+            Table::Pair(table, partition) => table
+                .resident_get_pair(partition.as_bytes(), key.as_bytes())
+                .map_err(capture_error),
             Table::Run(_) => Err(SqlCaptureError::UnsupportedBacking),
         }
     }
-    pub(crate) fn capture_raw_range(
-        &self,
-        lower: Bound<&str>,
-        upper_bound: Bound<&str>,
-    ) -> Result<RawRange, SqlCaptureError> {
+    pub(crate) fn capture_raw_range<'a>(
+        &'a self,
+        scratch: &'a mut SqlCaptureScratch,
+    ) -> Result<RawRange<'a>, SqlCaptureError> {
         match &self.table {
             Table::Empty => Ok(RawRange::Empty),
             Table::Plain(table) => table
-                .range::<&[u8]>((lower.map(str::as_bytes), upper_bound.map(str::as_bytes)))
+                .resident_range(&scratch.bounds, &mut scratch.range)
                 .map(RawRange::Plain)
                 .map_err(capture_error),
-            Table::Pair(table, partition) => {
-                if partition.len() > SQL_CAPTURE_MAX_KEY_BYTES {
-                    return Err(SqlCaptureError::Oversized);
-                }
-                let after = upper(partition);
-                let partition = partition.as_bytes();
-                let lower = match lower {
-                    Bound::Included(key) => Bound::Included((partition, key.as_bytes())),
-                    Bound::Excluded(key) => Bound::Excluded((partition, key.as_bytes())),
-                    Bound::Unbounded => Bound::Included((partition, &b""[..])),
-                };
-                let upper = match upper_bound {
-                    Bound::Included(key) => Bound::Included((partition, key.as_bytes())),
-                    Bound::Excluded(key) => Bound::Excluded((partition, key.as_bytes())),
-                    Bound::Unbounded => Bound::Excluded((after.as_bytes(), &b""[..])),
-                };
-                table
-                    .range::<(&[u8], &[u8])>((lower, upper))
-                    .map(RawRange::Pair)
-                    .map_err(capture_error)
-            }
+            Table::Pair(table, _) => table
+                .resident_partition_range(&scratch.bounds, &mut scratch.range)
+                .map(RawRange::Pair)
+                .map_err(capture_error),
             Table::Run(_) => Err(SqlCaptureError::UnsupportedBacking),
         }
     }

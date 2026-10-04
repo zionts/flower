@@ -1252,6 +1252,10 @@ impl TransactionalMemory {
     // failed allocation aborts the process instead of returning an error.
     fn check_page_order(page: PageNumber) -> Result<()> {
         if page.page_order > MAX_MAX_PAGE_ORDER {
+            #[cfg(feature = "flower-resident-reads")]
+            if crate::resident::active() {
+                return Err(crate::resident::fault(crate::ResidentReadFault::Corrupt));
+            }
             return Err(StorageError::Corrupted(format!(
                 "Page {page:?} has order greater than the maximum of {MAX_MAX_PAGE_ORDER}"
             )));
@@ -1904,6 +1908,28 @@ impl TransactionalMemory {
 
     pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
         Self::check_page_order(page_number)?;
+        #[cfg(feature = "flower-resident-reads")]
+        if crate::resident::active() {
+            // Validate before address_range's debug assertion and arithmetic.
+            let extent = page_number.page_size_bytes(self.page_size);
+            let regional = u64::from(page_number.page_index)
+                .checked_mul(extent)
+                .and_then(|x| x.checked_add(self.region_header_with_padding_size));
+            let end = regional.and_then(|regional| {
+                u64::from(page_number.region)
+                    .checked_mul(self.region_size)
+                    .and_then(|x| x.checked_add(u64::from(self.page_size)))
+                    .and_then(|x| x.checked_add(regional))
+                    .and_then(|x| x.checked_add(extent))
+            });
+            if regional
+                .and_then(|x| x.checked_add(extent))
+                .is_none_or(|x| x > self.region_size)
+                || end.is_none()
+            {
+                return Err(crate::resident::fault(crate::ResidentReadFault::Corrupt));
+            }
+        }
         let range = page_number.address_range(
             self.page_size.into(),
             self.region_size,

@@ -191,6 +191,19 @@ impl Consensus {
             .sql_capture_slice(self.partition.as_ref(), fence, expected, request, buffer)
     }
 
+    /// A small root-free ACTUAL storage-completion event. Pin this future and
+    /// call `.as_mut().enable()` BEFORE the capture attempt to avoid lost wakes;
+    /// after Busy await it with the original cancel/deadline, then try once.
+    /// This owns only Notify (not Consensus/Store/Database). It deliberately
+    /// does not signal a caller's own capture refusal/release, preventing Busy
+    /// polling disguised as progress. Cache/other-capture-only contention may
+    /// be returned as Busy rather than retried; no notification is guaranteed
+    /// without an actual storage mutation. Paced uses its supplied timer.
+    #[cfg(feature = "sql")]
+    pub fn sql_capture_progress(&self) -> tokio::sync::futures::OwnedNotified {
+        self.store.sql_capture_progress()
+    }
+
     /// Enroll bounded dependencies only after validating all previous stamps
     /// together against this publication. No source handles are retained.
     #[cfg(feature = "sql")]
