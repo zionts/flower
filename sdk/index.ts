@@ -44,4 +44,4 @@ export { sqlTable, sqlCatalog } from "./sql.ts";
 export type { SqlCell, JsonScalar, SqlColumn, SqlIndex, SqlRelationship, SqlReadContext, SqlProviderContext, SqlAuthorityContext, SqlProviderInput, SqlProjectedRow, SqlProviderBatch, SqlAuthorityRequest, SqlAuthorityDecision, SqlTableSpec, SqlTable, SqlCatalogSpec, SqlCatalog, SqlQueryInput, SqlResultColumn, SqlResult, SqlExecution, SqlCatalogColumn, SqlCatalogInfo, SqlExplain, SqlContext } from "./sql.ts";
 
 export { sqlMethod } from "./sql-method.ts";
-export type { SqlOperation, SqlTerminalRequest, SqlFinishBinding, SqlFinishMetadata, SqlFinishContext, SqlPublicResult, SqlOperationResult, SqlFinishInput, SqlMethodSpec, SqlTerminalMetadata } from "./sql-method.ts";
+export type { SqlOperation, SqlCancelResultShape, SqlTerminalRequest, SqlFinishBinding, SqlFinishMetadata, SqlFinishContext, SqlPublicResult, SqlOperationResult, SqlFinishInput, SqlMethodSpec, SqlTerminalMetadata } from "./sql-method.ts";

@@ -227,6 +227,8 @@ impl Catalog {
 pub(crate) struct TerminalMethod {
     pub catalog: String,
     pub operation: Operation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_result: Option<CancelResultShape>,
     pub finalizer: String,
     #[serde(default)]
     pub signing_keys: Vec<serde_json::Value>,
@@ -240,12 +242,20 @@ pub(crate) enum Operation {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CancelResultShape {
+    Boolean,
+    Cancelled,
+}
 impl TerminalMethod {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if !identifier(&self.catalog)
             || self.finalizer.is_empty()
-            || self.finalizer.len() > 256
+            || self.finalizer.len() > 384
             || self.signing_keys.len() > 8
+            || (self.operation == Operation::Cancel && !self.signing_keys.is_empty())
+            || (self.operation != Operation::Cancel && self.cancel_result.is_some())
         {
             return Err("Invalid terminal SQL metadata");
         }
@@ -262,4 +272,32 @@ impl TerminalMethod {
         }
         Ok(())
     }
+
+    /// Closed native cancellation output. The actual terminal descriptor,
+    /// verified live owner and authorization must be checked by the controller;
+    /// this formatter is not an authority verifier or a guest finalizer.
+    /// It performs no source read, projection, signing or allocation.
+    pub(crate) fn native_cancel_result(
+        &self,
+        cancelled: bool,
+    ) -> Result<&'static [u8], &'static str> {
+        if self.operation != Operation::Cancel || !self.signing_keys.is_empty() {
+            return Err("Invalid terminal SQL cancellation");
+        }
+        Ok(
+            match (
+                self.cancel_result.unwrap_or(CancelResultShape::Boolean),
+                cancelled,
+            ) {
+                (CancelResultShape::Boolean, false) => b"false",
+                (CancelResultShape::Boolean, true) => b"true",
+                (CancelResultShape::Cancelled, false) => b"{\"cancelled\":false}",
+                (CancelResultShape::Cancelled, true) => b"{\"cancelled\":true}",
+            },
+        )
+    }
 }
+
+#[cfg(test)]
+#[path = "sql/metadata_tests.rs"]
+mod metadata_tests;

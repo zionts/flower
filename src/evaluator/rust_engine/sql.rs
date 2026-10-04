@@ -183,6 +183,9 @@ impl Engine<'_> {
             .first()
             .and_then(Value::as_str)
             .ok_or_else(|| EngineError::new("SQL_INPUT_INVALID", "SQL operation required"))?;
+        if !matches!(operation, "query" | "explain" | "catalog" | "cancel") {
+            return self.abort("SQL_INPUT_INVALID", "Unknown SQL operation");
+        }
         let name = arguments
             .get(1)
             .and_then(Value::as_str)
@@ -238,7 +241,7 @@ impl Engine<'_> {
         let original_system = self.system;
         let original_access = std::mem::take(&mut self.access);
         self.system = true;
-        let request = json!({"catalog":registered.name,"invoker":self.principal,"purpose":purpose});
+        let request = json!({"catalog":registered.name,"operation":operation,"invoker":self.principal,"purpose":purpose});
         let decision = self.sql_callback(Callback::Authority, &registered.authority, &request);
         self.system = original_system;
         self.access = original_access;

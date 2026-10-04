@@ -5,6 +5,7 @@ import type { Json } from "./json.ts";
 import { sqlDeclaration, type SqlCatalog, type SqlCatalogInfo, type SqlExecution, type SqlExplain, type SqlQueryInput, type SqlResult } from "./sql.ts";
 
 export type SqlOperation = "query" | "explain" | "catalog" | "cancel";
+export type SqlCancelResultShape = "boolean" | "cancelled";
 export interface SqlTerminalRequest {
   readonly input: SqlQueryInput | {readonly queryId: string} | null;
   /** Untrusted request purpose; only deployed authority validation can confer rights. */
@@ -43,18 +44,21 @@ export interface SqlFinishInput<O extends SqlOperation = SqlOperation> {
 export interface SqlMethodSpec<A, O extends SqlOperation, V = SqlPublicResult<O>> {
   readonly catalog: SqlCatalog;
   readonly operation: O;
+  /** Closed native cancellation formatting only; never a guest/caller choice. */
+  readonly cancelResult?: O extends "cancel" ? SqlCancelResultShape : never;
   readonly args?: SchemaLike<A>;
   readonly access?: Access<A>;
   /** Readless: receives only actual verified invoker and validated method args. */
   readonly plan?: (invoker: Principal | null, args: A) => SqlTerminalRequest;
   /** Runs only after fresh native authority/source/expiry/code/history validation. */
-  readonly finalize?: (ctx: SqlFinishContext, execution: SqlOperationResult<O>, metadata: SqlFinishMetadata) => V;
+  readonly finalize?: O extends "cancel" ? never : (ctx: SqlFinishContext, execution: SqlOperationResult<O>, metadata: SqlFinishMetadata) => V;
   /** Native finalizer signing is restricted to these declared keys and signing operations. */
-  readonly signingKeys?: readonly ManagedKey[];
+  readonly signingKeys?: O extends "cancel" ? never : readonly ManagedKey[];
 }
 export interface SqlTerminalMetadata {
   readonly catalog: string;
   readonly operation: SqlOperation;
+  readonly cancelResult?: SqlCancelResultShape;
   readonly finalizer: string;
   readonly signingKeys: readonly ManagedKey[];
 }
@@ -65,12 +69,14 @@ interface Info {
 }
 const infos = new WeakMap<object, Info>();
 
+export function sqlMethod<S extends SchemaLike<any>>(name: string, spec: SqlMethodSpec<Infer<S>, "cancel", {readonly cancelled:boolean}> & {readonly args:S;readonly cancelResult:"cancelled"}): QueryMethod<Infer<S>, {readonly cancelled:boolean}>;
+export function sqlMethod<A = null>(name: string, spec: SqlMethodSpec<A, "cancel", {readonly cancelled:boolean}> & {readonly cancelResult:"cancelled"}): QueryMethod<A, {readonly cancelled:boolean}>;
 export function sqlMethod<S extends SchemaLike<any>, O extends SqlOperation, V = SqlPublicResult<O>>(name: string, spec: SqlMethodSpec<Infer<S>, O, V> & {readonly args: S}): QueryMethod<Infer<S>, V>;
 export function sqlMethod<A = null, O extends SqlOperation = "query", V = SqlPublicResult<O>>(name: string, spec: SqlMethodSpec<A, O, V>): QueryMethod<A, V>;
 /** Dedicated terminal SQL alias. No ordinary query/ctx.sql execution fallback. */
 export function sqlMethod(name: string, spec: SqlMethodSpec<any, SqlOperation, any>): QueryMethod<any, any> {
   requireName(name, "SQL method name");
-  const settings = plainObject(spec, "Terminal SQL method", ["catalog", "operation", "args", "access", "plan", "finalize", "signingKeys"]);
+  const settings = plainObject(spec, "Terminal SQL method", ["catalog", "operation", "cancelResult", "args", "access", "plan", "finalize", "signingKeys"]);
   const declaration = sqlDeclaration(settings.catalog as SqlCatalog);
   if (!["query", "explain", "catalog", "cancel"].includes(settings.operation as string)) throw new TypeError("SQL operation must be query, explain, catalog or cancel");
   if (settings.plan !== undefined && typeof settings.plan !== "function") throw new TypeError("SQL plan must be a readless function");
@@ -80,8 +86,11 @@ export function sqlMethod(name: string, spec: SqlMethodSpec<any, SqlOperation, a
   if (signingKeys.length && settings.finalize === undefined) throw new TypeError("SQL signingKeys require a finalizer");
   if (signingKeys.some((key) => !key.usages.includes("sign"))) throw new TypeError("SQL signingKeys require signing usage");
   const operation = settings.operation as SqlOperation;
+  if (settings.cancelResult !== undefined && (operation !== "cancel" || !["boolean", "cancelled"].includes(settings.cancelResult as string))) throw new TypeError("SQL cancelResult is only boolean or cancelled on a cancellation method");
+  if (operation === "cancel" && signingKeys.length) throw new TypeError("SQL cancellation cannot declare signing keys");
+  if (operation === "cancel" && settings.finalize !== undefined) throw new TypeError("SQL cancellation uses closed native formatting and cannot declare a finalizer");
   const plan = settings.plan as SqlMethodSpec<any, SqlOperation>["plan"];
-  const finalize = settings.finalize as SqlMethodSpec<any, SqlOperation>["finalize"];
+  const finalize = settings.finalize as ((ctx: SqlFinishContext, execution: SqlOperationResult<SqlOperation>, metadata: SqlFinishMetadata) => unknown) | undefined;
   const underlying = query(name, {args: settings.args as SchemaLike<any> | undefined, access: settings.access as Access<any> | undefined, cache: false, watch: false}, (ctx, args) => {
     const request = plan ? plan(ctx.principal(), args) : {input: (args ?? null) as SqlTerminalRequest["input"], purpose: null};
     plainObject(request, "SQL terminal request", ["input", "purpose"]);
@@ -89,6 +98,7 @@ export function sqlMethod(name: string, spec: SqlMethodSpec<any, SqlOperation, a
     return request;
   });
   const finalizer = Object.freeze({kind: "sqlFinalizer" as const, name: `${name}.$sql.finalize`, compute(_host: unknown, input: SqlFinishInput) {
+    if (operation === "cancel") fail("SQL_CANCEL_NATIVE_ONLY", "Cancellation uses closed native formatting");
     // These values come only from the native fresh-finish binding. This adapter
     // deliberately never binds a database host or supplies source getters.
     const binding = Object.freeze({...input.binding});
@@ -100,7 +110,7 @@ export function sqlMethod(name: string, spec: SqlMethodSpec<any, SqlOperation, a
     const metadata = Object.freeze({...binding, request: input.request});
     return finalize ? finalize(ctx, execution, metadata) : input.result;
   }});
-  infos.set(underlying, {catalog: settings.catalog as SqlCatalog, terminal: Object.freeze({catalog: declaration.manifest.name, operation, finalizer: finalizer.name, signingKeys: Object.freeze(signingKeys)}), finalizer});
+  infos.set(underlying, {catalog: settings.catalog as SqlCatalog, terminal: Object.freeze({catalog: declaration.manifest.name, operation, ...(settings.cancelResult !== undefined ? {cancelResult: settings.cancelResult as SqlCancelResultShape} : {}), finalizer: finalizer.name, signingKeys: Object.freeze(signingKeys)}), finalizer});
   return underlying as unknown as QueryMethod<any, any>;
 }
 /** SDK internals; declarations only, no method selected by client input. */

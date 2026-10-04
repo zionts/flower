@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { collection, define, key, sqlCatalog, sqlMethod, sqlTable, v, type Principal, type SqlFinishBinding, type SqlQueryInput } from "./index.ts";
+import { collection, define, key, sqlCatalog, sqlMethod, sqlTable, v, type Principal, type QueryMethod, type SqlCancelResultShape, type SqlMethodSpec, type SqlFinishBinding, type SqlQueryInput } from "./index.ts";
 import { sqlMethodInfo } from "./sql-method.ts";
 import { testDatabase } from "./testing.ts";
 const source=collection("terminal.source");
@@ -47,6 +47,15 @@ test("terminal SQL settings are default-deny and signing-key limited",()=>{
  assert.throws(()=>sqlMethod("x",{catalog,operation:"bad" as never}),/operation/);
  assert.throws(()=>sqlMethod("x",{catalog,operation:"query",cache:true} as never),/does not accept/);
  assert.throws(()=>sqlMethod("x",{catalog,operation:"query",signingKeys:[signer]}),/require a finalizer/);
+ assert.throws(()=>sqlMethod("x",{catalog,operation:"cancel",finalize:()=>true,signingKeys:[signer]} as never),/cancellation cannot declare signing keys/);
+ assert.throws(()=>sqlMethod("x",{catalog,operation:"cancel",finalize:()=>true} as never),/closed native formatting/);
+ const cancel=sqlMethod("terminal.cancel",{catalog,operation:"cancel"});
+ assert.equal(sqlMethodInfo(cancel)?.terminal.operation,"cancel");
+ const wrapped=sqlMethod("terminal.cancelWrapped",{catalog,operation:"cancel",cancelResult:"cancelled"});
+ assert.equal(sqlMethodInfo(wrapped)?.terminal.cancelResult,"cancelled");
+ assert.throws(()=>sqlMethod("x",{catalog,operation:"query",cancelResult:"cancelled"} as never),/cancelResult/);
+ assert.throws(()=>sqlMethod("x",{catalog,operation:"cancel",cancelResult:"user-chosen"} as never),/cancelResult/);
+ assert.deepEqual(sqlMethodInfo(cancel)?.terminal.signingKeys,[]);
  assert.throws(()=>sqlMethod("x",{catalog,operation:"query",finalize:()=>null,signingKeys:[key("n",{algorithm:"HS256",usages:["verify"]})]}),/signing usage/);
 });
 
@@ -69,3 +78,27 @@ test("bundled terminal argument guard crosses VM realm without evaluating its pl
  assert.throws(()=>db.query("run",{sql:1} as never),error=>(error as any)?.failure?.code==="INVALID_ARGUMENT");
  assert.throws(()=>db.query("run",{sql:"SELECT 1"} as never),error=>(error as any)?.failure?.code==="SQL_UNAVAILABLE");
 });
+
+
+test("closed cancellation shape preserves schema inference without guest finalization",()=>{
+ const shape:SqlCancelResultShape="cancelled";
+ const wrapped:QueryMethod<{queryId:string},{readonly cancelled:boolean}>=sqlMethod("terminal.typedCancel",{catalog,operation:"cancel",cancelResult:shape,args:v.object({queryId:v.string()})});
+ const plain:QueryMethod<null,boolean>=sqlMethod("terminal.typedBoolean",{catalog,operation:"cancel"});
+ const explicit:QueryMethod<null,boolean>=sqlMethod("terminal.typedExplicit",{catalog,operation:"cancel",cancelResult:"boolean"});
+ const app=define({sql:[catalog],http:{wrapped,plain,explicit}});
+ assert.equal(app.http.wrapped.terminal?.cancelResult,"cancelled");
+ assert.equal(app.http.plain.terminal?.cancelResult,undefined);
+ assert.equal(app.http.explicit.terminal?.cancelResult,"boolean");
+ assert.throws(()=>sqlMethodInfo(wrapped)!.finalizer.compute(null,{request:{input:{queryId:"ephemeral"},purpose:null},result:true,provenance:[],binding}),error=>(error as any)?.failure?.code==="SQL_CANCEL_NATIVE_ONLY"||String(error).includes("closed native formatting"));
+});
+
+// Compile-time contracts are checked by npm run typecheck; never executed.
+function closedCancellationTypes() {
+ // @ts-expect-error Cancellation has no application finalizer.
+ const callback:SqlMethodSpec<null,"cancel">={catalog,operation:"cancel",finalize:()=>true};
+ // @ts-expect-error Cancellation has no signing capability.
+ const signing:SqlMethodSpec<null,"cancel">={catalog,operation:"cancel",signingKeys:[signer]};
+ // @ts-expect-error Non-cancel operations cannot choose cancellation formatting.
+ const query:SqlMethodSpec<null,"query">={catalog,operation:"query",cancelResult:"cancelled"};
+ return [callback,signing,query];
+}

@@ -1,5 +1,6 @@
 import { collectionInfo, fail, plainObject, requireName, type Collection, type IndexMap, type Principal, type Row } from "./core.ts";
 import { canonicalJson, type Json } from "./json.ts";
+import type { SqlOperation } from "./sql-method.ts";
 
 /** Canonical transport: integers never pass through JavaScript floating point. */
 export type SqlCell = null | { readonly integer: string } | { readonly real: number } | { readonly text: string };
@@ -58,6 +59,8 @@ export interface SqlProviderBatch {
 }
 export interface SqlAuthorityRequest {
   readonly catalog: string;
+  /** Host-issued validated terminal operation; caller purpose/plan/input cannot choose it. */
+  readonly operation: SqlOperation;
   readonly invoker: Principal | null;
   readonly purpose: Json;
 }
