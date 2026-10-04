@@ -236,6 +236,13 @@ pub(in crate::consensus) struct RegistryStaging {
     control: NonNull<PoolControl>,
     slot: NonNull<RegistrySlot>,
 }
+/// Private prepared UTF-8 body, owning the existing STAGING slot. Its identity
+/// is not sealed and it cannot be read/selected/cloned as a published Cell.
+/// Preparation copies once before namespace/head/UID admission, with no source,
+/// serializer, signer, parser or other callbacks and no new heap allocation.
+pub(in crate::consensus) struct RegistryReadyBody {
+    staging: RegistryStaging,
+}
 /// Immutable root-free registry bytes. A clone adds no allocation; the slot
 /// remains charged and nonreusable until its LAST cell/witness owner drops.
 pub(in crate::consensus) struct RegistryCell {
@@ -371,6 +378,23 @@ impl RegistryPool {
         self.control == cell.control
     }
 
+    pub(super) fn owns_prepared(&self, body: &RegistryReadyBody) -> bool {
+        self.control == body.staging.control
+    }
+
+    pub(in crate::consensus) fn prepare_body(
+        &self,
+        raw_json: &[u8],
+    ) -> Result<RegistryReadyBody, RegistryError> {
+        if raw_json.is_empty()
+            || raw_json.len() > MAX_REGISTRY_BYTES
+            || std::str::from_utf8(raw_json).is_err()
+        {
+            return Err(RegistryError::Invalid);
+        }
+        self.stage()?.prepare_body(raw_json)
+    }
+
     pub(in crate::consensus) fn directory(&self) -> Result<Directory<'_>, RegistryError> {
         let header = self.header();
         let (Some(offset), Some(layout)) = (header.directory_offset, header.directory_layout)
@@ -417,6 +441,13 @@ impl RegistryPool {
     }
 
     pub(in crate::consensus) fn stage(&self) -> Result<RegistryStaging, RegistryError> {
+        // Reclaim logical final retirement BEFORE scanning for free cells, not
+        // only after an exhausted scan. Busy is a real refusal, never Capacity.
+        if self.header().directory_offset.is_some() {
+            self.directory()?
+                .reclaim_retired_native()
+                .map_err(directory_error)?;
+        }
         let guard = StageGuard::try_acquire(&self.header().stage_gate)?;
         self.stage_locked(&guard)
     }
@@ -489,36 +520,47 @@ impl Drop for RegistryPool {
 }
 
 impl RegistryStaging {
-    /// Internal source-owned constructor. This is not a parser/guest claim
-    /// about ordinary dispatch; the future opaque native Envelope must also
-    /// validate these stamps against its actual current publication atomically.
-    pub(in crate::consensus) fn seal(
-        self,
-        identity: RegistryIdentity,
-        raw_json: &[u8],
-    ) -> Result<RegistryCell, RegistryError> {
-        if !identity.valid()
-            || raw_json.is_empty()
+    // Only the external Pool preparation route is native; split seal below is
+    // a fixture/component constructor and does not imply source publication.
+    fn prepare_body(self, raw_json: &[u8]) -> Result<RegistryReadyBody, RegistryError> {
+        if raw_json.is_empty()
             || raw_json.len() > MAX_REGISTRY_BYTES
             || std::str::from_utf8(raw_json).is_err()
         {
             return Err(RegistryError::Invalid);
         }
-        // Unique STAGING ownership excludes readers/reuse of this slot. All
-        // bytes that accessors can expose are overwritten before Release.
         let data = unsafe { &mut *self.slot.as_ref().data.get() };
-        data.identity = identity.into();
         data.body_len = raw_json.len() as u32;
         data.body[..raw_json.len()].copy_from_slice(raw_json);
-        unsafe { self.slot.as_ref().references.store(1, Ordering::Release) };
+        Ok(RegistryReadyBody { staging: self })
+    }
+
+    /// Fixture/component split constructor, NOT atomic native publication.
+    pub(in crate::consensus) fn seal(
+        self,
+        identity: RegistryIdentity,
+        raw_json: &[u8],
+    ) -> Result<RegistryCell, RegistryError> {
+        if !identity.valid() {
+            return Err(RegistryError::Invalid);
+        }
+        Ok(self.prepare_body(raw_json)?.seal_native(identity))
+    }
+}
+impl RegistryReadyBody {
+    /// ONLY after checked native preflight. No body copy or fallible operation.
+    pub(super) fn seal_native(self, identity: RegistryIdentity) -> RegistryCell {
+        debug_assert!(identity.valid());
+        let staging = self.staging;
+        let data = unsafe { &mut *staging.slot.as_ref().data.get() };
+        data.identity = identity.into();
+        unsafe { staging.slot.as_ref().references.store(1, Ordering::Release) };
         let cell = RegistryCell {
-            control: self.control,
-            slot: self.slot,
+            control: staging.control,
+            slot: staging.slot,
         };
-        // Transfer exactly this slot's one pool owner; staging Drop must not
-        // free a slot now visible to immutable readers.
-        std::mem::forget(self);
-        Ok(cell)
+        std::mem::forget(staging);
+        cell
     }
 }
 impl Drop for RegistryStaging {
@@ -748,6 +790,7 @@ fn page_size() -> Result<usize, RegistryError> {
 unsafe impl Send for RegistryPool {}
 unsafe impl Sync for RegistryPool {}
 unsafe impl Send for RegistryStaging {}
+unsafe impl Send for RegistryReadyBody {}
 unsafe impl Send for RegistryCell {}
 unsafe impl Sync for RegistryCell {}
 

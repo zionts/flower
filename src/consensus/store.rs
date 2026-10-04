@@ -18,6 +18,8 @@ mod shared;
 pub use shared::SharedDatabase;
 #[cfg(feature = "sql")]
 mod sql_capture;
+#[cfg(feature = "sql")]
+mod sql_registry_meta;
 
 mod partition_storage;
 use partition_storage::*;
@@ -144,6 +146,9 @@ const DATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("application_da
 #[cfg(test)]
 const REQUESTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("application_requests_v4");
 const STATE_META: &str = "state_v4";
+// One fixed shared sidecar table. Non-SQL binaries must recognize it when
+// reopening a hosted database without treating it as a lone-replica table.
+const SQL_REGISTRY_META_NAME: &str = "sql_current_registry_v1";
 /// How far above the stored version bound a restarted process starts.
 const RESTART_MARGIN: u64 = 1 << 24;
 // Present when index entries use the current layout.
@@ -552,7 +557,7 @@ impl Store {
                 .begin_read()?
                 .list_tables()?
                 .map(|table| table.name().to_owned())
-                .filter(|name| name != shared::FILE_META.name())
+                .filter(|name| name != shared::FILE_META.name() && name != SQL_REGISTRY_META_NAME)
                 .collect();
             if prefix.is_empty() && names.iter().any(|name| name.contains('/')) {
                 bail!("{} holds the database of several hosted replicas; start it with --replica", directory.display());
@@ -1727,11 +1732,18 @@ impl RaftStateMachine<TypeConfig> for Store {
         let backing_persisted = self.inner.backing_persisted.clone();
         let rebase_rounds = self.inner.rebase_rounds.clone();
         let replaced_partitions = self.inner.replaced_partitions.clone();
-        let weak = Arc::downgrade(&self.inner);
+        // Replace the queued Weak-only owner with a strong native Store lifetime.
+        // Request cancellation must not retire the source identity while this
+        // real blocking job can still publish. The outer closure keeps it until
+        // the inner operation, all captured source guards/backings and database
+        // work have actually finished; no Snapshot/registry UID field is added.
+        let source_lifetime = self.inner.clone();
         let holders = self.inner.holders.clone();
         let changes = self.inner.changes.clone();
         let backup = self.inner.backup.clone();
-        let responses = tokio::task::spawn_blocking(move || work.run(|db| -> anyhow::Result<_> {
+        let responses = tokio::task::spawn_blocking(move || {
+            let weak = Arc::downgrade(&source_lifetime);
+            let result = work.run(move |db| -> anyhow::Result<_> {
             let span = profile.span();
             let _entered = span.enter();
             profile.phase(StoragePhase::BlockingQueue);
@@ -1902,7 +1914,12 @@ impl RaftStateMachine<TypeConfig> for Store {
             profile.phase(StoragePhase::Publish);
             profile.report(true);
             Ok(responses)
-        }))
+            });
+            // This is the actual job completion, NOT its cancelled waiter.
+            // The moved inner callback and its source owners have ended first.
+            drop(source_lifetime);
+            result
+        })
         .await
         .context("Raft apply worker")
         .and_then(|result| result)

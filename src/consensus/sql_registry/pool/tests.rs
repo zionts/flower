@@ -655,6 +655,8 @@ fn sql_registry_pool_foreign_cell_with_equal_uid_and_code_is_rejected_by_actual_
         schema: SourceStamp::present(3).unwrap(),
     };
     let directory = a.directory().unwrap();
+    directory.prepare_store_native(1).unwrap();
+    directory.ready_store_native(1).unwrap();
     let token = directory
         .register_native(origin, code, || Ok(a.issue_namespace(None).unwrap().uid))
         .unwrap();
@@ -744,6 +746,8 @@ fn sql_registry_pool_concurrent_last_external_handles_clear_current_once_and_pre
         schema: SourceStamp::present(3).unwrap(),
     };
     let directory = pool.directory().unwrap();
+    directory.prepare_store_native(1).unwrap();
+    directory.ready_store_native(1).unwrap();
     let token = directory
         .register_native(origin, code, || Ok(pool.issue_namespace(None).unwrap().uid))
         .unwrap();
@@ -868,3 +872,6 @@ fn sql_registry_bootstrap_once_only_in_isolated_startup_process() {
     );
     assert_eq!(source_registry().unwrap().control, global.control);
 }
+
+#[path = "native_tests.rs"]
+mod native_tests;

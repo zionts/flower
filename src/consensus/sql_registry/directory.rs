@@ -5,15 +5,52 @@
 //! clones only a validated CURRENT owner under the same metadata/key gate.
 //! This is NOT source validation, a native node admission owner, persistence,
 //! routing or SQL authority. Parent must admit ONE actual combined mapping.
+pub(in crate::consensus) use super::pool::RegistryReadyBody;
 use super::pool::{RegistryCell, RegistryPool};
-use super::{RegistryError, RegistryIdentity, SourceStamp};
+use super::{RegistryError, RegistryIdentity, RegistryNamespace, SourceStamp};
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MAX_HEADS: usize = 256;
+/// Exact native issuer domain: two low status bits, no truncated/hash identity.
+/// The actual Store issuer MUST refuse exhaustion at this bound, never wrap.
+pub(in crate::consensus) const MAX_NATIVE_STORE_ID: u64 = u64::MAX >> 2;
+const PREPARING: u64 = 0;
+const READY: u64 = 1;
+const FATAL: u64 = 2;
+const RETIRING: u64 = 3;
+
+/// Unknown is explicitly unavailable; it is never an implicit Ready Store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::consensus) enum SourceStatus {
+    Unregistered,
+    Preparing,
+    Ready,
+    Fatal,
+    Retiring,
+}
+fn valid_store(store: u64) -> bool {
+    store != 0 && store <= MAX_NATIVE_STORE_ID
+}
+fn status_word(store: u64, phase: u64) -> u64 {
+    debug_assert!(valid_store(store));
+    (store << 2) | phase
+}
+fn word_status(word: u64) -> SourceStatus {
+    if word == 0 {
+        return SourceStatus::Unregistered;
+    }
+    match word & 3 {
+        PREPARING => SourceStatus::Preparing,
+        READY => SourceStatus::Ready,
+        FATAL => SourceStatus::Fatal,
+        RETIRING => SourceStatus::Retiring,
+        _ => unreachable!(),
+    }
+}
 // An upper bound on this component, NOT an additional node allowance. Parent
 // must count it, cell slots, inline lease, cancellation/control and rounding
 // together within the SAME 16 MiB before any Store opens.
@@ -52,7 +89,7 @@ impl<'a> NativeOrigin<'a> {
     fn valid(self) -> bool {
         // Actual root-vs-scoped epoch rules belong to private native issuance.
         // Zero installation is supported by the existing pool identity.
-        self.store != 0 && self.epoch <= 9_007_199_254_740_991
+        valid_store(self.store) && self.epoch <= 9_007_199_254_740_991
     }
     fn kind(self) -> u64 {
         match self.key {
@@ -103,6 +140,14 @@ pub(in crate::consensus) struct HeadMetadata {
     pub(in crate::consensus) code: NativeCode,
 }
 
+/// Atomic ONE-body result. The source caller should retain this detached old
+/// owner until AFTER releasing its publication guard. No metadata/body owner
+/// is partially replaced on a refusal, and no old owner is dropped under gate.
+pub(in crate::consensus) struct NativePublication {
+    pub(in crate::consensus) metadata: HeadMetadata,
+    pub(in crate::consensus) detached: Option<RegistryCell>,
+}
+
 /// Complete object extent for Control + fixed heads + REAL cell owners + key bytes +
 /// alignment padding. No page rounding here: parent must extend its combined
 /// pool Layout with object_layout(), THEN round/admit the one actual mapping.
@@ -113,10 +158,14 @@ pub(in crate::consensus) struct DirectoryLayout {
     pub(in crate::consensus) control_bytes: usize,
     pub(in crate::consensus) head_bytes: usize,
     pub(in crate::consensus) owner_bytes: usize,
+    pub(in crate::consensus) status_bytes: usize,
+    pub(in crate::consensus) retired_owner_bytes: usize,
     pub(in crate::consensus) heads: usize,
     pub(in crate::consensus) key_bytes: usize,
     heads_offset: usize,
     owners_offset: usize,
+    statuses_offset: usize,
+    retired_owners_offset: usize,
     keys_offset: usize,
 }
 impl DirectoryLayout {
@@ -138,6 +187,12 @@ impl DirectoryLayout {
         let (layout, owners_offset) = layout
             .extend(owners)
             .map_err(|_| DirectoryError::Capacity)?;
+        let (layout, statuses_offset) = layout
+            .extend(Layout::array::<AtomicU64>(max_heads).map_err(|_| DirectoryError::Capacity)?)
+            .map_err(|_| DirectoryError::Capacity)?;
+        let (layout, retired_owners_offset) = layout
+            .extend(owners)
+            .map_err(|_| DirectoryError::Capacity)?;
         let keys = Layout::array::<u8>(key_bytes).map_err(|_| DirectoryError::Capacity)?;
         let (layout, keys_offset) = layout.extend(keys).map_err(|_| DirectoryError::Capacity)?;
         let layout = layout.pad_to_align();
@@ -150,10 +205,14 @@ impl DirectoryLayout {
             control_bytes: std::mem::size_of::<Control>(),
             head_bytes: std::mem::size_of::<Head>(),
             owner_bytes: std::mem::size_of::<Option<RegistryCell>>(),
+            status_bytes: std::mem::size_of::<AtomicU64>(),
+            retired_owner_bytes: std::mem::size_of::<Option<RegistryCell>>(),
             heads: max_heads,
             key_bytes,
             heads_offset,
             owners_offset,
+            statuses_offset,
+            retired_owners_offset,
             keys_offset,
         })
     }
@@ -166,11 +225,16 @@ impl DirectoryLayout {
 #[repr(C)]
 struct Control {
     gate: AtomicBool,
+    // Held through gate-free scratch destruction. A reentrant operation is
+    // Busy, never allowed to race reuse of initialized retired-owner scratch.
+    cleanup_gate: AtomicBool,
     counts: UnsafeCell<Counts>,
     heads: usize,
     key_bytes: usize,
     heads_offset: usize,
     owners_offset: usize,
+    statuses_offset: usize,
+    retired_owners_offset: usize,
     keys_offset: usize,
 }
 #[derive(Clone, Copy, Default)]
@@ -265,11 +329,14 @@ impl<'region> Directory<'region> {
         unsafe {
             control.as_ptr().write(Control {
                 gate: AtomicBool::new(false),
+                cleanup_gate: AtomicBool::new(false),
                 counts: UnsafeCell::new(Counts::default()),
                 heads: layout.heads,
                 key_bytes: layout.key_bytes,
                 heads_offset: layout.heads_offset,
                 owners_offset: layout.owners_offset,
+                statuses_offset: layout.statuses_offset,
+                retired_owners_offset: layout.retired_owners_offset,
                 keys_offset: layout.keys_offset,
             });
             for index in 0..layout.heads {
@@ -284,6 +351,18 @@ impl<'region> Directory<'region> {
                 region
                     .as_mut_ptr()
                     .add(layout.owners_offset)
+                    .cast::<UnsafeCell<Option<RegistryCell>>>()
+                    .add(index)
+                    .write(UnsafeCell::new(None));
+                region
+                    .as_mut_ptr()
+                    .add(layout.statuses_offset)
+                    .cast::<AtomicU64>()
+                    .add(index)
+                    .write(AtomicU64::new(0));
+                region
+                    .as_mut_ptr()
+                    .add(layout.retired_owners_offset)
                     .cast::<UnsafeCell<Option<RegistryCell>>>()
                     .add(index)
                     .write(UnsafeCell::new(None));
@@ -326,6 +405,11 @@ impl<'region> Directory<'region> {
         debug_assert_eq!(directory.header().heads_offset, layout.heads_offset);
         debug_assert_eq!(directory.header().owners_offset, layout.owners_offset);
         debug_assert_eq!(directory.header().keys_offset, layout.keys_offset);
+        debug_assert_eq!(directory.header().statuses_offset, layout.statuses_offset);
+        debug_assert_eq!(
+            directory.header().retired_owners_offset,
+            layout.retired_owners_offset
+        );
         directory
     }
 
@@ -346,6 +430,282 @@ impl<'region> Directory<'region> {
         directory.clear_exclusive();
     }
 
+    /// Private NATIVE startup only, BEFORE exposing the actual Store. The
+    /// issuer must supply a NEVER-REUSED identity in the explicit native domain.
+    /// Slot count equals the configured head count, with no independent map or
+    /// default. A Fatal/Preparing/Ready identity cannot be registered/reset.
+    pub(in crate::consensus) fn prepare_store_native(
+        &self,
+        store: u64,
+    ) -> Result<(), DirectoryError> {
+        if !valid_store(store) {
+            return Err(DirectoryError::Invalid);
+        }
+        let _guard = self.lock()?;
+        if self.store_status_native(store)? != SourceStatus::Unregistered {
+            return Err(DirectoryError::AlreadyCurrent);
+        }
+        let slot = (0..self.header().heads)
+            .find(|&index| self.status_slot(index).load(Ordering::Acquire) == 0)
+            .ok_or(DirectoryError::Capacity)?;
+        self.status_slot(slot)
+            .store(status_word(store, PREPARING), Ordering::Release);
+        Ok(())
+    }
+
+    /// One-way private startup seal, NOT a caller-controlled Ready/Fatal bool.
+    /// Fatal is sticky; only actual final retirement and a NEW native identity
+    /// allow recovery. Preparing must not be exposed to any source consumer.
+    pub(in crate::consensus) fn ready_store_native(
+        &self,
+        store: u64,
+    ) -> Result<(), DirectoryError> {
+        if !valid_store(store) {
+            return Err(DirectoryError::Invalid);
+        }
+        let _guard = self.lock()?;
+        for index in 0..self.header().heads {
+            let slot = self.status_slot(index);
+            if slot.load(Ordering::Acquire) >> 2 == store {
+                return slot
+                    .compare_exchange(
+                        status_word(store, PREPARING),
+                        status_word(store, READY),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map(|_| ())
+                    .map_err(|_| DirectoryError::CurrentUnavailable);
+            }
+        }
+        Err(DirectoryError::CurrentUnavailable)
+    }
+
+    /// Bounded exact native identity scan. Neither a pointer nor hash is source
+    /// authority. Native capture/classifier/cache/final-fresh callers MUST use
+    /// this (or require_ready_native), under their real source guard.
+    pub(in crate::consensus) fn store_status_native(
+        &self,
+        store: u64,
+    ) -> Result<SourceStatus, DirectoryError> {
+        if !valid_store(store) {
+            return Err(DirectoryError::Invalid);
+        }
+        for index in 0..self.header().heads {
+            let word = self.status_slot(index).load(Ordering::Acquire);
+            if word >> 2 == store {
+                return Ok(word_status(word));
+            }
+        }
+        Ok(SourceStatus::Unregistered)
+    }
+    pub(in crate::consensus) fn require_ready_native(
+        &self,
+        store: u64,
+    ) -> Result<(), DirectoryError> {
+        match self.store_status_native(store)? {
+            SourceStatus::Ready => Ok(()),
+            _ => Err(DirectoryError::CurrentUnavailable),
+        }
+    }
+
+    /// Mark BEFORE unlocking the SAME actual source publication write guard
+    /// on partial failure or unwind. Does not need the Directory gate, allocate,
+    /// wait, or affect any other Store. Two fixed CAS attempts cover the only
+    /// competing forward transition Preparing -> Ready; never reset Fatal.
+    /// Fatal/Retiring/Unregistered are all fail-closed for source use. The parent
+    /// must retain an actual registered Store lifetime while using this API.
+    pub(in crate::consensus) fn fatal_store_native(
+        &self,
+        store: u64,
+    ) -> Result<SourceStatus, DirectoryError> {
+        if !valid_store(store) {
+            return Err(DirectoryError::Invalid);
+        }
+        for index in 0..self.header().heads {
+            let slot = self.status_slot(index);
+            let mut word = slot.load(Ordering::Acquire);
+            for _ in 0..2 {
+                if word >> 2 != store {
+                    break;
+                }
+                match word_status(word) {
+                    SourceStatus::Fatal | SourceStatus::Retiring => return Ok(word_status(word)),
+                    _ => {}
+                }
+                match slot.compare_exchange(
+                    word,
+                    status_word(store, FATAL),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Ok(SourceStatus::Fatal),
+                    Err(actual) => word = actual,
+                }
+            }
+            if word >> 2 == store {
+                return Ok(word_status(word)); // only Fatal/Retiring after two forward races
+            }
+        }
+        Ok(SourceStatus::Unregistered)
+    }
+
+    /// Actual final InnerDrop only. One bounded sweep, with at most three CAS
+    /// attempts per slot (acyclic Preparing -> Ready -> Fatal -> Retiring), no
+    /// wait/poll/queue/spawn. Exact whole-word comparisons protect slot reuse.
+    /// Busy means the logical Retiring mark remains, not a lost finalization.
+    /// EVERY next successful Directory gate and body preparation reclaims it.
+    pub(in crate::consensus) fn retire_store_native(
+        &self,
+        store: u64,
+    ) -> Result<(), DirectoryError> {
+        if !valid_store(store) {
+            return Err(DirectoryError::Invalid);
+        }
+        for index in 0..self.header().heads {
+            let slot = self.status_slot(index);
+            let mut word = slot.load(Ordering::Acquire);
+            for _ in 0..3 {
+                if word >> 2 != store || word & 3 == RETIRING {
+                    break;
+                }
+                match slot.compare_exchange(
+                    word,
+                    status_word(store, RETIRING),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => word = actual,
+                }
+            }
+        }
+        // lock performs the bounded reclamation; Drop releases before owners.
+        drop(self.lock()?);
+        Ok(())
+    }
+
+    /// Body preparation calls this BEFORE a possible pool-cell Capacity result.
+    /// Busy is explicit, not disguised as exhaustion. No source refs/callbacks.
+    pub(super) fn reclaim_retired_native(&self) -> Result<(), DirectoryError> {
+        drop(self.lock()?);
+        Ok(())
+    }
+
+    /// ATOMIC ONE namespace publication, NOT an atomic grouped transaction.
+    /// Body bytes already exist in one private SAME-pool STAGING slot; all
+    /// fallible capacity/correlation/status/UID work precedes live mutation.
+    /// Expected correlates the OLD incarnation at the exact next key; a changed
+    /// install/epoch issues a fresh private UID, while same incarnation retains
+    /// its UID. Identity sealing after preflight is infallible and copies NO
+    /// body bytes. Head/key/count/current owner move under ONE Directory gate.
+    /// The parent must still hold the actual source publication write guard.
+    pub(in crate::consensus) fn publish_prepared_native(
+        &self,
+        origin: NativeOrigin<'_>,
+        expected: Option<NativeHeadToken>,
+        code: NativeCode,
+        body: RegistryReadyBody,
+    ) -> Result<NativePublication, DirectoryError> {
+        if !origin.valid() || !code.valid() {
+            return Err(DirectoryError::Invalid);
+        }
+        let pool = self.pool.ok_or(DirectoryError::Invalid)?;
+        if !pool.owns_prepared(&body) {
+            return Err(DirectoryError::CurrentUnavailable);
+        }
+        let guard = self.lock()?;
+        self.require_ready_native(origin.store)?;
+        let existing = self.find_key(&guard, origin).index;
+        let (index, old, offset) = match (existing, expected) {
+            (Some(index), Some(token)) => {
+                let old = self.head(&guard, index);
+                if old.token() != token
+                    || token.store != origin.store
+                    || token.kind != origin.kind()
+                {
+                    return Err(DirectoryError::Stale);
+                }
+                (index, Some(old), old.offset)
+            }
+            (Some(_), None) => return Err(DirectoryError::AlreadyCurrent),
+            (None, Some(_)) => return Err(DirectoryError::Stale),
+            (None, None) => {
+                let index = (0..self.header().heads)
+                    .find(|&index| self.head(&guard, index).uid == 0)
+                    .ok_or(DirectoryError::Capacity)?;
+                let offset = self
+                    .first_fit(&guard, origin.bytes().len())
+                    .offset
+                    .ok_or(DirectoryError::Capacity)?;
+                (index, None, offset)
+            }
+        };
+        let uid = if let Some(old) =
+            old.filter(|old| old.installation == origin.installation && old.epoch == origin.epoch)
+        {
+            old.uid
+        } else {
+            pool.issue_namespace((origin.epoch != 0).then_some(origin.epoch))
+                .map_err(|error| match error {
+                    RegistryError::Capacity => DirectoryError::Capacity,
+                    RegistryError::Busy => DirectoryError::Busy,
+                    _ => DirectoryError::Invalid,
+                })?
+                .uid
+        };
+        // A spent UID is never recycled on a late status refusal. Actual source
+        // guard/lifetime wiring prevents final Drop racing this publication.
+        self.require_ready_native(origin.store)?;
+        let head = Head {
+            store: origin.store,
+            installation: origin.installation,
+            epoch: origin.epoch,
+            kind: origin.kind(),
+            uid,
+            registry: code.registry,
+            bundle: code.bundle,
+            schema: code.schema.stored_word(),
+            offset,
+            len: origin.bytes().len(),
+        };
+        let identity = RegistryIdentity {
+            store: origin.store,
+            installation: origin.installation,
+            registry: code.registry,
+            bundle: code.bundle,
+            schema: code.schema,
+            namespace: RegistryNamespace {
+                uid,
+                epoch: origin.epoch,
+            },
+        };
+        // NO remaining fallible checks, callback, allocation, serialization or
+        // parser work; the body is sealed exactly once after checked preflight.
+        let cell = body.seal_native(identity);
+        if old.is_none() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    origin.bytes().as_ptr(),
+                    self.keys().add(offset),
+                    head.len,
+                )
+            };
+            let mut counts = self.counts(&guard);
+            counts.heads += 1;
+            counts.key_bytes += head.len;
+            self.write_counts(&guard, counts);
+        }
+        self.write_head(&guard, index, head);
+        let detached = self.replace_owner(&guard, index, cell);
+        drop(guard);
+        Ok(NativePublication {
+            metadata: head.metadata(),
+            detached,
+        })
+    }
+
+    /// FIXTURE/component split operation, NOT a source publication transaction.
     /// Native source ONLY. Callback must be a private nonwaiting/no-allocation
     /// issuance from the same pool counter (e.g. pool.issue_namespace(epoch)),
     /// never a guest/caller UID/hash/pointer or a separate counter. We invoke it
@@ -415,9 +775,12 @@ impl<'region> Directory<'region> {
             return Err(DirectoryError::Invalid);
         }
         let guard = self.lock()?;
-        Ok(self.correlate(&guard, origin, expected)?.1.metadata())
+        let head = self.correlate(&guard, origin, expected)?.1;
+        self.require_ready_native(origin.store)?;
+        Ok(head.metadata())
     }
 
+    /// FIXTURE/component split operation, NOT a source publication transaction.
     /// Changed registry/code pair immediately replaces current metadata. There
     /// is no old body alias, and no attachment/weak-slot fallback. Parent must
     /// atomically attach a matching real owned Cell before body selection works.
@@ -444,6 +807,7 @@ impl<'region> Directory<'region> {
         Ok(head.metadata())
     }
 
+    /// FIXTURE/component split operation, NOT a source publication transaction.
     /// Attach one REAL immutable owner to the exact CURRENT origin/token/code.
     /// Caller scalars are correlation, not native source authority. Mismatches
     /// refuse; even on refusal the input cell is dropped AFTER releasing the
@@ -511,6 +875,7 @@ impl<'region> Directory<'region> {
         if !head.matches(cell.identity()) || self.pool.is_some_and(|pool| !pool.owns_cell(cell)) {
             return Err(DirectoryError::CurrentUnavailable);
         }
+        self.require_ready_native(origin.store)?;
         cell.try_clone().map_err(|error| match error {
             RegistryError::Capacity => DirectoryError::Capacity,
             RegistryError::Busy => DirectoryError::Busy,
@@ -588,6 +953,9 @@ impl<'region> Directory<'region> {
         let guard = self.lock().expect("exclusive directory clear");
         unsafe { self.keys().write_bytes(0, self.header().key_bytes) };
         self.write_counts(&guard, Counts::default());
+        for index in 0..self.header().heads {
+            self.status_slot(index).store(0, Ordering::Release);
+        }
     }
 
     fn header(&self) -> &Control {
@@ -596,7 +964,70 @@ impl<'region> Directory<'region> {
         unsafe { self.control.as_ref() }
     }
     fn lock(&self) -> Result<Guard<'_>, DirectoryError> {
-        Guard::acquire(&self.header().gate)
+        let guard = Guard::acquire(self.header(), self.retired_pointer())?;
+        self.reclaim_retired_locked(&guard);
+        Ok(guard)
+    }
+    fn status_slot(&self, index: usize) -> &AtomicU64 {
+        debug_assert!(index < self.header().heads);
+        unsafe {
+            &*self
+                .control
+                .as_ptr()
+                .cast::<u8>()
+                .add(self.header().statuses_offset)
+                .cast::<AtomicU64>()
+                .add(index)
+        }
+    }
+    fn retired_pointer(&self) -> NonNull<UnsafeCell<Option<RegistryCell>>> {
+        unsafe {
+            NonNull::new_unchecked(
+                self.control
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(self.header().retired_owners_offset)
+                    .cast(),
+            )
+        }
+    }
+    fn reclaim_retired_locked(&self, guard: &Guard<'_>) {
+        // Fixed at most H status slots x H heads, no historical queue/map.
+        // Cleanup scratch is also in this SAME mapping and protected by the
+        // cleanup gate until AFTER every detached owner's destructor finishes.
+        for slot in 0..self.header().heads {
+            let word = self.status_slot(slot).load(Ordering::Acquire);
+            if word == 0 || word & 3 != RETIRING {
+                continue;
+            }
+            let store = word >> 2;
+            for index in 0..self.header().heads {
+                let head = self.head(guard, index);
+                if head.uid == 0 || head.store != store {
+                    continue;
+                }
+                unsafe { self.keys().add(head.offset).write_bytes(0, head.len) };
+                self.write_head(guard, index, Head::default());
+                let mut counts = self.counts(guard);
+                counts.heads -= 1;
+                counts.key_bytes -= head.len;
+                self.write_counts(guard, counts);
+                let owner = self.take_owner(guard, index);
+                unsafe {
+                    let scratch = &mut *(*self.retired_pointer().as_ptr().add(index)).get();
+                    debug_assert!(scratch.is_none());
+                    *scratch = owner;
+                }
+            }
+            // Exact identity+phase CAS: a delayed old retirement cannot affect
+            // a different Store that later reuses this bounded atomic slot.
+            let _ = self.status_slot(slot).compare_exchange(
+                word,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
     fn head(&self, _guard: &Guard<'_>, index: usize) -> Head {
         debug_assert!(index < self.header().heads);
@@ -781,19 +1212,57 @@ struct ExtentSearch {
     offset: Option<usize>,
     head_visits: usize,
 }
+struct CleanupGuard<'a>(&'a AtomicBool);
+impl Drop for CleanupGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 struct Guard<'a> {
-    gate: &'a AtomicBool,
+    control: &'a Control,
+    retired: NonNull<UnsafeCell<Option<RegistryCell>>>,
+    _cleanup: CleanupGuard<'a>,
+}
+fn drain_retired(retired: NonNull<UnsafeCell<Option<RegistryCell>>>, heads: usize) {
+    // Only a held cleanup token permits access. One cell-sized temporary, never
+    // a stack/heap owner array. Taking initializes None BEFORE the destructor.
+    for index in 0..heads {
+        let owner = unsafe { (&mut *(*retired.as_ptr().add(index)).get()).take() };
+        drop(owner);
+    }
 }
 impl<'a> Guard<'a> {
-    fn acquire(gate: &'a AtomicBool) -> Result<Self, DirectoryError> {
-        gate.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+    fn acquire(
+        control: &'a Control,
+        retired: NonNull<UnsafeCell<Option<RegistryCell>>>,
+    ) -> Result<Self, DirectoryError> {
+        control
+            .cleanup_gate
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| DirectoryError::Busy)?;
-        Ok(Self { gate })
+        let cleanup = CleanupGuard(&control.cleanup_gate);
+        // A standalone fixture's concrete lease destructor may unwind. Drain
+        // its remaining initialized scratch OUTSIDE the main gate on next use;
+        // the cleanup token always releases on unwind/refusal as well.
+        drain_retired(retired, control.heads);
+        control
+            .gate
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| DirectoryError::Busy)?;
+        Ok(Self {
+            control,
+            retired,
+            _cleanup: cleanup,
+        })
     }
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        self.gate.store(false, Ordering::Release);
+        self.control.gate.store(false, Ordering::Release);
+        // Views retain an external Pool handle or exclusive region throughout.
+        // _cleanup drops after this method, even if a concrete fixture lease
+        // destructor unwinds; reentrant operations are explicitly Busy.
+        drain_retired(self.retired, self.control.heads);
     }
 }
 // Standalone region or actual borrowed pool handle keeps backing initialized.

@@ -1956,3 +1956,47 @@ fn a_mostly_free_file_compacts_when_opened_after_doubling() {
     drop(SharedDatabase::open(&path).unwrap());
     assert!(size() < 4 << 20, "{} of {grown}", size());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_apply_keeps_actual_inner_until_blocking_publication_and_source_cleanup_end() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(1, directory.path().into()).await.unwrap();
+    let weak = Arc::downgrade(&store.inner);
+    let published = store.inner.published.clone();
+    let mut changes = store.changes();
+    // Hold the REAL publication guard. The native job may be queued or blocked
+    // behind this guard, but cannot publish/finish before we release it.
+    let publication = published.read().unwrap();
+    let mut worker = store.clone();
+    let mut apply = Box::pin(worker.apply([entry(
+        1,
+        command("source-lifetime", 0, &[("key", json!({"value": 7}))], &[]),
+    )]));
+    // One executor poll starts the actual spawn_blocking job. No status loop,
+    // sleep/RSS sample, reset clock or synthetic completion is used.
+    assert!(futures_util::poll!(&mut apply).is_pending());
+    drop(apply); // Request's awaiting future is cancelled.
+    drop(worker);
+    drop(store); // The last external/non-Raft Store goes away.
+    assert!(
+        weak.upgrade().is_some(),
+        "actual blocking publisher must own Inner, not only Weak/components"
+    );
+    drop(publication);
+    // Existing native change-channel lifecycle supplies blocking events: a
+    // real publication, then closure only after all actual source owners drop.
+    let written = tokio::time::timeout(Duration::from_secs(5), changes.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(written.revision, 1);
+    assert_eq!(written.keys.as_deref(), Some(&["key".to_owned()][..]));
+    assert_eq!(published.read().unwrap().revision, 1);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), changes.recv())
+            .await
+            .unwrap(),
+        Err(tokio::sync::broadcast::error::RecvError::Closed)
+    ));
+    assert!(weak.upgrade().is_none(), "no leaked strong source lifetime");
+}

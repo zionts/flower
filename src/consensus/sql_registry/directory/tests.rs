@@ -60,6 +60,18 @@ fn code(registry: u64) -> NativeCode {
         schema: SourceStamp::present(registry + 2).unwrap(),
     }
 }
+// Explicit fixture registration: never production/native Store lifecycle proof.
+fn fixture_ready(directory: &Directory<'_>, store: u64) {
+    if directory.store_status_native(store).unwrap() == SourceStatus::Unregistered {
+        directory.prepare_store_native(store).unwrap();
+        directory.ready_store_native(store).unwrap();
+    }
+}
+fn fixture_directory(region: &mut [u8], layout: DirectoryLayout) -> Directory<'_> {
+    let directory = Directory::initialize(region, layout).unwrap();
+    fixture_ready(&directory, 1);
+    directory
+}
 fn register(directory: &Directory<'_>, issuer: &Issuer, name: &str) -> NativeHeadToken {
     directory
         .register_native(scoped(name), code(1), || issuer.issue())
@@ -97,7 +109,20 @@ fn directory_layout_counts_all_control_descriptors_arena_padding_and_has_no_page
     let (exact, owners_offset) = exact
         .extend(Layout::array::<UnsafeCell<Option<RegistryCell>>>(256).unwrap())
         .unwrap();
+    let (exact, statuses_offset) = exact
+        .extend(Layout::array::<AtomicU64>(256).unwrap())
+        .unwrap();
+    let (exact, retired_owners_offset) = exact
+        .extend(Layout::array::<UnsafeCell<Option<RegistryCell>>>(256).unwrap())
+        .unwrap();
     let (exact, keys_offset) = exact.extend(Layout::array::<u8>(8193).unwrap()).unwrap();
+    assert_eq!(layout.statuses_offset, statuses_offset);
+    assert_eq!(layout.retired_owners_offset, retired_owners_offset);
+    assert_eq!(layout.status_bytes, std::mem::size_of::<AtomicU64>());
+    assert_eq!(
+        layout.retired_owner_bytes,
+        std::mem::size_of::<Option<RegistryCell>>()
+    );
     assert_eq!(layout.object_layout(), exact.pad_to_align());
     assert_eq!(
         (
@@ -110,7 +135,11 @@ fn directory_layout_counts_all_control_descriptors_arena_padding_and_has_no_page
     assert!(
         layout.bytes
             >= layout.control_bytes
-                + (layout.head_bytes + layout.owner_bytes) * 256
+                + (layout.head_bytes
+                    + layout.owner_bytes
+                    + layout.status_bytes
+                    + layout.retired_owner_bytes)
+                    * 256
                 + layout.key_bytes
     );
     assert!(layout.bytes - (layout.keys_offset + layout.key_bytes) < layout.alignment);
@@ -131,6 +160,17 @@ fn directory_layout_counts_all_control_descriptors_arena_padding_and_has_no_page
         layout.keys_offset,
         layout.alignment,
         layout.bytes,
+    );
+    println!(
+        "directory actual mapped status_size={} retired_owner_size={} statuses_offset={} retired_owners_offset={} status_slots={} cleanup_gate_size={} ready_body_size={} publication_size={}",
+        layout.status_bytes,
+        layout.retired_owner_bytes,
+        layout.statuses_offset,
+        layout.retired_owners_offset,
+        layout.heads,
+        std::mem::size_of::<AtomicBool>(),
+        std::mem::size_of::<RegistryReadyBody>(),
+        std::mem::size_of::<NativePublication>()
     );
     assert_eq!(DirectoryLayout::new(0, 1), Err(DirectoryError::Invalid));
     assert_eq!(DirectoryLayout::new(257, 1), Err(DirectoryError::Invalid));
@@ -180,7 +220,7 @@ fn directory_initialization_rejects_bad_extent_alignment_and_mutated_accounting_
         Directory::initialize(&mut larger.bytes()[1..1 + layout.bytes], layout),
         Err(DirectoryError::Invalid)
     ));
-    let directory = assert_zero(|| Directory::initialize(region.bytes(), layout).unwrap());
+    let directory = assert_zero(|| fixture_directory(region.bytes(), layout));
     assert_eq!(
         directory.usage().unwrap(),
         DirectoryUsage {
@@ -197,7 +237,7 @@ fn directory_exact_utf8_nul_empty_and_root_same_fixture_epoch_are_distinct() {
     let key_bytes = names.iter().map(|name| name.len()).sum();
     let layout = DirectoryLayout::new(names.len() + 1, key_bytes).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     let root = directory
         .register_native(origin(NativeKey::Root), code(1), || issuer.issue())
@@ -247,7 +287,7 @@ fn directory_native_name_above_4096_succeeds_iff_actual_total_arena_has_room() {
     let name = "λ".repeat(5000); // 10,000 exact UTF-8 bytes; no ordinary-name clamp.
     let layout = DirectoryLayout::new(2, name.len()).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     let token = assert_zero(|| register(&directory, &issuer, &name));
     assert_eq!(
@@ -274,7 +314,7 @@ fn directory_native_name_above_4096_succeeds_iff_actual_total_arena_has_room() {
     );
     let smaller = DirectoryLayout::new(1, name.len() - 1).unwrap();
     let mut other = Region::new(smaller);
-    let too_small = Directory::initialize(other.bytes(), smaller).unwrap();
+    let too_small = fixture_directory(other.bytes(), smaller);
     assert_eq!(
         too_small.register_native(scoped(&name), code(1), || issuer.issue()),
         Err(DirectoryError::Capacity)
@@ -292,7 +332,7 @@ fn directory_native_name_above_4096_succeeds_iff_actual_total_arena_has_room() {
 fn directory_exact_head_and_key_refusals_have_no_effect_or_issuer_call() {
     let layout = DirectoryLayout::new(2, 5).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     let one = register(&directory, &issuer, "abc");
     let two = register(&directory, &issuer, "de");
@@ -339,7 +379,7 @@ fn directory_exact_head_and_key_refusals_have_no_effect_or_issuer_call() {
 fn directory_fragmentation_first_fit_free_and_slot_reuse_are_bounded_deterministic() {
     let layout = DirectoryLayout::new(6, 12).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     let a = register(&directory, &issuer, "aaa");
     let b = register(&directory, &issuer, "bbb");
@@ -385,7 +425,7 @@ fn directory_fragmentation_first_fit_free_and_slot_reuse_are_bounded_determinist
 fn directory_scan_total_comparison_bytes_cannot_exceed_used_disjoint_arena() {
     let layout = DirectoryLayout::new(256, 256 * 3).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     for index in 0..256u16 {
         // Three-byte stack names, no per-head heap keys even in this fixture.
@@ -407,7 +447,7 @@ fn directory_scan_total_comparison_bytes_cannot_exceed_used_disjoint_arena() {
 fn directory_updates_never_alias_old_code_and_unattached_heads_are_unavailable() {
     let layout = DirectoryLayout::new(1, 5).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     let token = register(&directory, &issuer, "alpha");
     assert_eq!(
@@ -452,7 +492,7 @@ fn directory_updates_never_alias_old_code_and_unattached_heads_are_unavailable()
 fn directory_uid_store_install_epoch_key_correlation_and_reregister_are_not_aba() {
     let layout = DirectoryLayout::new(3, 10).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     let token = register(&directory, &issuer, "alpha");
     for wrong in [
@@ -533,7 +573,7 @@ fn directory_uid_store_install_epoch_key_correlation_and_reregister_are_not_aba(
 fn directory_busy_is_nonwaiting_and_distinct_from_actual_capacity() {
     let layout = DirectoryLayout::new(1, 1).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     let token = register(&directory, &issuer, "x");
     let guard = directory.lock().unwrap();
@@ -579,7 +619,7 @@ fn directory_busy_is_nonwaiting_and_distinct_from_actual_capacity() {
 fn directory_issuer_failure_invalid_duplicate_and_unwind_leave_no_key_or_head_effect() {
     let layout = DirectoryLayout::new(3, 12).unwrap();
     let mut region = Region::new(layout);
-    let directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     let token = register(&directory, &issuer, "a");
     for result in [
@@ -653,7 +693,7 @@ fn directory_register_copy_lookup_update_retire_clear_and_drop_have_zero_rust_al
     let name = "large-name-µ".repeat(600);
     let layout = DirectoryLayout::new(2, name.len()).unwrap();
     let mut region = Region::new(layout);
-    let mut directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let mut directory = fixture_directory(region.bytes(), layout);
     let issuer = Issuer::new();
     assert_zero(|| {
         let token = register(&directory, &issuer, &name);
@@ -692,7 +732,7 @@ fn directory_register_copy_lookup_update_retire_clear_and_drop_have_zero_rust_al
 fn directory_scoped_parallel_one_shot_operations_are_safe_busy_or_success_and_zero_heap() {
     let layout = DirectoryLayout::new(4, 16).unwrap();
     let mut region = Region::new(layout);
-    let mut directory = Directory::initialize(region.bytes(), layout).unwrap();
+    let mut directory = fixture_directory(region.bytes(), layout);
     // Fixture-only counter; deliberately not an assertion of source authority.
     let issuer = AtomicU64::new(1);
     let successes = AtomicUsize::new(0);
@@ -863,6 +903,7 @@ fn register_from_pool(
     origin: NativeOrigin<'_>,
     code: NativeCode,
 ) -> (NativeHeadToken, RegistryNamespace) {
+    fixture_ready(directory, origin.store);
     let namespace = Cell::new(None);
     let token = directory
         .register_native(origin, code, || {
@@ -1472,7 +1513,7 @@ fn directory_refusal_update_remove_clear_and_drop_destroy_last_real_cell_outside
     for operation in 0..9 {
         let layout = DirectoryLayout::new(1, 0).unwrap();
         let mut region = Region::new(layout);
-        let mut directory = Directory::initialize(region.bytes(), layout).unwrap();
+        let mut directory = fixture_directory(region.bytes(), layout);
         let (pool, owner) = fixture_pool(1);
         owner.observe_standalone_gate(&directory);
         let origin = origin(NativeKey::Root);
@@ -1687,3 +1728,6 @@ fn directory_explicit_absent_schema_is_selectable_and_never_matches_present_or_o
         });
     }
 }
+
+#[path = "native_tests.rs"]
+mod native_tests;

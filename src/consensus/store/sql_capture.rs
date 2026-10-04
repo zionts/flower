@@ -5,11 +5,32 @@ use crate::consensus::sql_capture::*;
 
 static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
 pub(super) fn next_identity() -> anyhow::Result<u64> {
-    NEXT_IDENTITY
+    reserve_identity(&NEXT_IDENTITY)
+        .ok_or_else(|| anyhow::anyhow!("SQL capture store identity exhausted"))
+}
+fn reserve_identity(counter: &AtomicU64) -> Option<u64> {
+    counter
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
+            // The same real issuer feeds the mapped Store lifecycle phase tag.
+            // Reserve its two explicit phase bits; never truncate/hash/reuse a
+            // previously issued identity or reset the process-global counter.
+            (value != 0 && value <= crate::consensus::sql_registry::directory::MAX_NATIVE_STORE_ID)
+                .then(|| value + 1)
         })
-        .map_err(|_| anyhow::anyhow!("SQL capture store identity exhausted"))
+        .ok()
+}
+#[cfg(test)]
+#[test]
+fn sql_capture_actual_store_identity_issuer_refuses_phase_domain_exhaustion_without_wrap() {
+    let max = crate::consensus::sql_registry::directory::MAX_NATIVE_STORE_ID;
+    let counter = AtomicU64::new(max - 1);
+    assert_eq!(reserve_identity(&counter), Some(max - 1));
+    assert_eq!(reserve_identity(&counter), Some(max));
+    assert_eq!(reserve_identity(&counter), None);
+    assert_eq!(counter.load(Ordering::Acquire), max + 1);
+    assert_eq!(reserve_identity(&AtomicU64::new(0)), None);
+    assert_eq!(reserve_identity(&AtomicU64::new(u64::MAX)), None);
+    assert_eq!(reserve_identity(&AtomicU64::new(1)), Some(1));
 }
 impl Store {
     pub(crate) fn sql_capture_progress(&self) -> tokio::sync::futures::OwnedNotified {
