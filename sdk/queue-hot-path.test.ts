@@ -188,7 +188,7 @@ test("finish reads once and deletes once without serializing a completed job", a
   assert.throws(() => jobs.finish(ctx, { ...lease, id: "" }), /Job ID/);
 });
 
-test("empty waiting polls skip writes until half the wait remains, including the admit path", () => {
+test("empty waiting polls skip writes until three quarters of the wait remains, including the admit path", () => {
   for (const admit of [undefined, () => true]) {
     const { ctx, calls, state } = emptyContext();
     const poll = () => jobs.claimMany(ctx, "w", { max: 2, waitMs: 100, ...(admit ? { admit } : {}) });
@@ -196,20 +196,43 @@ test("empty waiting polls skip writes until half the wait remains, including the
     const initial = ctx.get(jobs.line, ["", "w"])!;
     assert.deepEqual(initial, { scope: "", owner: "w", room: 2, since: 1_000_000, expiresAt: 1_000_100 });
     calls.length = 0;
-    for (const delta of [0, 1, 25, 49]) {
+    for (const delta of [0, 1, 12, 24]) {
       state.now = 1_000_000 + delta;
       assert.deepEqual(poll(), []);
       assert.deepEqual(ctx.get(jobs.line, ["", "w"]), initial);
     }
     assert.equal(calls.some((call) => /^(set|delete) /.test(call)), false, "fresh polls perform no writes at all");
-    state.now = 1_000_050;
+    state.now = 1_000_025;
     calls.length = 0;
     poll();
     assert.deepEqual(calls.filter((call) => call.startsWith("set ")), ["set hotJobs.line"]);
-    assert.deepEqual(ctx.get(jobs.line, ["", "w"]), { ...initial, expiresAt: 1_000_150 });
-    state.now = 1_000_150;
+    assert.deepEqual(ctx.get(jobs.line, ["", "w"]), { ...initial, expiresAt: 1_000_125 });
+    state.now = 1_000_125;
     poll();
-    assert.deepEqual(ctx.get(jobs.line, ["", "w"]), { ...initial, since: 1_000_150, expiresAt: 1_000_250 }, "an expired place rejoins at the back");
+    assert.deepEqual(ctx.get(jobs.line, ["", "w"]), { ...initial, since: 1_000_125, expiresAt: 1_000_225 }, "an expired place rejoins at the back");
+  }
+});
+
+test("quarter-wait refresh boundaries keep half-wait headroom for small and odd durations", () => {
+  for (const waitMs of [1, 2, 3, 4, 5, 6, 7, 8, 9, 60_000]) {
+    for (const elapsed of new Set([0, Math.floor(waitMs / 4), Math.ceil(waitMs / 4), Math.floor(waitMs / 2), waitMs - 1, waitMs])) {
+      for (const admit of [undefined, () => true]) {
+        const { ctx, calls, state } = emptyContext();
+        const initial = state.now;
+        const poll = () => jobs.claimMany(ctx, "w", { waitMs, ...(admit ? { admit } : {}) });
+        poll();
+        state.now += elapsed;
+        calls.length = 0;
+        poll();
+        const refreshed = elapsed * 4 >= waitMs;
+        const spot = ctx.get(jobs.line, ["", "w"])!;
+        const label = `waitMs=${waitMs}, elapsed=${elapsed}, admit=${admit !== undefined}`;
+        assert.deepEqual(calls.filter((call) => call.startsWith("set ")), refreshed ? ["set hotJobs.line"] : [], label);
+        assert.equal(spot.expiresAt, initial + waitMs + (refreshed ? elapsed : 0), label);
+        assert.equal(spot.since, elapsed < waitMs ? initial : state.now, label);
+        assert.ok(spot.expiresAt - state.now - Math.floor(waitMs / 2) > waitMs / 4, label);
+      }
+    }
   }
 });
 
@@ -217,13 +240,15 @@ test("waiting polls record changed room, shorter deadlines, departures and one-m
   const { ctx, calls, state } = emptyContext();
   const spot = () => ctx.get(jobs.line, ["", "w"]);
   jobs.claimMany(ctx, "w", { max: 2, waitMs: 100 });
-  state.now++;
-  jobs.claimMany(ctx, "w", { max: 3, waitMs: 100 });
-  assert.deepEqual(spot(), { scope: "", owner: "w", room: 3, since: 1_000_000, expiresAt: 1_000_101 });
-  jobs.claimMany(ctx, "w", { max: 3, waitMs: 10 });
-  assert.equal(spot()!.expiresAt, 1_000_011, "a shorter wait takes effect immediately");
-  jobs.claimMany(ctx, "w", { max: 3, waitMs: 100 });
-  assert.equal(spot()!.expiresAt, 1_000_101, "less than half the requested wait remaining triggers an extension");
+  for (const room of [3, 1]) {
+    state.now++;
+    jobs.claimMany(ctx, "w", { max: room, waitMs: 100 });
+    assert.deepEqual(spot(), { scope: "", owner: "w", room, since: 1_000_000, expiresAt: state.now + 100 });
+  }
+  jobs.claimMany(ctx, "w", { max: 1, waitMs: 10 });
+  assert.equal(spot()!.expiresAt, state.now + 10, "a shorter wait takes effect immediately");
+  jobs.claimMany(ctx, "w", { max: 1, waitMs: 100 });
+  assert.equal(spot()!.expiresAt, state.now + 100, "less than three quarters of the requested wait remaining triggers an extension");
   calls.length = 0;
   jobs.claimMany(ctx, "w");
   assert.equal(calls.some((call) => /^(set|delete) /.test(call)), false, "omitting waitMs leaves the line alone");
@@ -252,7 +277,7 @@ test("coalesced line refreshes preserve scoped places, partial claims and actual
   poll("b", "w");
   const a = line("a", "w")!;
   const b = line("b", "w")!;
-  db.now += 48;
+  db.now += 23;
   poll("a", "w");
   assert.deepEqual(line("a", "w"), a);
   assert.deepEqual(line("b", "w"), b);
@@ -278,9 +303,9 @@ test("a coalesced waiter expires for readiness without maintenance, and half-int
   poll("first");
   db.now++;
   poll("second");
-  db.now += 48;
+  db.now += 23;
   poll("first");
-  db.now += 50;
+  db.now += 75;
   db.mutate("tenant.enqueue", { scope: "a", id: "one", payload: null });
   assert.deepEqual([ready("first"), ready("second")], [true, false]);
   db.now++;
@@ -289,9 +314,9 @@ test("a coalesced waiter expires for readiness without maintenance, and half-int
   db.mutate("finishIn", { scope: "a", lease: leaseOf(claim) });
   poll("first");
   for (let i = 0; i < 6; i++) {
-    db.now += 49;
+    db.now += 24;
     poll("first");
-    db.now++;
+    db.now += 26;
     poll("first");
     db.maintain();
     assert.deepEqual(db.query("line"), [{ scope: "a", owner: "first", room: 1, since: 1_000_100, expiresAt: db.now + 100 }]);

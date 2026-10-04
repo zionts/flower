@@ -213,8 +213,9 @@ export interface ClaimOptions<P = Json> {
    * Wait in the scope's line for this long when the claim takes fewer than `max`: while it waits,
    * `ready(ctx, owner)` tells this owner first when work comes. A claim that takes `max`, or passes 0,
    * leaves the line. Claim again at least every waitMs / 2 to keep your place: an unchanged
-   * place is refreshed only when at most half that wait remains. A shorter deadline or a
-   * change in room is written immediately.
+   * place is refreshed only when at most three quarters of that wait remains, leaving
+   * at least a quarter-wait margin beyond the next half-wait sleep. A shorter deadline
+   * or a change in room is written immediately.
    */
   readonly waitMs?: number;
   /** Checks each job before handing it out; a job it refuses is cancelled, and the claim takes the next. */
@@ -548,9 +549,10 @@ export function queue<P = Json, R = Json>(name: string, options: QueueOptions<P,
           const room = max - claims.length;
           const expiresAt = now + waitMs;
           // Empty polls need not rewrite a fresh place (and its indexes). Still record
-          // changed capacity, a shorter wait, and renewals before the place runs out.
+          // changed capacity and a shorter deadline immediately. Reserve at least a quarter
+          // wait for response/dispatch delays beyond the worker's next half-wait sleep.
           if (waiting !== null && waiting.room === room && waiting.expiresAt <= expiresAt &&
-              waiting.expiresAt - now > waitMs / 2) return;
+              waiting.expiresAt - now > waitMs * 0.75) return;
           const since = waiting !== null && waiting.expiresAt > now ? waiting.since : now;
           ctx.set(line, spot, { scope, owner, room, since, expiresAt });
         } else if (waiting !== null) ctx.delete(line, spot);
