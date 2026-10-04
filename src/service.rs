@@ -6,6 +6,10 @@ mod keys;
 mod partitions;
 mod process;
 mod query_cache;
+#[cfg(feature = "sql")]
+pub(crate) mod sql_ingress;
+#[cfg(any(feature = "sql", test))]
+pub(crate) mod sql_node;
 mod staged_deployment;
 #[cfg(test)]
 mod tests;

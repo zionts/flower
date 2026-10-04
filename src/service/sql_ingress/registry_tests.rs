@@ -1,6 +1,6 @@
 //! Tests use the exact current evaluator serde/validate/build before observation.
 use super::*;
-use crate::{allocation_probe, metadata_reference as reference};
+use crate::{allocation_probe, evaluator::metadata_reference as reference};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Duration;

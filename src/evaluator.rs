@@ -32,6 +32,20 @@ mod transactions_tests;
 mod wasm;
 mod wire;
 
+/// Classifier conformance uses the actual native serde types and registry
+/// producer. The standalone harness extracts these same definitions; this
+/// test-only bridge never substitutes a parser or affects serving visibility.
+#[cfg(all(test, feature = "sql"))]
+pub(crate) mod metadata_reference {
+    pub(crate) use super::HttpMethod;
+    use std::collections::BTreeMap;
+
+    pub(crate) fn registry(http: &BTreeMap<String, HttpMethod>) -> anyhow::Result<serde_json::Value> {
+        super::sql_registry::build(http)
+    }
+}
+
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, atomic::AtomicBool},
