@@ -18,6 +18,7 @@ mod shared;
 pub use shared::SharedDatabase;
 
 mod partition_storage;
+pub(super) mod physical;
 use partition_storage::*;
 mod retention;
 use retention::*;
@@ -298,6 +299,8 @@ struct SnapshotCapture {
 /// a later apply is committing, without waiting on its state lock.
 #[derive(Clone)]
 struct Published {
+    // Volatile publication identity: even a same-position restore invalidates a census.
+    physical_generation: u64,
     partitions: Partitions,
     last_applied: Option<LogId<u64>>,
     revision: u64,
@@ -308,6 +311,7 @@ struct Published {
 impl From<&StoredState> for Published {
     fn from(state: &StoredState) -> Self {
         Self {
+            physical_generation: physical::next_generation(),
             partitions: state.partitions.clone(),
             last_applied: state.last_applied,
             revision: state.application.revision,
@@ -412,6 +416,7 @@ impl PendingWrites {
 }
 
 struct Inner {
+    physical_identity: physical::Identity,
     id: u64,
     shared: Arc<SharedDatabase>,
     tables: Tables,
@@ -628,6 +633,7 @@ impl Store {
         lazy.update_membership(&state.membership);
         let store = Self {
             inner: Arc::new(Inner {
+                physical_identity: physical::Identity::new()?,
                 id,
                 shared,
                 tables,

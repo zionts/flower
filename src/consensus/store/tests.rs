@@ -895,6 +895,7 @@ fn store_with_database(directory: &std::path::Path, db: Database) -> Store {
     let current_snapshot = checkpoint;
     Store {
         inner: Arc::new(Inner {
+            physical_identity: physical::Identity::new().unwrap(),
             appending: Arc::new(PublishedLock::new(Vec::new())),
             pending: Default::default(),
             id: 1,

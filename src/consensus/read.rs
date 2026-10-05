@@ -116,6 +116,10 @@ impl Dispatchers {
         Self { leader, replica }
     }
 
+    pub(super) async fn replica_fence(&self) -> anyhow::Result<ReadFence> {
+        self.replica.request().await
+    }
+
     pub(super) async fn leader_fence(&self) -> anyhow::Result<ReadFence> {
         self.leader.request().await
     }

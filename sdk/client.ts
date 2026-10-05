@@ -550,6 +550,34 @@ export interface PartitionPlacement {
 export interface RebalanceMove { partition: string; source: string; destination: string; operation: string }
 export interface RebalancePlan { operation: string; groups: ClusterGroup[]; moves: RebalanceMove[]; next: number; complete: boolean }
 export interface ClusterLayout { groups: ClusterGroup[]; partitions: PartitionPlacement[]; moves: PartitionMove[]; rebalance: RebalancePlan | null }
+/** A fresh local Raft prefix; integers are decimal strings to preserve u64 precision. */
+export interface PhysicalPartitionFence { term: string; node: string; index: string; revision: string }
+/** Null means the selector is unsupported, not empty/false. No record or receipt bodies. */
+export interface PhysicalPartitionState {
+  applicationPresent: boolean; recordsPresent: boolean | null; receiptsPresent: boolean | null;
+  deploymentJobPresent: boolean; deploymentPlanPresent: boolean;
+  stagedGenerationPresent: null; cleanupPresent: null;
+}
+export type PhysicalPartitionPhase = "importing" | "staged" | "copied" | "active" | "frozen" | "retired";
+export interface PhysicalPartitionInfo {
+  partition: string; epoch: number; phase: PhysicalPartitionPhase; operation: string;
+  transfer: { partition: string; operation: string; source: string; destination: string; source_epoch: number; epoch: number } | null;
+  revision: number; digest: string | null; bytes: string; received_bytes: string; next_chunk: string; base_bytes: string;
+}
+export interface PhysicalPartitionDescriptor {
+  kind: "default" | "named"; partition: string | null; info: PhysicalPartitionInfo | null;
+  state: PhysicalPartitionState; snapshotRevision: string;
+  retainedBasePresent: boolean | null; retainedBaseRevision: string | null;
+  retainedBaseState: PhysicalPartitionState | null; importManifestPresent: boolean | null; retainedImportManifestPresent: boolean | null; chunksPresent: boolean | null;
+}
+export interface PhysicalPartitionPage {
+  scope: "local-live-store"; store: string; incarnation: string; node: string; group: string | null; storageNamespace: string;
+  persistentDatabaseIdentity: null; fence: PhysicalPartitionFence; freshReadFence: PhysicalPartitionFence;
+  items: PhysicalPartitionDescriptor[]; nextCursor: string | null; complete: boolean; defaultIncluded: boolean;
+  externalScopeDiscovered: false; coverage: "published-default-and-all-stored-named-partitions";
+  operatorFootprintManifestRequired: true; excludedScopes: string[]; unsupported: string[];
+}
+export interface PhysicalPartitionOptions { limit?: number; cursor?: string; signal?: AbortSignal }
 export interface PartitionWaitOptions { signal?: AbortSignal; timeoutMs?: number; intervalMs?: number }
 export interface KeyGenerateOptions extends ControlOptions { /** RSA modulus size; rejected for other algorithms. */ bits?: number }
 export interface KeyRevokeOptions extends ControlOptions { /** Omit to affect every version. */ version?: number }
@@ -735,6 +763,23 @@ export class FlowerAdmin {
   }
 
   /** Registered groups, placements and durable moves. */
+  /** Bounded, local-only physical copy metadata. Use a root operator client for EACH manifested store.
+   * Continue only with its opaque cursor. Drift requires discarding all prior pages and restarting.
+   * Completion covers this live store only, never other replicas, restored directories or backups.
+   * This read neither pauses writers nor authorizes retirement, cleanup or archival mutation.
+   */
+  async physicalPartitions(options: PhysicalPartitionOptions = {}): Promise<PhysicalPartitionPage> {
+    if (!options || typeof options !== "object" || Array.isArray(options) ||
+        Object.keys(options).some(key => !["limit", "cursor", "signal"].includes(key))) throw new TypeError("invalid physical census options");
+    const body: Record<string, unknown> = { scope: "local-live-store", limit: options.limit ?? 25 };
+    if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 100)) throw new TypeError("physical census limit must be 1..100");
+    if (options.cursor !== undefined) {
+      if (typeof options.cursor !== "string" || options.cursor.length > 4096 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(options.cursor)) throw new TypeError("invalid physical census cursor");
+      body.cursor = options.cursor;
+    }
+    return this.admin("/admin/partitions/physical", body, options.signal);
+  }
+
   async layout(options: { signal?: AbortSignal } = {}): Promise<ClusterLayout> {
     return this.admin("/admin/partitions/catalog", { action: "list" }, options.signal);
   }

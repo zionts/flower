@@ -798,3 +798,86 @@ console.log(await cluster.layout());
 `resize` durably balances partition counts, moving one partition at a time. It neither starts servers nor balances bytes or measured CPU. Live pre-copy, source freeze, final difference transfer, catalog cutover, destination activation and source retirement are recoverable and idempotent. The source keeps serving while its durable base is copied. After a brief freeze it sends changed records and receipts, including deletions; a large difference falls back to a full frozen image. Migration rolls forward after it starts; unavailable required groups can prolong the frozen phase. An interrupted client does not cancel the work. Logical-partition transaction methods are supported; freeze waits for unresolved participants and coordinators while completion remains available.
 
 Active routes are cached for `FLOWER_ROUTE_CACHE_MS` (default 1,000 ms). Expired routes require the catalog; a catalog outage then affects named calls and watches. Native epoch/status checks independently fence writes and fresh reads. Streams terminate on ownership changes; reconnect at the stable partition URL for a fresh snapshot. Migration retains a durable base until retirement, and export caches the complete encoded base, difference, or fallback image in memory despite chunked transport. Optional `FLOWER_PARTITION_BASE_MAX_BYTES` bounds base admission and `FLOWER_PARTITION_TAIL_MAX_BYTES` chooses when to fall back to a full frozen transfer; neither is set by default. Partition names are logical boundaries, not authentication. The [complete SDK and operations reference](https://flower.xmit.dev/reference/partitions.html#partitions) documents every method, phase, default and tradeoff.
+
+
+### Operator local physical-copy census
+
+`POST /admin/partitions/physical` uses the **normal operator bearer token**, not
+peer authentication. It is a read-only metadata endpoint on the root client,
+local to the addressed open replica/store. It does not proxy to the catalog or
+scan any directory. For example:
+
+```ts
+import { FlowerAdmin } from "@flower-js/sdk/client";
+import type { PhysicalPartitionPage } from "@flower-js/sdk/client";
+const admin = new FlowerAdmin(storeUrl, { adminToken });
+let page: PhysicalPartitionPage = await admin.physicalPartitions({ limit: 25 });
+// Preserve every page together with store/incarnation/fence and its manifested URL.
+while (page.nextCursor !== null) {
+  page = await admin.physicalPartitions({ limit: 25, cursor: page.nextCursor });
+}
+```
+
+The strict HTTP request is `{ "scope": "local-live-store", "limit": 25 }`,
+optionally with an opaque `cursor`. The positive limit defaults to 25 and is at
+most 100; unknown fields, offsets, null options, foreign scopes and malformed
+cursors are rejected. The default DB is a separate `kind: "default"`, with a
+null partition ID; a named partition called `default` is still a different item.
+All **stored native named partitions** are sought in physical ID order, including
+unregistered, importing, staged, copied, active, frozen and retired copies.
+Catalog membership is neither required nor inferred. `info` is native ownership
+metadata, not a catalog placement. `state` reports bundle, record/receipt and
+deployment-job/plan presence without returning their bodies or keys.
+`retainedBaseState` describes a native retained copy base. `importManifestPresent`
+includes a current import's native info manifest; `retainedImportManifestPresent`
+identifies the retained base/delta manifest. `chunksPresent` checks the current
+native import-buffer store (ordinary/base chunks or separate delta chunks).
+
+The response binds `scope`, a volatile open-store ID, a volatile publication
+`incarnation`, configured group label (or null), native `storageNamespace`, node ID and exact
+applied `fence`. A separately hosted replica reports its exact table namespace
+and a null group, rather than incorrectly borrowing a process-wide group label;
+the operator footprint manifest must associate its listener/namespace with its
+actual group. `freshReadFence` is a **new quorum-confirmed read fence for this request**;
+the published state is immutable and at/after it. Fence integers, snapshot revisions, and native byte/chunk
+counters are decimal strings (epochs/native revisions are safe integers). The HMAC-protected canonical cursor binds that
+store, publication, group, scope, exact fence and physical seek position. No
+snapshot pin or observation bank is retained. Any publication change, including
+a same-log/revision snapshot installation or a restart, invalidates continuation.
+On `PHYSICAL_CENSUS_DRIFT` or an invalid/foreign cursor, discard **all previous
+pages** and restart; never splice them together. Stable multi-page enumeration
+therefore requires the operator's independently established write/control
+exclusion. A one-page observation can succeed under active writes.
+
+`complete` means this stable observation has exhausted the published default DB
+and stored named-partition map **of this local live store only**. The endpoint
+cannot discover other open stores/replicas, unmounted/restored directories,
+backups or archival snapshot files. An authoritative **operator footprint
+manifest remains required**, and passive archives must remain preserved as a
+separate scope. This is not worldwide absence proof, a raw-table/directory dump,
+or authority to restore, delete, retire or collect any copy.
+
+Work is bounded by at most `limit + 1` named-map candidates, direct map seek,
+at most 32 overlay metadata slots plus one backing metadata seek per presence
+selector, 1,024 combined identity-string bytes per named descriptor, a 4,096-byte
+cursor and a **64 KiB response**. A too-large descriptor or page fails closed
+with `PHYSICAL_CENSUS_BUDGET` (HTTP 413); nothing is silently skipped. Lowering
+`limit` helps only a page-byte limit, not an oversized physical identity. These
+are endpoint-specific restrictions; existing admission, root body/output,
+application evaluation, ABI and transaction limits are unchanged.
+
+Null means **unknown/unsupported**, never false or zero: presence can remain
+unknown after the bounded overlay probe when deletions may cover a backing.
+Staged-generation and cleanup state are not inferred from job/plan presence;
+their selectors are null. Durable database/incarnation identity is not available
+from this metadata model and is explicitly null; the volatile store/publication
+identities must be associated with the external footprint manifest. Default-DB
+ownership/copy/import flags are also null, not fabricated named-partition phases.
+
+This route **does not pause anything**. Native `frozen` is evidence only of that
+named partition's serving ownership fence, not of process-wide maintenance,
+imports, other copies, controls, background work or the default DB being paused.
+Every non-retired DB/copy still needs positive enumeration **and independently
+verified pause/exclusion evidence** before a migration can proceed. Unknown
+selectors or external stores keep their corresponding operator gates open; do
+not use the endpoint as an archival mutation or migration bypass.
