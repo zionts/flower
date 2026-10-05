@@ -762,7 +762,6 @@ export class FlowerAdmin {
     return this.admin("/admin/keys", { ...body, requestId: await this.connection.requestId(options.requestId, options) }, options.signal);
   }
 
-  /** Registered groups, placements and durable moves. */
   /** Bounded, local-only physical copy metadata. Use a root operator client for EACH manifested store.
    * Continue only with its opaque cursor. Drift requires discarding all prior pages and restarting.
    * Completion covers this live store only, never other replicas, restored directories or backups.
@@ -780,6 +779,7 @@ export class FlowerAdmin {
     return this.admin("/admin/partitions/physical", body, options.signal);
   }
 
+  /** Registered groups, placements and durable moves. */
   async layout(options: { signal?: AbortSignal } = {}): Promise<ClusterLayout> {
     return this.admin("/admin/partitions/catalog", { action: "list" }, options.signal);
   }
