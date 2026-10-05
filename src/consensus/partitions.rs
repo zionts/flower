@@ -201,6 +201,17 @@ impl Partitions {
     pub fn insert(&mut self, state: PartitionState) {
         self.0.insert(state.info.partition.clone(), Arc::new(state));
     }
+    pub(super) fn after(
+        &self,
+        after: Option<&str>,
+    ) -> impl Iterator<Item = (&String, &PartitionState)> {
+        use std::ops::Bound;
+        let lower = after.map_or(Bound::Unbounded, |id| Bound::Excluded(id.to_owned()));
+        self.0
+            .range::<_, String>((lower, Bound::Unbounded))
+            .map(|(id, state)| (id, state.as_ref()))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &PartitionState)> {
         self.0.iter().map(|(id, state)| (id, state.as_ref()))
     }
@@ -962,6 +973,23 @@ impl Consensus {
 
     pub fn partition_binding(&self) -> Option<&PartitionBinding> {
         self.partition.as_ref()
+    }
+
+    /// Fresh operator census of this handle's local live physical store only.
+    pub(crate) async fn physical_partitions(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            self.partition.is_none(),
+            "PHYSICAL_CENSUS_SCOPE: requires a local root handle"
+        );
+        let fence = tokio::time::timeout(self.limits.read_timeout, self.reads.replica_fence())
+            .await
+            .context("unavailable: physical census read timed out")??;
+        self.store.physical_partitions(&fence, limit, cursor, group)
     }
 
     pub async fn list_partitions(&self) -> anyhow::Result<Vec<PartitionInfo>> {

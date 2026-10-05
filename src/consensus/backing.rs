@@ -174,6 +174,27 @@ impl Backing {
         backing
     }
 
+    /// One metadata-only seek: never copy a key or decode a stored body.
+    pub(crate) fn has_entries(&self) -> bool {
+        match &self.table {
+            Table::Empty => false,
+            Table::Plain(table) => table.len().expect("stored record count") != 0,
+            Table::Pair(table, partition) => {
+                let after = upper(partition);
+                table
+                    .range::<(&[u8], &[u8])>((
+                        Bound::Included((partition.as_bytes(), &b""[..])),
+                        Bound::Excluded((after.as_bytes(), &b""[..])),
+                    ))
+                    .expect("stored partition range")
+                    .next()
+                    .map(|entry| entry.expect("stored partition range entry"))
+                    .is_some()
+            }
+            Table::Run(run) => !run.index.is_empty(),
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         *self.len.get_or_init(|| match &self.table {
             // redb keeps a table's length in its root.

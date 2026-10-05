@@ -67,3 +67,22 @@ test("activation waits are cancellable and have a configurable deadline", async 
     assert.equal(asked, 2);
   }
 });
+
+test("physical census is an operator-local bounded read with opaque continuation", async () => {
+  const page = { scope: "local-live-store", items: [], complete: true, nextCursor: null };
+  const { admin, calls } = fixture(() => page);
+  const signal = new AbortController().signal;
+  assert.deepEqual(await admin.physicalPartitions({ signal }), page);
+  const cursor = `e30.${"a".repeat(43)}`;
+  await admin.physicalPartitions({ limit: 1, cursor, signal });
+  assert.deepEqual(calls.map(call => call.body), [
+    { scope: "local-live-store", limit: 25 }, { scope: "local-live-store", limit: 1, cursor }
+  ]);
+  assert.ok(calls.every(call => call.url === "http://gateway:7101/admin/partitions/physical" && call.init.headers.authorization === "Bearer operator" && call.init.signal === signal));
+  const before = calls.length;
+  for (const options of [{ limit: 0 }, { limit: 101 }, { limit: NaN }, { limit: 1.5 }, { limit: null },
+    { cursor: "" }, { cursor: 1 }, { cursor: "x".repeat(4097) }, { offset: 1 }, { scope: "all" }, null, []]) {
+    await assert.rejects(admin.physicalPartitions(options as any), TypeError);
+  }
+  assert.equal(calls.length, before);
+});

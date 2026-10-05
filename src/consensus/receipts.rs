@@ -143,6 +143,34 @@ impl Receipts {
         }
     }
 
+    /// Metadata-only bounded presence probe. None is an unsupported absence,
+    /// never false: an unsettled overlay can tombstone its entire backing.
+    pub(crate) fn census_presence(&self) -> Option<bool> {
+        const CANDIDATES: usize = 32;
+        if self
+            .map
+            .iter()
+            .take(CANDIDATES)
+            .any(|(_, entry)| entry.receipt.is_some())
+        {
+            return Some(true);
+        }
+        if self.map.len() > CANDIDATES {
+            return None;
+        }
+        match &self.backing {
+            None => Some(false),
+            Some(backing) => {
+                let present = backing.has_entries();
+                if !present || self.map.is_empty() {
+                    Some(present)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         let Some(backing) = &self.backing else {
             return self.map.len();

@@ -112,6 +112,7 @@ pub fn router(consensus: Consensus, admin_token: String) -> Router {
         .route("/admin/deployments", post(deployment_control))
         .route("/admin/keys", post(keys::handle))
         .route("/admin/resources", get(resource_metrics))
+        .route("/admin/partitions/physical", post(physical_partitions))
         .route("/admin/retention", post(retention::handle))
         .route("/admin/transactions", post(transaction_control))
         .merge(transactions::router())
@@ -1318,4 +1319,106 @@ async fn resource_metrics(
     metrics["storage"] = app.consensus.storage_metrics();
     metrics["process"] = process::metrics();
     Ok(Json(metrics))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhysicalPartitionsFields {
+    scope: String,
+    #[serde(default = "physical_default_limit")]
+    limit: usize,
+    #[serde(default, deserialize_with = "physical_cursor")]
+    cursor: Option<String>,
+}
+struct PhysicalPartitionsRequest(PhysicalPartitionsFields);
+impl<'de> Deserialize<'de> for PhysicalPartitionsRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Object;
+        impl<'de> serde::de::Visitor<'de> for Object {
+            type Value = PhysicalPartitionsRequest;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a physical census request object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                PhysicalPartitionsFields::deserialize(serde::de::value::MapAccessDeserializer::new(
+                    map,
+                ))
+                .map(PhysicalPartitionsRequest)
+            }
+        }
+        // Derived structs also accept JSON sequences. Require an object while
+        // preserving derived duplicate-field and unknown-field rejection.
+        decoder.deserialize_map(Object)
+    }
+}
+fn physical_default_limit() -> usize {
+    25
+}
+fn physical_cursor<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<String>, D::Error> {
+    // Missing is allowed, but an explicitly supplied null is not a cursor.
+    String::deserialize(decoder).map(Some)
+}
+
+/// A local metadata read, never forwarded through the catalog or peer control.
+async fn physical_partitions(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    RequestJson(PhysicalPartitionsRequest(input)): RequestJson<PhysicalPartitionsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if headers.get("authorization").and_then(|v| v.to_str().ok())
+        != Some(format!("Bearer {}", app.admin_token).as_str())
+    {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "operator bearer token required".into(),
+        ));
+    }
+    if input.scope != "local-live-store"
+        || !(1..=100).contains(&input.limit)
+        || input
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 4096)
+    {
+        return Err(invalid(anyhow::anyhow!(
+            "physical census requires scope local-live-store, optional limit 1..100 and optional bounded cursor"
+        )));
+    }
+    // Strings plus a conservative fixed allowance for this closed decoded shape.
+    let _input = app.admission.retain(
+        admission::Class::Control,
+        1024usize
+            .saturating_add(input.scope.capacity())
+            .saturating_add(input.cursor.as_ref().map_or(0, String::capacity)),
+    )?;
+    let _permit = admission::acquire_retained(&app, admission::Class::Control).await?;
+    // The configured local label, not a catalog lookup or peer discovery.
+    let group = std::env::var("FLOWER_GROUP").ok();
+    let result = app
+        .consensus
+        .physical_partitions(input.limit, input.cursor.as_deref(), group.as_deref())
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.starts_with("PHYSICAL_CENSUS_CURSOR:") {
+                ApiError::new(StatusCode::BAD_REQUEST, "PHYSICAL_CENSUS_CURSOR", message)
+            } else if message.starts_with("PHYSICAL_CENSUS_DRIFT:") {
+                ApiError::new(StatusCode::CONFLICT, "PHYSICAL_CENSUS_DRIFT", message)
+            } else if message.starts_with("PHYSICAL_CENSUS_BUDGET:") {
+                ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "PHYSICAL_CENSUS_BUDGET",
+                    message,
+                )
+            } else {
+                unavailable(error)
+            }
+        })?;
+    Ok(Json(result))
 }
