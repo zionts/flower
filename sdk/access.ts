@@ -1,6 +1,7 @@
 // Collection access policies: rules the server evaluates natively on every
 // read and write a method makes for its caller. See docs/guide/access.html.
 import { canonicalJson, type Json } from "./json.ts";
+import { sourcePageCursor } from "./source-page.ts";
 import type { FieldOf } from "./core.ts";
 
 type FieldValue<T, F> = [T] extends [object] ? (F extends keyof T ? T[F] : never) : Json;
@@ -682,6 +683,26 @@ export function enforceAccess(
     range(reference: any) {
       const access = guard(name(reference));
       if (!access) return host.range(reference);
+      if (reference.kind === "sourcePage") {
+        const rows: Row[] = [];
+        let request = reference;
+        for (;;) {
+          // Let the raw host validate the original reference and every cursor.
+          // Unlike indexed ranges below, never replace the limit with a full scan.
+          const page = host.range(request);
+          const limit = reference.options.limit;
+          for (const row of page.rows as Row[]) {
+            if (!access.visible(row.key, row.value)) continue;
+            if (rows.length === limit) {
+              return { rows, cursor: sourcePageCursor(reference.collection, rows[rows.length - 1].key) };
+            }
+            rows.push({ key: row.key, value: access.redact(row.key, row.value) });
+          }
+          if (page.cursor === null) return { rows, cursor: null };
+          // Separate lookahead avoids overflowing MAX_SAFE_INTEGER with limit + 1.
+          request = { ...reference, options: { limit, after: page.cursor } };
+        }
+      }
       const { limit, ...options } = reference.options;
       const all = host.range({ ...reference, options: { ...options, limit: Number.MAX_SAFE_INTEGER } }).rows as Row[];
       const visible = all.map((row, index) => ({ row, index })).filter(({ row }) => access.visible(row.key, row.value, reference.fields));

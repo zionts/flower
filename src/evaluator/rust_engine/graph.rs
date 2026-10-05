@@ -626,6 +626,14 @@ impl Engine<'_> {
                 self.rows_for_host(rows)
             }
             "range" => {
+                if argument(0)["kind"] == "sourcePage" {
+                    let query = pages::SourcePage::parse(argument(0))?;
+                    // A source page is an inventory read: changes anywhere in
+                    // the collection may change membership, values or lookahead.
+                    self.observe(observed, collection_id(&query.collection))?;
+                    self.count_reads(1)?;
+                    return self.source_page(&query, false);
+                }
                 let query = ranges::RangeQuery::parse(argument(0))?;
                 self.count_reads(1)?;
                 self.observed_range(observed, &query)

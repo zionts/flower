@@ -4,11 +4,12 @@ import {
 } from "./core.ts";
 import type {
   Access, AuthorizationRequest, Collection, Component, ComponentParts, Definition, DeletedRow, DeleteOptions, Derived, Failure, FlowerModule, HttpMap,
-  ManifestMethod, MutationContext, Principal, QueryContext, SetOptions, Task, TaskFailure, Trigger,
+  ManifestMethod, MutationContext, Principal, QueryContext, ScanPageOptions, SetOptions, Task, TaskFailure, Trigger,
 } from "./core.ts";
 import { aggregateSource, checkReadable, collectionManifest, normalizeAggregateMetadata, referenceManifest, referenceTarget } from "./indexing.ts";
 import { keyManifest, type ManagedKey } from "./keys.ts";
 import { ValidationError, type Schema } from "./schema.ts";
+import { sourcePageReference } from "./source-page.ts";
 
 /** Principal subject the authorization hook returns for anonymous callers; methods see null. */
 export const ANONYMOUS_SUBJECT = "$anonymous";
@@ -260,6 +261,12 @@ function bind(host: Host, runtime: Runtime): Session {
       const translated = keyScan(reference, options);
       const rows = translated === undefined ? host.scan(reference) : host.scan(reference, translated);
       return rows.map((row: { key: string; value: Json }) => ({ key: JSON.parse(row.key), value: row.value }));
+    },
+    scanPage(reference: any, options: ScanPageOptions) {
+      guard(reference);
+      const page = host.range(sourcePageReference(reference.name, options));
+      if (!collectionInfo(reference)?.key) return page;
+      return { rows: page.rows.map((row: { key: string; value: Json }) => ({ key: JSON.parse(row.key), value: row.value })), cursor: page.cursor };
     },
     query: (reference: any) => { guard(reference); return host.query(reference); },
     range(reference: any) {

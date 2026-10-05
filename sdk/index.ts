@@ -6,7 +6,7 @@ export {
   fail, collection, derive, query, mutation, transaction, participant, task, trigger, retainDeleted, component,
 } from "./core.ts";
 export type {
-  Failure, IndexScalar, IndexMap, FieldOf, IndexValues, EqualityValue, RangeOptions, ScanOptions, Row, RangePage, Query, RangeQuery, Index, Collection,
+  Failure, IndexScalar, IndexMap, FieldOf, IndexValues, EqualityValue, RangeOptions, ScanOptions, ScanPageOptions, Row, RangePage, Query, RangeQuery, Index, Collection,
   Principal, AuthorizationRequest, HistoryIdentity, Context, QueryContext, MutationContext, SetOptions, DeleteOptions,
   AggregateMetadata, Derived, Materialization, DeriveOptions, QueryConsistency, Access, MethodSpec, MutationSpec, QuerySpec,
   QueryMethod, MutationMethod, TransactionTarget, TransactionCall, TransactionPlan, TransactionMethod, TransactionResult,

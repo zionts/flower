@@ -214,7 +214,10 @@ export class TestDatabase<App = FlowerModule> {
       ...ctx,
       principal: () => identity,
       history: ctx.history ?? (() => null),
-      range: (reference: any) => { indexed(reference.collection, reference.fields); return ctx.range(reference); },
+      range: (reference: any) => {
+        if (reference.kind !== "sourcePage") indexed(reference.collection, reference.fields);
+        return ctx.range(reference);
+      },
       query: (reference: any) => { indexed(typeof reference.collection === "string" ? reference.collection : reference.collection.name, reference.fields); return ctx.query(reference); },
       scan: (reference: any, options?: any) => {
         if (options?.index !== undefined) indexed(reference.name, reference.indexes?.[options.index] ?? [options.index]);

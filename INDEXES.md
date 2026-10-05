@@ -74,7 +74,7 @@ Collections with typed keys, `.key(v.tuple([v.string(), v.string()]))` for examp
 
 A source-key scan whose bounds share a prefix (a typed-key `prefix` is such a pair of bounds) walks only the rows whose keys start with it, not the whole collection before them.
 
-Scans see pending mutation writes. Ordered scans share the scalar ordering and conservative index dependencies described below; source-key scans depend on the collection. Missing or nonscalar indexed fields are excluded from ordered scans, while source-key scans include every row. Offsets count matching rows in the selected direction and require walking past those rows; large offsets still cost work. Declared indexes skip those rows without retaining them, keeping selected results and pending-write candidates. Source-key scans and undeclared indexes retain up to `offset + limit` candidates while ordering native source records. Use `ctx.range` when a continuation cursor is more appropriate than an offset.
+Scans see pending mutation writes. Ordered scans share the scalar ordering and conservative index dependencies described below; source-key scans depend on the collection. Missing or nonscalar indexed fields are excluded from ordered scans, while source-key scans include every row. Offsets count matching rows in the selected direction and require walking past those rows; large offsets still cost work. Declared indexes skip those rows without retaining them, keeping selected results and pending-write candidates. Source-key scans and undeclared indexes retain up to `offset + limit` candidates while ordering native source records. Use `ctx.range` for indexed continuations, or `ctx.scanPage` for complete source-row inventory without an index (described below), instead of growing an offset.
 
 ```ts
 const timers = collection<{ tenant: string; state: string; dueAt: number }>("timers")
@@ -95,6 +95,54 @@ Declared ranges seek into persistent ordered storage and retain at most `limit +
 Derived scans and ranges depend on a window of their index, not the whole index. A result that filled its offset, limit and, for a page, its lookahead row depends only on the entries in its range up to the last row it examined; a shorter result depends on its entire range, which also covers inserts into an empty one. Rows skipped by `offset` and a page's lookahead row count only through their positions; returned rows count through their values too. A write re-runs a derivation only when its row's old or new position falls in the window, or when the value of a returned row changes, with or without a declared index. Scans without options still depend on their whole collection. Cached query results and watches that scan a declared index stay valid while its window's entries are the same: an unchanged index needs no check, and otherwise only the window's entries are compared. Key-ordered scans stay valid until their collection gains or loses a key, and scans of undeclared indexes until any row of their collection changes; the values of returned rows are checked individually in every case.
 
 The TypeScript scheduler declares a `(state, dueAt)` index. Expiring collections seek expired deadlines. Queues index `(scope, state, availableAt)`, `(scope, state, leaseExpiresAt)` and `(state, leaseExpiresAt)`: selecting a ready job is bounded, while expired leases are inspected in bounded pages so a claim still takes the job that has been available longest. A large expired-lease herd still costs work. Explicit helper inspection APIs can return full datasets. Policies, retry behavior, lease fencing, and callbacks remain TypeScript.
+
+## Complete source inventory pages
+
+`ctx.scanPage(collection, { limit, after? })` returns a `RangePage<T, K>`:
+`{ rows: [{ key, value }], cursor: string | null }`. It needs no index and includes
+all visible source rows, including nulls, primitives, arrays, and objects missing
+indexed fields. Typed collection keys are decoded just as in `scan` and `range`.
+Use it for complete inventories and maintenance walks, not for logical key bounds
+or sorting by a field.
+
+```ts
+const inventory = query("orders.inventory", {
+  args: v.object({ after: v.optional(v.string()) }),
+}, (ctx, options) => ctx.scanPage(orders, { limit: 100, ...options }));
+```
+
+`ScanPageOptions` accepts only `limit` (a required positive safe integer) and
+`after` (a string when present). It is forward-only: no `offset`, `reverse`,
+`prefix`, or index selection. Pass the previous page's non-null `cursor` as
+`after`; a null cursor means no further visible row existed in that invocation.
+A cursor is returned only when another **visible** row exists and identifies the
+last visible row returned, never a hidden or lookahead row. Collection and field
+access policies still apply with the caller's ordinary authority.
+
+Source pages use **physical source-record order**: byte-lexicographic UTF-8 order
+of `source:` followed by canonical JSON `[collectionName, storedKey]`. This is not
+logical UTF-16 key order: JSON quoting and escaping affect the position, and
+`"\ue000"` precedes `"🌺"`. A typed key's `storedKey` is itself canonical JSON text.
+Existing `scan` and indexed `range` ordering are unchanged.
+
+The native implementation seeks directly after the physical cursor, avoiding a
+whole-collection sort or an increasing offset. It retains selected results and
+lookahead work under the ordinary memory, time, and output budgets. A restrictive
+access policy can require examining many hidden rows to fill a page or establish
+that no further visible row exists; `limit` bounds returned rows, not total work.
+The Node reference runtime may sort all rows and issue several raw pages while
+applying policies: its tests establish semantics, **not native performance**.
+
+Each call reads its current invocation snapshot, including pending mutation
+writes. Cursors are positions, not snapshot handles or authorization tokens: an
+anchor row may have been deleted, and concurrent inserts before it will not be
+returned by continuing after it. The cursor is canonical JSON with exactly
+`{ version: 1, scope, last }`, where `scope` is canonical JSON
+`["sourcePage", collectionName]` and `last` is the canonical physical source ID.
+Malformed, noncanonical, wrong-version, and wrong-collection cursors fail with
+`INVALID_REFERENCE`; the limit is not part of the scope and may change between
+pages. Source-page reads conservatively depend on their collection as well as
+the returned values and any access-policy dependencies.
 
 ## Delta reducers
 

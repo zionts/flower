@@ -12,6 +12,7 @@ mod metadata;
 pub(crate) use metadata::{ReactiveIndex, update_memberships};
 mod access;
 mod indexes;
+mod pages;
 mod ranges;
 mod reducers;
 mod references;
@@ -1239,6 +1240,10 @@ impl Engine<'_> {
                 self.rows_for_host(rows)
             }
             "range" => {
+                if argument(0)["kind"] == "sourcePage" {
+                    let query = pages::SourcePage::parse(argument(0))?;
+                    return self.source_page(&query, true);
+                }
                 let query = ranges::RangeQuery::parse(argument(0))?;
                 Ok(self.range_rows(&query, true)?.rows)
             }
