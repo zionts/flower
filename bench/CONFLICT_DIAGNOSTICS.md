@@ -27,8 +27,16 @@ FLOWER_CONFLICT_DIAGNOSTICS_MAX_CHECKS=4096 \
 FLOWER_CONFLICT_DIAGNOSTICS_MAX_EVENTS=1000 \
 RUST_LOG=warn,flower::conflicts=debug \
   target/release/flower ... >flower-conflicts.log 2>&1
-node bench/conflict-diagnostics.mjs flower-conflicts.log
-# Or: node bench/conflict-diagnostics.mjs <flower-conflicts.log
+node bench/conflict-diagnostics.mjs \
+  --names org.spend,org.dailySpend,hourTotals,scopeSpend,chargeTotals \
+  flower-conflicts.log
+# The parser's allowlist is supplied independently; it does not trust input labels.
+# Or, with no named labels (generic counts only):
+node bench/conflict-diagnostics.mjs <flower-conflicts.log
+# Ultimator's process-compose JSON wrapper is supported too:
+node /path/to/flower/bench/conflict-diagnostics.mjs \
+  --names org.spend,org.dailySpend,hourTotals,scopeSpend,chargeTotals \
+  /path/to/ultimator/.dev/logs/flower.log
 ```
 
 The example names are **operator-supplied examples**, not schema-specific logic
@@ -119,11 +127,46 @@ the adaptive speculation policy, process restarts, logging loss, and diagnostic
 overhead also bias the sample. Compare against existing speculation telemetry
 separately. Do not merge duplicate captures as independent events.
 
-The parser retains at most 16 distinct configured names across input files;
-`names_truncated` flags config changes exceeding that cap while generic counts
-remain available. Malformed records are counted, never printed, and cause a
-nonzero exit status. They are not silently counted as complete negatives or
-positives; do not interpret ratios from a damaged capture as a valid bound.
+The parser accepts only the dedicated `DEBUG flower::conflicts:` fmt record,
+optionally preceded by its UTC timestamp. It also accepts process-compose's
+JSON log envelope (`level: "info"`, `process: "flower"`, a nonnegative `replica`,
+and a string `message`) **only after** decoding and verifying that inner fmt
+target. ANSI decoration is stripped after JSON decoding. It does not locate a
+marker in arbitrary application text, unwrap arbitrary JSON, or accept bare
+report JSON. Marker-bearing input with a missing/wrong target or unknown format
+is counted as malformed/rejected, not silently treated as a diagnostic. Other
+ordinary log lines without the marker are ignored. Use captures from the trusted
+logging infrastructure: recognizing a target is not cryptographic authentication
+of an arbitrary file, and this parser is not a general application-log sanitizer.
+
+Labels default to **none**, regardless of names found in the input. Supply an
+independent `--names NAME,...` allowlist to opt in to approved output labels; do
+not derive it from input records. It allows at most 16 distinct names, each 1–64
+ASCII letters/digits/`.`/`_`/`-`. Empty configuration means no names. Unknown flags,
+missing/duplicate `--names`, invalid names, or an oversized allowlist fail closed
+before reading any input, with a generic error that never echoes supplied values.
+Only the independently configured labels appear in output, including zero
+observed counters when a configured name is absent. Input names outside that
+allowlist are omitted without dropping their generic mismatch counts. The old
+input-driven `names_truncated` output is no longer used: oversized parser
+configuration is rejected, not partially accepted. `--` ends option parsing;
+no files (or `-`) reads stdin. `--help` shows the static usage text.
+
+Before aggregating a record, the parser verifies that a complete scan inspected
+all dependencies and all seven state predicates, inspected dependencies fit
+within inspected work, and stamp-family failure totals do not exceed inspected
+dependencies. Each of the seven structural counters is 0 or 1 and must have been
+inspected. Disjoint named totals for each family must not exceed that family's
+generic count, even for names excluded from output. Incomplete scans must either
+have exhausted the work limit or report an unavailable window marker.
+
+Malformed/rejected records are counted, never printed, and cause a nonzero exit
+status. No counters are partially added from a rejected record. A damaged capture
+has `capture_valid: false` and **both ratios are `null`**, even if other records
+were valid. Aggregate counts from individually validated records remain visible
+for diagnosis, not as a valid partial positive bound. Empty valid samples also
+report `null` ratios. File-read errors produce only a generic error and no
+summary; no arbitrary input, exception text, path, or input label is echoed.
 
 The dedicated event has no parent request span and contains no raw keys,
 collection arguments, row values, org/session/request IDs, principals,
