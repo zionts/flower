@@ -691,9 +691,15 @@ mod tests {
             result: json!("PRIVATE_RECEIPT_CANARY"),
         };
         let mut root = seed("default-seed", 0);
+        let catalog_group = json!({"id":"local", "addresses":[address.clone()]});
+        root.puts.insert(
+            "partition-catalog:group:local".into(),
+            catalog_group.clone(),
+        );
         root.puts.insert(
             "partition-catalog:partition:catalogued".into(),
-            json!({"partition":"catalogued","private":"PRIVATE_CATALOG_CANARY"}),
+            json!({"partition":"catalogued", "epoch":1, "owner":catalog_group,
+                "status":"active", "operation":"seed", "movement":null}),
         );
         consensus.commit(root).await.unwrap();
         for name in [
