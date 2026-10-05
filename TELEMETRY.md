@@ -145,3 +145,11 @@ Validation: `node tests/e2e-otel.mjs` after building the server exercises a real
 three-node cluster, incoming and forwarded trace context, batch links,
 all metric families, failed evaluations, payload exclusion, shutdown flushing,
 and disabled reporting.
+
+## Bounded certificate conflict investigation
+
+[Speculative certificate conflict diagnostics](bench/CONFLICT_DIAGNOSTICS.md)
+are a separate, production-default-off debug facility for finite investigations.
+They report all mismatch families within a work limit and a diagnostic-only
+upper bound from ignoring **all** cell versions, never safe repairability.
+They do not add method-name labels, request data, or OTLP spans.

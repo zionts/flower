@@ -2984,3 +2984,77 @@ async fn candidates_a_group_does_not_reach_carry_into_the_next() {
     );
     app.consensus.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn conflict_diagnostics_observe_rejection_without_changing_the_candidate() {
+    use std::io::Write;
+    #[derive(Clone)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (_directory, app) = super::super::tests::application(speculative_bundle()).await;
+    let mut state = app.consensus.read_for_writer().await.unwrap();
+    let now = app.clock.sample(&state).unwrap();
+    let input = speculative_input("private-candidate-request", "private-source-key");
+    let mut candidate = prepare_candidate(&app, &state, &input, false, Some(now))
+        .await
+        .unwrap();
+    assert!(candidate.certificate.as_ref().unwrap().valid(&state.data));
+    let response = candidate.prepared.response.clone();
+    let puts = candidate.prepared.command.as_ref().unwrap().puts.clone();
+    let revision = candidate
+        .prepared
+        .command
+        .as_ref()
+        .unwrap()
+        .expected_revision;
+    state.data.insert(
+        "source:[\"records\",\"private-source-key\"]".into(),
+        json!(99),
+    );
+    let output = Captured(Default::default());
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    {
+        // This current-thread Tokio test keeps the subscriber through validate.
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        assert!(!candidate.validate(&app, &state, &input).await.unwrap());
+    }
+    assert_eq!(candidate.prepared.response, response);
+    assert_eq!(candidate.prepared.command.as_ref().unwrap().puts, puts);
+    assert_eq!(
+        candidate
+            .prepared
+            .command
+            .as_ref()
+            .unwrap()
+            .expected_revision,
+        revision
+    );
+    let output = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    let enabled = std::env::var("FLOWER_CONFLICT_DIAGNOSTICS").ok().as_deref() == Some("1");
+    // Run this exact fixture in separate processes with the flag off/on, using
+    // default valid config, rather than mutating process-wide env in tests.
+    assert_eq!(output.contains("flower_conflict_diagnostic "), enabled);
+    assert!(!output.contains("private-candidate-request"));
+    assert!(!output.contains("private-source-key"));
+    if enabled {
+        assert!(output.contains("\"source_record\":1"));
+        assert!(output.contains("\"ignoring_all_cell_versions_upper_bound\":\"no\""));
+    }
+    drop(candidate);
+    app.consensus.shutdown().await.unwrap();
+}

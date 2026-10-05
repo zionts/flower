@@ -1,5 +1,7 @@
 //! Query certificates refer to write versions, never old payloads or
 //! allocations, so values need not stay in memory to be checked.
+mod diagnostics;
+
 use super::*;
 use std::ops::Bound;
 use std::sync::Mutex;
@@ -18,6 +20,59 @@ enum Stamp {
         upper: String,
         entries: Vec<u64>,
     },
+}
+
+impl Stamp {
+    // The ordinary path still short-circuits, and still adopts a newer marker
+    // only after proving a window unchanged. Diagnostics never call this method.
+    fn valid(&self, id: &str, data: &Records) -> bool {
+        match self {
+            Self::Record(expected) => *expected == data.version(id),
+            Self::Marker(expected) => *expected == data.generation(id),
+            Self::Window {
+                index,
+                marker,
+                lower,
+                upper,
+                entries,
+            } => {
+                let current = data.generation(index);
+                let mut marker = marker.lock().expect("window marker lock");
+                if *marker == current {
+                    return true;
+                }
+                let unchanged = window_versions_match(data, lower, upper, entries, || Some(()))
+                    .expect("unlimited validation");
+                if unchanged {
+                    *marker = current;
+                }
+                unchanged
+            }
+        }
+    }
+}
+
+// One equality test for both paths. The diagnostic caller charges every next(),
+// including the final absence check; None means unknown, never unchanged.
+fn window_versions_match(
+    data: &Records,
+    lower: &str,
+    upper: &str,
+    entries: &[u64],
+    mut inspect: impl FnMut() -> Option<()>,
+) -> Option<bool> {
+    let mut found = data.range_versions::<(Bound<&str>, Bound<&str>)>((
+        Bound::Included(lower),
+        Bound::Excluded(upper),
+    ));
+    for expected in entries {
+        inspect()?;
+        if !found.next().is_some_and(|actual| *expected == actual) {
+            return Some(false);
+        }
+    }
+    inspect()?;
+    Some(found.next().is_none())
 }
 
 impl Clone for Stamp {
@@ -60,36 +115,9 @@ impl DependencyCertificate {
             && data
                 .get("clock")
                 .is_none_or(|value| safe_time(value, "Stored clock").is_ok())
-            && self.checks.iter().all(|(id, stamp)| match stamp {
-                Stamp::Record(expected) => *expected == data.version(id),
-                Stamp::Marker(expected) => *expected == data.generation(id),
-                Stamp::Window {
-                    index,
-                    marker,
-                    lower,
-                    upper,
-                    entries,
-                } => {
-                    let current = data.generation(index);
-                    let mut marker = marker.lock().expect("window marker lock");
-                    if *marker == current {
-                        return true;
-                    }
-                    let mut found = data.range_versions::<(Bound<&str>, Bound<&str>)>((
-                        Bound::Included(lower),
-                        Bound::Excluded(upper),
-                    ));
-                    let unchanged = entries
-                        .iter()
-                        .all(|expected| found.next().is_some_and(|actual| *expected == actual))
-                        && found.next().is_none();
-                    if unchanged {
-                        *marker = current;
-                    }
-                    unchanged
-                }
-            })
+            && self.checks.iter().all(|(id, stamp)| stamp.valid(id, data))
     }
+
     pub fn allocation_cost(&self) -> usize {
         self.bytes
     }
@@ -211,12 +239,15 @@ impl MutationCertificate {
         }
     }
     pub fn valid(&self, data: &Records) -> bool {
-        self.reads.valid_records(data)
-            && self.graph == data.reactive().shape
-            && data
-                .get("clock")
-                .map_or(Ok(0), |clock| safe_time(clock, "Stored clock"))
-                .is_ok_and(|clock| clock <= self.now)
+        self.reads.valid_records(data) && self.graph_matches(data) && self.clock_matches(data)
+    }
+    fn graph_matches(&self, data: &Records) -> bool {
+        self.graph == data.reactive().shape
+    }
+    fn clock_matches(&self, data: &Records) -> bool {
+        data.get("clock")
+            .map_or(Ok(0), |clock| safe_time(clock, "Stored clock"))
+            .is_ok_and(|clock| clock <= self.now)
     }
     pub fn allocation_cost(&self) -> usize {
         self.reads.allocation_cost().saturating_add(64)

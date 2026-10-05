@@ -805,3 +805,46 @@ fn a_window_stamp_holds_what_the_budget_leaves_room_for_then_falls_back_to_its_m
     );
     assert!(!window.valid(&inside));
 }
+
+#[test]
+fn conflict_diagnostic_cell_upper_bound_includes_a_genuine_read_that_cannot_be_reused() {
+    let fixture = Fixture::new([
+        (
+            "leaf",
+            (|_, host| get(host, "collection", "items", json!("first"))) as Callback,
+        ),
+        (
+            "readLeaf",
+            (|_, host| get(host, "derived", "leaf", Value::Null)) as Callback,
+        ),
+    ]);
+    let mut data = Records::new();
+    deploy(
+        &mut data,
+        json!({"writes":[{"collection":"items","key":"first","value":1}],"materialize":[{"name":"leaf"}]}),
+        &fixture,
+    );
+    let candidate = optimistic(&data, "readLeaf", Value::Null, &fixture);
+    assert_eq!(candidate.value, 1);
+    let certificate = candidate.mutation_certificate.unwrap();
+    assert!(certificate.valid(&data));
+    deploy(
+        &mut data,
+        json!({"writes":[{"collection":"items","key":"first","value":2}]}),
+        &fixture,
+    );
+    assert!(!certificate.valid(&data));
+    let report = certificate.conflict_diagnostic_for_test(&data, 4096);
+    assert_eq!(report["mismatches"]["cell_record"], 1);
+    assert_eq!(report["ignoring_all_cell_versions_upper_bound"], "yes");
+    assert_eq!(report["claim"], "not_safe_repairability");
+    let serial = optimistic(&data, "readLeaf", Value::Null, &fixture);
+    assert_eq!(
+        serial.value, 2,
+        "the old return value is genuinely stale, not repairable by ignoring a version"
+    );
+    assert!(
+        !certificate.valid(&data),
+        "the diagnostic cannot make acceptance true"
+    );
+}

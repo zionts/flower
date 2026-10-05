@@ -60,6 +60,9 @@ impl Candidate {
             return Ok(false);
         };
         if !certificate.valid(&state.data) {
+            // Observation only, after the unchanged acceptance decision. No
+            // request payload or method name enters this bounded diagnostic.
+            certificate.log_conflicts(&state.data);
             return Ok(false);
         }
         let body = pending.begin()?;
