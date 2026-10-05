@@ -126,6 +126,95 @@
     return selected.map(function (entry) { return entry.row; });
   }
 
+  function sourcePageRecord(value, label) {
+    var record = scanRecord(value, label);
+    // The Node harness passes objects from another realm. Accept that realm's
+    // Object.prototype, but not class instances or custom prototype chains.
+    var prototype = Object.getPrototypeOf(value);
+    if (prototype !== null) {
+      var constructor = Object.getOwnPropertyDescriptor(prototype, "constructor");
+      if (Object.getPrototypeOf(prototype) !== null || !constructor || !own(constructor, "value") ||
+          typeof constructor.value !== "function" ||
+          Function.prototype.toString.call(constructor.value) !== Function.prototype.toString.call(Object)) {
+        throw failure("INVALID_REFERENCE", label + " must be a plain object");
+      }
+    }
+    return record;
+  }
+
+  function wellFormedString(value) {
+    if (typeof value !== "string") return false;
+    for (var i = 0; i < value.length; i++) {
+      var unit = value.charCodeAt(i);
+      if (unit >= 0xd800 && unit <= 0xdbff) {
+        var next = value.charCodeAt(++i);
+        if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      } else if (unit >= 0xdc00 && unit <= 0xdfff) return false;
+    }
+    return true;
+  }
+
+  // Rust String/BTree order is byte-lexicographic UTF-8, equivalently Unicode
+  // scalar order for well-formed strings, NOT JavaScript's UTF-16 comparison.
+  function sourceOrder(a, b) {
+    var i = 0, j = 0;
+    while (i < a.length && j < b.length) {
+      var left = a.codePointAt(i), right = b.codePointAt(j);
+      if (left !== right) return left < right ? -1 : 1;
+      i += left > 0xffff ? 2 : 1;
+      j += right > 0xffff ? 2 : 1;
+    }
+    return i < a.length ? 1 : j < b.length ? -1 : 0;
+  }
+
+  function sourcePagePlan(reference) {
+    requireRecord(reference, "range reference", "INVALID_REFERENCE");
+    var kind = Object.getOwnPropertyDescriptor(reference, "kind");
+    if (kind && !own(kind, "value")) throw failure("INVALID_REFERENCE", "Range kind cannot be an accessor");
+    if (!kind || kind.value !== "sourcePage") return null;
+    var ref = sourcePageRecord(reference, "source page reference");
+    if (Object.keys(ref).length !== 3 || !own(ref, "collection") || !own(ref, "options") ||
+        !wellFormedString(ref.collection)) {
+      throw failure("INVALID_REFERENCE", "Invalid source page reference");
+    }
+    var options = sourcePageRecord(ref.options, "source page options");
+    if (Object.keys(options).some(function (key) { return key !== "limit" && key !== "after"; }) ||
+        !Number.isSafeInteger(options.limit) || options.limit < 1 ||
+        (own(options, "after") && typeof options.after !== "string")) {
+      throw failure("INVALID_REFERENCE", "Invalid source page options");
+    }
+    var scope = canonical(["sourcePage", ref.collection]), after = null;
+    if (own(options, "after")) {
+      var cursor, pair;
+      try {
+        cursor = JSON.parse(options.after);
+        if (!cursor || Array.isArray(cursor) || typeof cursor !== "object" ||
+            Object.keys(cursor).length !== 3 || cursor.version !== 1 || cursor.scope !== scope ||
+            typeof cursor.last !== "string" || cursor.last.indexOf("source:") !== 0 ||
+            canonical(cursor) !== options.after) throw 0;
+        pair = JSON.parse(cursor.last.slice(7));
+        if (!Array.isArray(pair) || pair.length !== 2 || pair[0] !== ref.collection ||
+            !wellFormedString(pair[1]) || sourceId(pair[0], pair[1]) !== cursor.last) throw 0;
+      } catch (_) { throw failure("INVALID_REFERENCE", "Invalid source page cursor"); }
+      after = cursor.last;
+    }
+    return { collection: ref.collection, limit: options.limit, scope: scope, after: after };
+  }
+
+  // Reference semantics only: Node may sort all rows. Native source pages seek
+  // directly in persistent storage and are the bounded production implementation.
+  function sourcePage(plan, rows) {
+    var selected = rows.map(function (row) { return { id: sourceId(plan.collection, row.key), row: row }; })
+      .filter(function (entry) { return plan.after === null || sourceOrder(entry.id, plan.after) > 0; });
+    selected.sort(function (a, b) { return sourceOrder(a.id, b.id); });
+    var more = selected.length > plan.limit;
+    selected = selected.slice(0, plan.limit);
+    return {
+      rows: selected.map(function (entry) { return entry.row; }),
+      cursor: more ? canonical({ version: 1, scope: plan.scope, last: selected[selected.length - 1].id }) : null
+    };
+  }
+
   // Reference implementation only: native production uses persistent ordered keys.
   function orderedRange(ref, rows) {
     requireRecord(ref, "range reference", "INVALID_REFERENCE");
@@ -620,7 +709,9 @@
         },
         range: function (ref) {
           checkContext();
-          return clone(orderedRange(ref, scanRows(ref.collection)));
+          var plan = sourcePagePlan(ref);
+          var rows = scanRows(plan ? plan.collection : ref.collection);
+          return clone(plan ? sourcePage(plan, rows) : orderedRange(ref, rows));
         },
         query: function (ref) {
           checkContext();
@@ -962,9 +1053,10 @@
       },
       range: function (ref) {
         checkContext();
-        var rows = rowsFor(ref.collection);
+        var plan = sourcePagePlan(ref);
+        var rows = rowsFor(plan ? plan.collection : ref.collection);
         countOperations(rows.length);
-        return clone(orderedRange(ref, rows));
+        return clone(plan ? sourcePage(plan, rows) : orderedRange(ref, rows));
       },
       query: function (ref) {
         checkContext();

@@ -436,6 +436,94 @@ test("scan shares scalar tuple ordering and key tie breaks with ordered ranges",
   assert.deepEqual(db.call("query", "scan", { index: "byValue", lte: null }).value, ["value-0"]);
 });
 
+test("source pages use physical UTF-8 IDs and include every value in all reference entry modes", () => {
+  const name = 'source/"🌺\n';
+  const keys = ["🌺", "\ue000", '"', "\\", "/", "\n", "\u0000", "a", ""];
+  const values = [null, 7, false, "text", [], {}, { noIndex: true }, true, 0];
+  const data = Object.fromEntries(keys.map((key, i) => [sourceKey(name, key), values[i]]));
+  data[sourceKey("other", "private")] = "other collection";
+  const expected = keys.map((key, i) => ({ key, value: values[i] })).sort((a, b) =>
+    Buffer.compare(Buffer.from(sourceKey(name, a.key)), Buffer.from(sourceKey(name, b.key))));
+  const pageRef = (options) => ({ kind: "sourcePage", collection: name, options });
+  for (const mode of [false, true, "ordered"]) {
+    const db = methodHarness({
+      page: (ctx, options) => ctx.range(pageRef(options)),
+      change: (ctx) => {
+        const first = ctx.range(pageRef({ limit: 2 }));
+        ctx.delete(collection(name), first.rows.at(-1).key);
+        ctx.set(collection(name), "zz", { pending: true });
+        return ctx.range(pageRef({ limit: 99, after: first.cursor }));
+      },
+    }, {}, data, mode);
+    const found = [];
+    let after;
+    do {
+      const result = db.call("query", "page", { limit: 2, ...(after === undefined ? {} : { after }) }).value;
+      found.push(...result.rows);
+      if (result.cursor !== null) {
+        const cursor = JSON.parse(result.cursor);
+        assert.deepEqual(cursor, { last: sourceKey(name, result.rows.at(-1).key), scope: JSON.stringify(["sourcePage", name]), version: 1 });
+        assert.equal(result.cursor, JSON.stringify(cursor), "cursor is canonical JSON");
+      }
+      after = result.cursor ?? undefined;
+    } while (after !== undefined);
+    assert.deepEqual(found, expected);
+    assert.ok(found.findIndex((row) => row.key === "\ue000") < found.findIndex((row) => row.key === "🌺"));
+    assert.deepEqual(db.call("query", "page", { limit: Number.MAX_SAFE_INTEGER }).value, { rows: expected, cursor: null });
+    const changed = db.call("mutation", "change").value;
+    assert.deepEqual(changed.rows, [...expected.slice(2), { key: "zz", value: { pending: true } }].sort((a, b) =>
+      Buffer.compare(Buffer.from(sourceKey(name, a.key)), Buffer.from(sourceKey(name, b.key)))));
+    assert.equal(changed.cursor, null);
+  }
+});
+
+test("source pages reject malformed raw references and options without executing accessors", () => {
+  let accessed = false;
+  const optionsAccessor = { get limit() { accessed = true; return 1; } };
+  const ref = (options) => ({ kind: "sourcePage", collection: "rows", options });
+  const hidden = Object.defineProperty({ limit: 1 }, "after", { value: "hidden", enumerable: false });
+  const badOptions = [undefined, null, [], 1, {}, { limit: 0 }, { limit: -1 }, { limit: 0.1 }, { limit: NaN },
+    { limit: Infinity }, { limit: Number.MAX_SAFE_INTEGER + 1 }, { limit: "1" }, { limit: 1, after: undefined },
+    { limit: 1, after: null }, { limit: 1, after: 1 }, { limit: 1, reverse: false }, { limit: 1, offset: 0 },
+    { limit: 1, prefix: [] }, { limit: 1, fields: [] }, { limit: 1, index: "x" }, { limit: 1, [Symbol("x")]: true },
+    hidden, optionsAccessor, Object.create({ limit: 1 }), new (class { limit = 1; })()];
+  const badRefs = [
+    ...badOptions.map(ref),
+    { ...ref({ limit: 1 }), extra: true },
+    { ...ref({ limit: 1 }), collection: "\ud800" },
+    { ...ref({ limit: 1 }), collection: 1 },
+    { ...ref({ limit: 1 }), get collection() { accessed = true; return "rows"; } },
+    { ...ref({ limit: 1 }), get kind() { accessed = true; return "sourcePage"; } },
+    { ...ref({ limit: 1 }), get options() { accessed = true; return { limit: 1 }; } },
+    { ...ref({ limit: 1 }), [Symbol("x")]: true },
+  ];
+  for (const reference of badRefs) {
+    const db = methodHarness({ page: (ctx) => ctx.range(reference) });
+    assert.throws(() => db.call("query", "page"), (error) => error.code === "INVALID_REFERENCE");
+  }
+  assert.equal(accessed, false);
+  const db = methodHarness({ page: (ctx) => ctx.range(ref(Object.assign(Object.create(null), { limit: 1 }))) });
+  assert.deepEqual(db.call("query", "page").value, { rows: [], cursor: null });
+});
+
+test("source-page derived dependencies observe all values and pending writes", () => {
+  const rows = collection("rows");
+  const page = { kind: "sourcePage", collection: rows.name, options: { limit: 2 } };
+  const definitions = { page: (ctx) => ctx.range(page) };
+  const db = harness(definitions);
+  db.mutate({ materialize: [{ name: "page" }], writes: [{ collection: rows.name, key: "a", value: null }, { collection: rows.name, key: "c", value: 3 }] });
+  assert.deepEqual(db.value("page"), { rows: [{ key: "a", value: null }, { key: "c", value: 3 }], cursor: null });
+  db.mutate({ writes: [{ collection: rows.name, key: "b", value: {} }] });
+  assert.deepEqual(db.value("page").rows, [{ key: "a", value: null }, { key: "b", value: {} }]);
+  assert.equal(JSON.parse(db.value("page").cursor).last, sourceKey(rows.name, "b"));
+  const methods = methodHarness({ change: (ctx) => {
+    ctx.set(rows, "a", false);
+    ctx.delete(rows, "b");
+    return ctx.get(derived("page"));
+  } }, definitions, db.data);
+  assert.deepEqual(methods.call("mutation", "change").value, { rows: [{ key: "a", value: false }, { key: "c", value: 3 }], cursor: null });
+});
+
 test("scan options survive derived method previews and react to staged index changes", () => {
   const rows = { ...collection("rows"), indexes: { byScore: ["score"] } };
   const options = { index: "byScore", gte: 0, reverse: true, offset: 1, limit: 1 };

@@ -74,6 +74,14 @@ export interface ScanOptions<I extends IndexMap = IndexMap> {
   readonly reverse?: boolean;
 }
 
+/** Forward-only inventory in physical source-record order, not logical key order. */
+export interface ScanPageOptions {
+  /** Maximum visible rows to return: a positive safe integer. */
+  readonly limit: number;
+  /** Continue after a previous page against the current invocation's snapshot. */
+  readonly after?: string;
+}
+
 export interface Row<T = Json, K = string> { key: K; value: T }
 export interface RangePage<T = Json, K = string> { readonly rows: Row<T, K>[]; readonly cursor: string | null }
 export interface Query<T = Json, K = string> {
@@ -326,6 +334,8 @@ export interface Context {
   get<V>(derived: Derived<null, V>): V;
   get<A, V>(derived: Derived<A, V>, args: A): V;
   scan<T, K extends Json, I extends IndexMap>(collection: Collection<T, K, I>, options?: ScanOptions<I>): Row<T, K>[];
+  /** Page every row, including nulls and primitives, without requiring an index. */
+  scanPage<T, K extends Json>(collection: Collection<T, K, any>, options: ScanPageOptions): RangePage<T, K>;
   query<T>(query: Query<T, any>): T[];
   range<T, K>(range: RangeQuery<T, K>): RangePage<T, K>;
 }

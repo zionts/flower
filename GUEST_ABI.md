@@ -109,7 +109,7 @@ malformed arguments; unknown operations and resource failures trap instead.
 | 3 | history | none | `{database, incarnation}` or null | methods |
 | 4 | get | target, key or args | record, derived value or null | all |
 | 5 | scan | collection, options? | `[{key, value}]` | all |
-| 6 | range | range | `{rows: [{key, value}], cursor}` | all |
+| 6 | range | range or source-page reference | `{rows: [{key, value}], cursor}` | all |
 | 7 | query | query | `[value]` | all |
 | 8 | set | collection, key, value, options? | null | mutations |
 | 9 | delete | collection, key | null | mutations |
@@ -131,8 +131,26 @@ queries and derived values get none.
 
 A `target` is a collection name, `{"kind": "collection", "name": string}` or
 `{"kind": "derived", "name": string}`. Scan options, range and query shapes are
-described in [INDEXES.md](INDEXES.md). Transactions plan only: every host call
-fails there.
+described in [INDEXES.md](INDEXES.md). Operation 6 also accepts a source-page
+reference, without a new opcode or bridge capability:
+
+```json
+{"kind":"sourcePage","collection":"orders","options":{"limit":100}}
+```
+
+Its reference has exactly `kind`, `collection`, and `options`; options have only
+a required positive safe-integer `limit` and an optional string `after`. It walks
+all visible source rows in physical source-ID UTF-8 byte order, including nulls,
+primitives, and rows with missing fields, under the same collection/field access
+policies as other reads. The host keys remain stored strings; the TypeScript
+`ctx.scanPage` binding decodes typed keys. Cursors are canonical JSON with exactly
+`version: 1`, `scope: canonicalJSON(["sourcePage", collection])`, and
+`last: "source:" + canonicalJSON([collection, storedKey])`. Both the cursor and
+its source ID must be canonical and belong to the requested collection. A
+non-null cursor identifies the last returned visible row, only when another
+visible row exists; the anchor may have been deleted. See the inventory section
+of [INDEXES.md](INDEXES.md) for snapshot, ordering, and work-budget semantics.
+Transactions plan only: every host call fails there.
 
 `crypto_call` passes byte spans (`{u32 ptr, u32 len}` records) and writes a
 `{u32 kind, u32 ptr, u32 length_or_integer}` result; the QuickJS guest's

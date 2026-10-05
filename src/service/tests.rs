@@ -6,6 +6,7 @@ use super::*;
 
 mod cache_http;
 mod mutation_dispatch;
+mod source_pages;
 
 #[test]
 fn http_registry_borrowed_entries_preserve_validation_and_resolution() {

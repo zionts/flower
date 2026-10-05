@@ -838,6 +838,7 @@ mod access;
 mod dependencies;
 mod durable;
 mod managed_keys;
+mod pages;
 mod persistent_graph;
 mod propagation;
 mod ranges;
