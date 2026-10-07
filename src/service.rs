@@ -87,6 +87,9 @@ pub fn router(consensus: Consensus, admin_token: String) -> Router {
     );
     let app = make_app(consensus, admin_token, query_evaluations, admission, None);
     let ingress = admission::ingress::Budget::new(&app);
+    // Raft RPC routes are applied OUTSIDE (above) the admission middleware layer to guarantee
+    // they can never be starved by client traffic. Raft append/vote/snapshot RPCs are critical
+    // infrastructure that must proceed even when the admission pool is full.
     Router::new()
         .route(
             "/health",
@@ -117,18 +120,18 @@ pub fn router(consensus: Consensus, admin_token: String) -> Router {
         .route("/admin/transactions", post(transaction_control))
         .merge(transactions::router())
         .merge(forwarding::router(app.clone()))
+        .merge(partition_routes)
         .layer(DefaultBodyLimit::max(
             tuning::settings()
                 .expect("validated HTTP body budget")
                 .http_max_body_bytes,
         ))
         .with_state(app)
-        .merge(raft_routes)
-        .merge(partition_routes)
         .layer(axum::middleware::from_fn_with_state(
             ingress,
             admission::ingress::handle,
         ))
+        .merge(raft_routes)  // Merged AFTER admission layer to bypass it
         .layer(axum::middleware::from_fn(crate::telemetry::http))
 }
 
