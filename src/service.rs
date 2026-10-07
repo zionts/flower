@@ -87,8 +87,7 @@ pub fn router(consensus: Consensus, admin_token: String) -> Router {
     );
     let app = make_app(consensus, admin_token, query_evaluations, admission, None);
     let ingress = admission::ingress::Budget::new(&app);
-    // Build admission-controlled routes (everything except raft RPCs)
-    let admissioned_routes = Router::new()
+    Router::new()
         .route(
             "/health",
             get(|| async { Json(json!({"service":"flower","version":env!("CARGO_PKG_VERSION")})) }),
@@ -118,34 +117,19 @@ pub fn router(consensus: Consensus, admin_token: String) -> Router {
         .route("/admin/transactions", post(transaction_control))
         .merge(transactions::router())
         .merge(forwarding::router(app.clone()))
-        .merge(partition_routes)
         .layer(DefaultBodyLimit::max(
             tuning::settings()
                 .expect("validated HTTP body budget")
                 .http_max_body_bytes,
         ))
-        .with_state(app.clone())
+        .with_state(app)
+        .merge(partition_routes)
         .layer(axum::middleware::from_fn_with_state(
             ingress,
             admission::ingress::handle,
         ))
-        .layer(axum::middleware::from_fn(crate::telemetry::http));
-
-    // Raft RPC routes bypass admission middleware entirely to guarantee they can never
-    // be starved by client traffic. Raft append/vote/snapshot RPCs are critical
-    // infrastructure that must proceed even when the admission pool is full.
-    let raft_only_routes = raft_routes
-        .layer(DefaultBodyLimit::max(
-            tuning::settings()
-                .expect("validated HTTP body budget")
-                .http_max_body_bytes,
-        ))
-        .layer(axum::middleware::from_fn(crate::telemetry::http));
-
-    // Merge admission-controlled and raft-only routers at top level, with raft checked first
-    Router::new()
-        .merge(raft_only_routes)
-        .merge(admissioned_routes)
+        .merge(raft_routes)  // Merged AFTER admission middleware to bypass it
+        .layer(axum::middleware::from_fn(crate::telemetry::http))
 }
 
 fn make_app(
