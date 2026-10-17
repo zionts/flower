@@ -79,6 +79,19 @@ node scripts/publish-sdk.mjs --check
 node scripts/publish-sdk.mjs --check ./flower-js-sdk-0.1.0.tgz
 ```
 
+## Build a server locally
+
+`cargo build --release --locked --bin flower` builds the server a release job
+packages, at `target/release/flower`; it runs from there or copied elsewhere.
+Inside `nix develop` it uses the pinned Rust toolchain. On macOS the binary
+loads only system libraries, from `/usr/lib` and `/System/Library`, wherever it
+was built. The `libc` crate asks every Apple binary to link libiconv, which the
+Nix shell's linker finds in the Nix store, and `build.rs` drops that unused
+library with `-dead_strip_dylibs`. A server that loaded from `/nix/store` would
+stop starting once garbage collection removed the path, or at boot before the
+Nix volume mounted. `tests/system_libraries.rs` checks the binary;
+`otool -L target/release/flower` shows the same list.
+
 ## Prepare a release
 
 ```sh
