@@ -115,6 +115,7 @@
         fileset = lib.fileset.unions [
           ./Cargo.toml
           ./Cargo.lock
+          ./build.rs
           ./src
           # Workspace members: Cargo reads their manifests to resolve the lockfile.
           ./crates
