@@ -139,7 +139,10 @@ pub(super) fn settings() -> Result<&'static Settings> {
             };
             let query_workers = admission("FLOWER_QUERY_WORKERS", cpus)?;
             let preparation_workers = admission("FLOWER_PREPARATION_WORKERS", query_workers)?;
-            let control_workers = admission("FLOWER_CONTROL_WORKERS", 1)?;
+            // Control workers handle raft RPCs (append, vote, install_snapshot), which are
+            // critical infrastructure and must not starve under high load. Default to at least
+            // 2 on any machine, and scale with cores but cap at 4 to avoid exhausting CPU.
+            let control_workers = admission("FLOWER_CONTROL_WORKERS", (cpus / 3).max(2).min(4))?;
             let deployment_workers = admission("FLOWER_DEPLOYMENT_WORKERS", 1)?;
             let evaluator = crate::evaluator::config::settings().map_err(|error| error.to_string())?;
             let per_job = evaluator.guest_memory_bytes.checked_add(evaluator.rust_memory_bytes)

@@ -123,12 +123,12 @@ pub fn router(consensus: Consensus, admin_token: String) -> Router {
                 .http_max_body_bytes,
         ))
         .with_state(app)
-        .merge(raft_routes)
         .merge(partition_routes)
         .layer(axum::middleware::from_fn_with_state(
             ingress,
             admission::ingress::handle,
         ))
+        .merge(raft_routes)  // Merged AFTER admission middleware to bypass it
         .layer(axum::middleware::from_fn(crate::telemetry::http))
 }
 
